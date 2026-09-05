@@ -1,4 +1,4 @@
-﻿import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
+import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { AppState, AppStateStatus } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
 import { runSync, pushOnlySync, SyncResult } from "../services/sync";
@@ -10,6 +10,7 @@ export type ConnectionState = "online" | "offline" | "syncing";
 
 interface SyncContextValue {
   connection: ConnectionState;
+  isSyncing: boolean;
   pendingCount: number;
   lastSyncedAt: string | null;
   lastError: string | null;
@@ -91,8 +92,8 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   /** forceSync expuesto al exterior (para botones manuales, reabrir jornada, etc.) */
   const forceSync = useCallback(async () => {
-    // El usuario pidió actualizar: no reutilizar la respuesta cacheada del
-    // servidor aunque el cursor no haya cambiado todavía.
+    // Anticoncurrencia: si ya hay una sincronización en vuelo, ignorar taps adicionales
+    if (syncingRef.current) return;
     await runForceSyncRef.current(true);
   }, []);
 
@@ -176,7 +177,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <SyncContext.Provider
-      value={{ connection, pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, resetLocalData }}
+      value={{ connection, isSyncing: connection === "syncing", pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, resetLocalData }}
     >
       {children}
     </SyncContext.Provider>

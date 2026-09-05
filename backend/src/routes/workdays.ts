@@ -26,9 +26,10 @@ export function invalidateWorkdayCache() {
 
 workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   const date = today();
-  // Devolver caché si pertenece al mismo día. Se invalida al crear, editar o
-  // cerrar jornadas y al crear/editar/cancelar pedidos.
-  if (workdayCacheEntry && workdayCacheEntry.date === date) {
+  const fresh = req.query.fresh === "1" || req.query.fresh === "true";
+  // Devolver caché si pertenece al mismo día y no se solicita verificación fresca.
+  // Se invalida al crear, editar o cerrar jornadas y al crear/editar/cancelar pedidos.
+  if (!fresh && workdayCacheEntry && workdayCacheEntry.date === date) {
     return res.json(workdayCacheEntry.data);
   }
 

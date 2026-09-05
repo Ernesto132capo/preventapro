@@ -4,7 +4,7 @@ import { enqueue, listPending, markDone, markFailed, markSyncing, deferForDepend
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
 import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
 import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
-import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay } from "../db/repositories/workdays";
+import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay, markWorkDayClosed } from "../db/repositories/workdays";
 
 export interface SyncResult {
   ok: boolean;
@@ -301,6 +301,25 @@ async function pushOrder(row: OutboxRow, userId: string) {
       // Error de red real (no de validación) — reintentar sin marcar como fallo definitivo.
       return deferForDependency(row.id);
     }
+
+    // Blindaje de jornada concluida / cerrada: evitar bucle infinito de reintentos
+    const isClosedWorkdayError =
+      message.toLowerCase().includes("jornada") &&
+      (message.toLowerCase().includes("concluida") || message.toLowerCase().includes("cerrada"));
+
+    if (isClosedWorkdayError) {
+      console.warn(`[pushOrder] Pedido ${order.id} rechazado por jornada concluida. Rescatando estado...`);
+      const currentWd = await getTodayWorkDay(userId);
+      await markWorkDayClosed(currentWd.id);
+      await db.runAsync(
+        `UPDATE orders SET status = 'cancelled', sync_status = 'failed', sync_error = ? WHERE id = ?`,
+        [message, order.id]
+      );
+      // Descartar la orden del outbox para NO entrar en bucle infinito
+      await markDone(row.id);
+      return;
+    }
+
     await markOrderFailed(order.id, message);
     await markFailed(row.id, message);
   }
@@ -375,6 +394,68 @@ export async function pushOnlySync(userId: string): Promise<SyncResult> {
 }
 
 /**
+ * Rutina de emergencia/rescate ante conflictos de almacenamiento local o al presionar "Forzar Sincro".
+ * - Resuelve la jornada directamente con el servidor omitiendo caché (?fresh=1).
+ * - Si la jornada está cerrada en el backend, actualiza la base de datos local y cancela órdenes locales huérfanas sin server_id.
+ * - Limpia elementos del outbox trabados con errores permanentes (ej. jornada concluida).
+ * - Invalida el cursor de pull local para forzar que el cliente descargue y alinee todos los datos del servidor.
+ */
+async function rescueLocalConflict(userId: string) {
+  const db = await getDb();
+  try {
+    const res = await apiFetch<any>(`/workdays/current?fresh=1`);
+    if (res?.workDay) {
+      const local = await getTodayWorkDay(userId);
+      await upsertServerWorkDay(local.id, res.workDay);
+      const allTodayDays = await db.getAllAsync<{ id: string }>(
+        `SELECT id FROM work_days WHERE work_date = ?`,
+        [local.work_date]
+      );
+      for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
+
+      // Si la jornada remota está concluida, cancelar preventas locales colgadas sin server_id
+      if (res.workDay.status === "closed") {
+        const unpushed = await db.getAllAsync<{ id: string }>(
+          `SELECT id FROM orders WHERE (work_day_id = ? OR work_day_id = ?) AND server_id IS NULL`,
+          [local.id, res.workDay.id]
+        );
+        for (const uo of unpushed) {
+          await db.runAsync(
+            `UPDATE orders SET status = 'cancelled', sync_status = 'failed', sync_error = 'Cancelado: la jornada fue concluida por otro usuario' WHERE id = ?`,
+            [uo.id]
+          );
+          await db.runAsync(
+            `UPDATE outbox SET status = 'done' WHERE entity_type = 'order' AND local_entity_id = ?`,
+            [uo.id]
+          );
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[rescueLocalConflict] Error al verificar jornada fresca:", e);
+  }
+
+  // Limpiar filas de outbox en conflicto irrecuperable
+  try {
+    await db.runAsync(
+      `UPDATE outbox SET status = 'done' WHERE status = 'failed' AND (
+        last_error LIKE '%jornada%' OR 
+        last_error LIKE '%concluida%' OR 
+        last_error LIKE '%cerrada%' OR 
+        attempts >= 3
+      )`
+    );
+  } catch (e) {
+    console.warn("[rescueLocalConflict] Error limpiando outbox trabado:", e);
+  }
+
+  // Forzar reseteo del cursor para alinear todos los datos locales con el servidor
+  try {
+    await setMeta("last_pull_at", "1970-01-01T00:00:00.000Z");
+  } catch {}
+}
+
+/**
  * FULL sync: pull de catálogo + push del outbox.
  * Usar en el timer periódico para recoger cambios de otros dispositivos.
  * Respeta un cooldown mínimo para no disparar pulls duplicados.
@@ -386,7 +467,11 @@ export async function runSync(userId: string, options: { forcePull?: boolean } =
     // respetan el cooldown para no duplicar lecturas.
     const skipPull = !options.forcePull && now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
 
-    await resolveTodayWorkDay(userId);
+    if (options.forcePull) {
+      await rescueLocalConflict(userId);
+    } else {
+      await resolveTodayWorkDay(userId);
+    }
 
     let pulled = { clients: 0, products: 0 };
     if (!skipPull) {

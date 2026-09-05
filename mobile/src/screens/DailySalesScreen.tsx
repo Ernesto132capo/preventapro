@@ -24,6 +24,7 @@ export function DailySalesScreen() {
   const [showCloseForm, setShowCloseForm] = useState(false);
   const [confirmText, setConfirmText] = useState("");
   const [closing, setClosing] = useState(false);
+  const [reopening, setReopening] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -52,6 +53,7 @@ export function DailySalesScreen() {
   }, [syncTick]);
 
   async function handleClose() {
+    if (closing || reopening) return;
     setError(null);
     if (confirmText !== "CONFIRMAR") {
       setError('Debes escribir exactamente "CONFIRMAR".');
@@ -98,7 +100,9 @@ export function DailySalesScreen() {
   }
 
   async function handleReopen() {
+    if (reopening || closing) return;
     if (!workDay) return;
+    setReopening(true);
     try {
       const serverId = await resolveServerWorkDayId(workDay.id);
       if (serverId) {
@@ -110,6 +114,8 @@ export function DailySalesScreen() {
       Alert.alert("Jornada reabierta", "Puedes seguir registrando pedidos en la jornada de hoy.");
     } catch (err: any) {
       Alert.alert("Error al reabrir", err?.message || "No se pudo reabrir la jornada.");
+    } finally {
+      setReopening(false);
     }
   }
 

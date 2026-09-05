@@ -54,11 +54,27 @@ export function DashboardScreen() {
     if (syncTick > 0) load();
   }, [syncTick]);
 
+  const isSyncing = connection === "syncing" || refreshing;
+
   async function onRefresh() {
+    if (isSyncing) return;
     setRefreshing(true);
-    await forceSync();
-    await load();
-    setRefreshing(false);
+    try {
+      await forceSync();
+      await load();
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function handleManualForceSync() {
+    if (isSyncing) return;
+    try {
+      await forceSync();
+      await load();
+    } catch (err) {
+      console.warn("Error en sincronización forzada:", err);
+    }
   }
 
   async function handleReopen() {
@@ -179,7 +195,14 @@ export function DashboardScreen() {
           <Text style={{ color: colors.amberText, fontWeight: "600" }}>
             {pendingCount} cambio{pendingCount === 1 ? "" : "s"} pendiente{pendingCount === 1 ? "" : "s"} de sincronizar
           </Text>
-          <Button label="Forzar Sincro" onPress={forceSync} variant="outline" style={{ marginTop: spacing.sm }} />
+          <Button
+            label="Forzar Sincro"
+            onPress={handleManualForceSync}
+            variant="outline"
+            disabled={isSyncing}
+            loading={connection === "syncing"}
+            style={{ marginTop: spacing.sm }}
+          />
           <Button
             label="Reiniciar datos locales"
             onPress={() => Alert.alert(
@@ -188,6 +211,7 @@ export function DashboardScreen() {
               [{ text: "Cancelar", style: "cancel" }, { text: "Reiniciar", style: "destructive", onPress: async () => { await resetLocalData(); await load(); Alert.alert("Datos locales reiniciados", "La app descargó nuevamente los datos del servidor."); } }]
             )}
             variant="danger"
+            disabled={isSyncing}
             style={{ marginTop: spacing.sm }}
           />
         </Card>
@@ -198,9 +222,18 @@ export function DashboardScreen() {
           <Text style={{ color: "#7a1a12", fontWeight: "600" }}>Error de sincronización:</Text>
           <Text style={{ color: "#7a1a12", marginTop: 4 }}>{lastError}</Text>
           <Button
+            label="Forzar Sincro (Rescate)"
+            onPress={handleManualForceSync}
+            variant="outline"
+            disabled={isSyncing}
+            loading={connection === "syncing"}
+            style={{ marginTop: spacing.sm }}
+          />
+          <Button
             label="Descartar pendientes con error"
             onPress={discardFailedItems}
             variant="outline"
+            disabled={isSyncing}
             style={{ marginTop: spacing.sm }}
           />
         </Card>

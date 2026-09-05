@@ -87,13 +87,15 @@ export async function resolveServerWorkDayId(localId: string): Promise<string | 
   return null;
 }
 
-export async function markWorkDayClosed(localId: string, orderCount: number, totalCents: number) {
+export async function markWorkDayClosed(localId: string, orderCount?: number, totalCents?: number) {
   const db = await getDb();
-  const row = await db.getFirstAsync<any>(`SELECT work_date FROM work_days WHERE id = ?`, [localId]);
+  const row = await db.getFirstAsync<any>(`SELECT work_date, order_count, total_cents FROM work_days WHERE id = ?`, [localId]);
   const date = row?.work_date || todayStr();
+  const oc = orderCount !== undefined ? orderCount : (row?.order_count ?? 0);
+  const tc = totalCents !== undefined ? totalCents : (row?.total_cents ?? 0);
   await db.runAsync(
     `UPDATE work_days SET status = 'closed', order_count = ?, total_cents = ? WHERE id = ? OR work_date = ?`,
-    [orderCount, totalCents, localId, date]
+    [oc, tc, localId, date]
   );
 }
 

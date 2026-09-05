@@ -8,7 +8,7 @@ import { EmptyState } from "../components/EmptyState";
 import { getClient, listActiveClients } from "../db/repositories/clients";
 import { listProducts, ProductWithPresentations } from "../db/repositories/products";
 import { createOrderLocal, getOrderWithItems, updateOrderLocal } from "../db/repositories/orders";
-import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
+import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId, upsertServerWorkDay } from "../db/repositories/workdays";
 import { buildCartLine, calcOrderTotals, recalcLineQuantity, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
 import { CartLine, Client, Presentation, Product, WorkDay } from "../domain/types";
@@ -144,6 +144,7 @@ export function NewSaleScreen() {
   }
 
   async function handleSaveOrder() {
+    if (saving) return;
     setError(null);
     if (!selectedClient) {
       setError("Selecciona un cliente antes de guardar.");
@@ -155,12 +156,34 @@ export function NewSaleScreen() {
     }
     setSaving(true);
     try {
-      const currentWd = await getTodayWorkDay(user!.id);
+      let currentWd = await getTodayWorkDay(user!.id);
+
+      // Validación obligatoria con el estado más fresco del servidor
+      try {
+        const freshRes = await apiFetch<any>("/workdays/current?fresh=1");
+        if (freshRes?.workDay) {
+          await upsertServerWorkDay(currentWd.id, freshRes.workDay);
+          currentWd = { ...currentWd, ...freshRes.workDay, status: freshRes.workDay.status };
+          setWorkDay(currentWd);
+        }
+      } catch (netErr) {
+        console.warn("No se pudo verificar estado online de jornada, usando local:", netErr);
+      }
+
       if (currentWd.status === "closed") {
-        setError("La jornada de hoy está concluida. Debes reabrir la jornada para registrar preventas.");
         setSaving(false);
+        setError("La jornada de hoy ya fue concluida. Debes reabrir la jornada para registrar preventas.");
+        Alert.alert(
+          "Jornada Concluida",
+          "La jornada de hoy ya fue cerrada por otro usuario. No es posible registrar pedidos en una jornada concluida. Para añadir nuevas preventas debes reabrir la jornada.",
+          [
+            { text: "Entendido", style: "cancel" },
+            { text: "Reabrir Jornada", onPress: handleReopen },
+          ]
+        );
         return;
       }
+
       if (editingOrderId) {
         await updateOrderLocal(editingOrderId, cart, paymentCondition);
       } else {
