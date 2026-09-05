@@ -170,15 +170,23 @@ export async function deleteProductLocal(productId: string): Promise<void> {
 
 export async function upsertProductFromServer(serverProduct: any) {
   const db = await getDb();
+  let localMatch = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM products WHERE server_id = ? OR sku = ?`,
+    [serverProduct.id, serverProduct.sku]
+  );
+
+  const targetId = localMatch ? localMatch.id : serverProduct.id;
+
   await db.runAsync(
     `INSERT INTO products (id, server_id, sku, name, category_id, base_cost_cents, base_unit_name, active, promo_active, sync_status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced')
      ON CONFLICT(id) DO UPDATE SET
-       sku = excluded.sku, name = excluded.name, category_id = excluded.category_id,
-       base_cost_cents = excluded.base_cost_cents, active = excluded.active,
+       server_id = excluded.server_id, sku = excluded.sku, name = excluded.name,
+       category_id = excluded.category_id, base_cost_cents = excluded.base_cost_cents,
+       base_unit_name = excluded.base_unit_name, active = excluded.active,
        promo_active = excluded.promo_active, sync_status = 'synced'`,
     [
-      serverProduct.id,
+      targetId,
       serverProduct.id,
       serverProduct.sku || "",
       serverProduct.name || "",
@@ -189,18 +197,22 @@ export async function upsertProductFromServer(serverProduct: any) {
       serverProduct.promo_active ?? 0,
     ]
   );
+
+  await db.runAsync(`DELETE FROM product_presentations WHERE product_id = ?`, [targetId]);
+
   for (const pres of serverProduct.presentations || []) {
     await db.runAsync(
       `INSERT INTO product_presentations
         (id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
+         server_id = excluded.server_id, product_id = excluded.product_id,
          name = excluded.name, unit_equivalence = excluded.unit_equivalence, price_cents = excluded.price_cents,
          cost_cents = excluded.cost_cents, quantity_available = excluded.quantity_available, active = excluded.active`,
       [
         pres.id,
         pres.id,
-        serverProduct.id,
+        targetId,
         pres.name || "",
         pres.sort_order ?? 0,
         pres.unit_equivalence ?? 1,

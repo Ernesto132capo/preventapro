@@ -47,9 +47,13 @@ catalogRouter.get("/products/:id", async (req, res) => {
 });
 
 catalogRouter.post("/products", async (req: AuthedRequest, res) => {
-  const parsed = productSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+  const parsed = productSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   const d = parsed.data;
-  if (!(await col.products.where("sku", "==", d.sku).limit(1).get()).empty) return res.status(409).json({ error: "Ese SKU ya existe." });
+  const existing = await col.products.where("sku", "==", d.sku).limit(1).get();
+  if (!existing.empty) {
+    return res.json({ product: await serialProduct(existing.docs[0].id, existing.docs[0].data()), deduped: true });
+  }
   const id = uuid(), ts = nowIso(), product = { sku: d.sku, name: d.name, categoryId: d.categoryId ?? null, photoUrl: d.photoUrl ?? null, baseCostCents: d.baseCostCents, baseUnitName: d.baseUnitName, createdBy: req.userId, active: true, createdAt: ts, updatedAt: ts };
   const batch = col.products.firestore.batch(); batch.set(col.products.doc(id), product);
   d.presentations.forEach((p, sortOrder) => batch.set(presentationsCol(id).doc(uuid()), { ...p, productId: id, sortOrder, active: true, createdAt: ts, updatedAt: ts }));

@@ -19,9 +19,17 @@ export function HistoryScreen() {
   const [workDays, setWorkDays] = useState<WorkDay[]>([]);
 
   const load = useCallback(async () => {
-    if (!user) return;
-    setWorkDays(await listClosedWorkDays(user.id));
-  }, [user]);
+    try {
+      const res = await apiFetch<{ workDays: any[] }>("/workdays/history");
+      if (res?.workDays) {
+        setWorkDays(res.workDays);
+        return;
+      }
+    } catch {
+      // Fallback offline
+    }
+    setWorkDays(await listClosedWorkDays());
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
