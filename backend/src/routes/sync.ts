@@ -27,16 +27,21 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
     const isInitial = !req.query.since || since.startsWith("1970");
 
-    const [clientDocs, productDocs, presentationDocs, categoryDocs, neighborhoodDocs] = await Promise.all([
+    const [clientDocs, productDocs, rawPresentationDocs, categoryDocs, neighborhoodDocs] = await Promise.all([
       isInitial ? col.clients.where("active", "==", true).get() : col.clients.where("updatedAt", ">", since).get(),
       isInitial ? col.products.where("active", "==", true).get() : col.products.where("updatedAt", ">", since).get(),
-      isInitial
-        ? col.products.firestore.collectionGroup("presentations").where("active", "==", true).get()
-        : col.products.firestore.collectionGroup("presentations").where("updatedAt", ">", since).get(),
+      col.products.firestore.collectionGroup("presentations").get(),
       col.categories.where("active", "==", true).get(),
       col.neighborhoods.where("active", "==", true).get(),
     ]);
-    const presentations = presentationDocs.docs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
+
+    const filteredPresDocs = rawPresentationDocs.docs.filter((d) => {
+      const data = d.data();
+      if (isInitial) return data.active !== false;
+      return (data.updatedAt && data.updatedAt > since) || (data.createdAt && data.createdAt > since);
+    });
+
+    const presentations = filteredPresDocs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
     res.json({
       serverTime: new Date().toISOString(),
       clients: clientDocs.docs.map((d) => client(d.id, d.data())),
@@ -45,7 +50,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       inventory: presentations.map((p) => ({
         id: p.id,
         presentation_id: p.id,
-        quantity_available: presentationDocs.docs.find((d) => d.id === p.id)?.data().stock ?? 0,
+        quantity_available: filteredPresDocs.find((d: any) => d.id === p.id)?.data().stock ?? 0,
         updated_at: p.updated_at,
       })),
       categories: categoryDocs.docs.map((d) => ({ id: d.id, ...d.data(), active: 1 })),
