@@ -48,10 +48,22 @@ export async function upsertServerWorkDay(localId: string, serverWorkDay: any) {
 
 export async function resolveServerWorkDayId(localId: string): Promise<string | null> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ server_id: string | null }>(`SELECT server_id FROM work_days WHERE id = ?`, [
-    localId,
-  ]);
-  return row?.server_id || null;
+  const row = await db.getFirstAsync<{ server_id: string | null }>(
+    `SELECT server_id FROM work_days WHERE id = ? OR server_id = ?`,
+    [localId, localId]
+  );
+  if (row?.server_id) return row.server_id;
+
+  // Fallback: buscar cualquier jornada abierta que ya tenga server_id resuelto
+  const openWd = await db.getFirstAsync<{ server_id: string | null }>(
+    `SELECT server_id FROM work_days WHERE server_id IS NOT NULL AND status = 'open' ORDER BY created_at DESC LIMIT 1`
+  );
+  if (openWd?.server_id) {
+    await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [openWd.server_id, localId]);
+    return openWd.server_id;
+  }
+
+  return null;
 }
 
 export async function markWorkDayClosed(localId: string, orderCount: number, totalCents: number) {
@@ -63,12 +75,16 @@ export async function markWorkDayClosed(localId: string, orderCount: number, tot
   ]);
 }
 
-export async function listClosedWorkDays(userId: string): Promise<WorkDay[]> {
+export async function listClosedWorkDays(userId?: string): Promise<WorkDay[]> {
   const db = await getDb();
-  const rows = await db.getAllAsync<any>(
-    `SELECT * FROM work_days WHERE user_id = ? AND status = 'closed' ORDER BY work_date DESC`,
-    [userId]
-  );
+  const rows = userId
+    ? await db.getAllAsync<any>(
+        `SELECT * FROM work_days WHERE user_id = ? AND status = 'closed' ORDER BY work_date DESC`,
+        [userId]
+      )
+    : await db.getAllAsync<any>(
+        `SELECT * FROM work_days WHERE status = 'closed' ORDER BY work_date DESC`
+      );
   return rows.map((r) => ({ ...r, local_id: r.id }));
 }
 

@@ -3,6 +3,7 @@ import { View, Text, TextInput, StyleSheet, ScrollView, Pressable, Alert } from 
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "../components/Button";
+import { useSync } from "../context/SyncContext";
 import {
   createProductLocal,
   updateProductLocal,
@@ -20,6 +21,7 @@ const DEFAULT_PRESENTATIONS: EditPresentationInput[] = [
 export function ProductFormScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
+  const { forceSync } = useSync();
   const productId = route.params?.productId as string | undefined;
   const isEditing = !!productId;
 
@@ -80,6 +82,7 @@ export function ProductFormScreen() {
         await createProductLocal({ name: name.trim(), presentations });
       }
       setSaving(false);
+      forceSync().catch((err) => console.warn("Background sync error:", err));
       navigation.goBack();
     } catch (err: any) {
       setSaving(false);

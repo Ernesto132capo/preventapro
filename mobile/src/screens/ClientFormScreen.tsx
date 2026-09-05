@@ -3,6 +3,7 @@ import { View, Text, TextInput, StyleSheet, ScrollView } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "../components/Button";
+import { useSync } from "../context/SyncContext";
 import { createClientLocal, updateClientLocal, getClient } from "../db/repositories/clients";
 
 /** Alta rápida de cliente (Fase 8) — se puede abrir desde Clientes o desde dentro de una preventa.
@@ -10,6 +11,7 @@ import { createClientLocal, updateClientLocal, getClient } from "../db/repositor
 export function ClientFormScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
+  const { forceSync } = useSync();
   const returnToPreventa = route.params?.returnToPreventa as boolean | undefined;
   const clientId = route.params?.clientId as string | undefined;
   const isEditing = !!clientId;
@@ -49,6 +51,7 @@ export function ClientFormScreen() {
         ? await updateClientLocal(clientId!, { businessName, contactName, phone, address })
         : await createClientLocal({ businessName, contactName, phone, address });
       setSaving(false);
+      forceSync().catch((err) => console.warn("Background sync error:", err));
       if (returnToPreventa && !isEditing) {
         // Solo se pasan valores serializables por navegación; evita el warning
         // de React Navigation por enviar una función en params.

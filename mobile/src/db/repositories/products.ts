@@ -198,19 +198,35 @@ export async function upsertProductFromServer(serverProduct: any) {
     ]
   );
 
-  await db.runAsync(`DELETE FROM product_presentations WHERE product_id = ?`, [targetId]);
+  // Mantener presentaciones existentes por nombre o server_id para no romper las referencias
+  // en order_items creadas localmente mientras estaba offline.
+  const existingPresentations = await db.getAllAsync<any>(
+    `SELECT * FROM product_presentations WHERE product_id = ?`,
+    [targetId]
+  );
 
-  for (const pres of serverProduct.presentations || []) {
+  const serverPresList = serverProduct.presentations || [];
+  const serverPresNames = new Set(serverPresList.map((p: any) => (p.name || "").trim().toLowerCase()));
+
+  for (const pres of serverPresList) {
+    const presNameKey = (pres.name || "").trim().toLowerCase();
+    const match = existingPresentations.find(
+      (ep: any) => ep.server_id === pres.id || ep.id === pres.id || (ep.name || "").trim().toLowerCase() === presNameKey
+    );
+
+    const presLocalId = match ? match.id : pres.id;
+
     await db.runAsync(
       `INSERT INTO product_presentations
         (id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          server_id = excluded.server_id, product_id = excluded.product_id,
-         name = excluded.name, unit_equivalence = excluded.unit_equivalence, price_cents = excluded.price_cents,
+         name = excluded.name, sort_order = excluded.sort_order,
+         unit_equivalence = excluded.unit_equivalence, price_cents = excluded.price_cents,
          cost_cents = excluded.cost_cents, quantity_available = excluded.quantity_available, active = excluded.active`,
       [
-        pres.id,
+        presLocalId,
         pres.id,
         targetId,
         pres.name || "",
@@ -222,26 +238,95 @@ export async function upsertProductFromServer(serverProduct: any) {
         pres.active ?? 1,
       ]
     );
+
+    // Si la presentación local tenía otro ID pero coincide con la del servidor, actualizar ítems de preventas locales
+    if (match && match.id !== pres.id) {
+      await db.runAsync(
+        `UPDATE order_items SET presentation_id = ? WHERE presentation_id = ?`,
+        [match.id, pres.id]
+      );
+    }
+  }
+
+  // Desactivar localmente las que fueron eliminadas en el servidor
+  for (const ep of existingPresentations) {
+    const epNameKey = (ep.name || "").trim().toLowerCase();
+    if (!serverPresNames.has(epNameKey) && !serverPresList.some((p: any) => p.id === ep.server_id)) {
+      await db.runAsync(`UPDATE product_presentations SET active = 0 WHERE id = ?`, [ep.id]);
+    }
   }
 }
 
 export async function resolveServerProductId(localId: string): Promise<string | null> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ server_id: string | null; sync_status: string }>(
-    `SELECT server_id, sync_status FROM products WHERE id = ?`,
+  const row = await db.getFirstAsync<{ id: string; server_id: string | null; sync_status: string }>(
+    `SELECT id, server_id, sync_status FROM products WHERE id = ? OR server_id = ?`,
+    [localId, localId]
+  );
+  if (row) {
+    if (row.server_id) return row.server_id;
+    if (row.sync_status === "synced") return row.id;
+  }
+
+  // Fallback: buscar por SKU en el snapshot de ítems de preventa
+  const item = await db.getFirstAsync<{ sku_snapshot: string }>(
+    `SELECT sku_snapshot FROM order_items WHERE product_id = ? LIMIT 1`,
     [localId]
   );
-  if (!row) return null;
-  if (row.server_id) return row.server_id;
-  return row.sync_status === "synced" ? localId : null;
+  if (item?.sku_snapshot) {
+    const bySku = await db.getFirstAsync<{ id: string; server_id: string | null; sync_status: string }>(
+      `SELECT id, server_id, sync_status FROM products WHERE sku = ?`,
+      [item.sku_snapshot]
+    );
+    if (bySku?.server_id) {
+      await db.runAsync(`UPDATE order_items SET product_id = ? WHERE product_id = ?`, [bySku.id, localId]);
+      return bySku.server_id;
+    }
+    if (bySku?.sync_status === "synced") return bySku.id;
+  }
+
+  return null;
 }
 
 export async function resolveServerPresentationId(localId: string): Promise<string | null> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ server_id: string | null }>(
-    `SELECT server_id FROM product_presentations WHERE id = ?`,
+
+  // 1. Coincidencia directa por id
+  const byId = await db.getFirstAsync<{ id: string; server_id: string | null }>(
+    `SELECT id, server_id FROM product_presentations WHERE id = ?`,
     [localId]
   );
-  if (!row) return null;
-  return row.server_id || null;
+  if (byId?.server_id) return byId.server_id;
+
+  // 2. Coincidencia si localId ya es un server_id
+  const byServerId = await db.getFirstAsync<{ server_id: string }>(
+    `SELECT server_id FROM product_presentations WHERE server_id = ?`,
+    [localId]
+  );
+  if (byServerId?.server_id) return byServerId.server_id;
+
+  // 3. Fallback inteligente: buscar por el nombre de la presentación en order_items
+  const item = await db.getFirstAsync<{ product_id: string; presentation_name_snapshot: string }>(
+    `SELECT product_id, presentation_name_snapshot FROM order_items WHERE presentation_id = ? LIMIT 1`,
+    [localId]
+  );
+  if (item?.presentation_name_snapshot) {
+    const product = await db.getFirstAsync<{ id: string; server_id: string | null }>(
+      `SELECT id, server_id FROM products WHERE id = ? OR server_id = ?`,
+      [item.product_id, item.product_id]
+    );
+    if (product) {
+      const presMatch = await db.getFirstAsync<{ id: string; server_id: string | null }>(
+        `SELECT id, server_id FROM product_presentations WHERE (product_id = ? OR product_id = ?) AND name = ?`,
+        [product.id, product.server_id || product.id, item.presentation_name_snapshot]
+      );
+      if (presMatch?.server_id) {
+        // Reparar el registro de order_items para que apunte al id local vigente
+        await db.runAsync(`UPDATE order_items SET presentation_id = ? WHERE presentation_id = ?`, [presMatch.id, localId]);
+        return presMatch.server_id;
+      }
+    }
+  }
+
+  return null;
 }

@@ -3,7 +3,7 @@ import { apiFetch, ApiError } from "./api";
 import { enqueue, listPending, markDone, markFailed, markSyncing, deferForDependency, OutboxRow } from "../db/outbox";
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
 import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
-import { markOrderSynced, markOrderFailed } from "../db/repositories/orders";
+import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getOrCreateOpenWorkDay } from "../db/repositories/workdays";
 
 export interface SyncResult {
@@ -43,6 +43,13 @@ async function pullCatalog(): Promise<{ clients: number; products: number }> {
       quantity_available: invByPresentation[p.id] ?? 0,
     }));
     await upsertProductFromServer({ ...prod, presentations });
+  }
+
+  // Descargar e integrar preventas compartidas del equipo
+  if (data.orders && Array.isArray(data.orders)) {
+    for (const o of data.orders) {
+      await upsertOrderFromServer(o);
+    }
   }
 
   await setMeta("last_pull_at", data.serverTime);
@@ -222,10 +229,20 @@ async function pushOrder(row: OutboxRow, userId: string) {
     return markDone(row.id);
   }
 
-  const workDayServerId = await resolveServerWorkDayId(order.work_day_id);
+  let workDayServerId = await resolveServerWorkDayId(order.work_day_id);
+  if (!workDayServerId) {
+    try {
+      const res = await apiFetch<any>(`/workdays/current`);
+      if (res?.workDay?.id) {
+        workDayServerId = res.workDay.id;
+        await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [workDayServerId, order.work_day_id]);
+      }
+    } catch {}
+  }
+
   const clientServerId = await resolveServerClientId(order.client_id);
   if (!workDayServerId || !clientServerId) {
-    // Dependencia (jornada o cliente) aún no sincronizada — reintentar en la próxima pasada.
+    console.warn(`[pushOrder] Deferring order ${order.id}: workDayServerId=${workDayServerId}, clientServerId=${clientServerId}`);
     return deferForDependency(row.id);
   }
 
@@ -235,6 +252,7 @@ async function pushOrder(row: OutboxRow, userId: string) {
     const productServerId = await resolveServerProductId(item.product_id);
     const presentationServerId = await resolveServerPresentationId(item.presentation_id);
     if (!productServerId || !presentationServerId) {
+      console.warn(`[pushOrder] Deferring order ${order.id}: item ${item.id} missing productServerId=${productServerId}, presentationServerId=${presentationServerId}`);
       return deferForDependency(row.id); // el producto creado offline todavía no sincronizó
     }
     resolvedItems.push({ productId: productServerId, presentationId: presentationServerId, quantity: item.quantity });

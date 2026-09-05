@@ -94,6 +94,16 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
 
 export async function listOrdersForWorkDay(workDayLocalId: string): Promise<LocalOrder[]> {
   const db = await getDb();
+  const wd = await db.getFirstAsync<{ id: string; server_id: string | null }>(
+    `SELECT id, server_id FROM work_days WHERE id = ?`,
+    [workDayLocalId]
+  );
+  if (wd?.server_id) {
+    return db.getAllAsync<LocalOrder>(
+      `SELECT * FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active' ORDER BY created_at DESC`,
+      [workDayLocalId, wd.server_id, wd.server_id]
+    );
+  }
   return db.getAllAsync<LocalOrder>(
     `SELECT * FROM orders WHERE work_day_id = ? AND status = 'active' ORDER BY created_at DESC`,
     [workDayLocalId]
@@ -102,9 +112,121 @@ export async function listOrdersForWorkDay(workDayLocalId: string): Promise<Loca
 
 export async function getOrderWithItems(orderId: string) {
   const db = await getDb();
-  const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ?`, [orderId]);
-  const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [orderId]);
+  const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ? OR server_id = ?`, [orderId, orderId]);
+  if (!order) return { order: null, items: [] };
+  const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
   return { order, items };
+}
+
+export async function upsertOrderFromServer(serverOrder: any) {
+  const db = await getDb();
+
+  let localWorkDay = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM work_days WHERE server_id = ? OR id = ?`,
+    [serverOrder.work_day_id, serverOrder.work_day_id]
+  );
+  if (!localWorkDay) {
+    localWorkDay = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
+    );
+  }
+  const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
+
+  const localClient = await db.getFirstAsync<{ id: string; business_name: string }>(
+    `SELECT id, business_name FROM clients WHERE server_id = ? OR id = ?`,
+    [serverOrder.client_id, serverOrder.client_id]
+  );
+  const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
+  const clientName = serverOrder.client_name || localClient?.business_name || "Cliente";
+
+  const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
+    `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
+    [serverOrder.id, serverOrder.id]
+  );
+
+  if (existing && existing.sync_status === "pending") {
+    return;
+  }
+
+  const targetOrderId = existing ? existing.id : serverOrder.id;
+
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `INSERT INTO orders
+        (id, server_id, work_day_id, client_id, client_name, payment_condition,
+         subtotal_cents, tax_cents, total_cents, item_count, status, sync_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         server_id = excluded.server_id,
+         work_day_id = excluded.work_day_id,
+         client_id = excluded.client_id,
+         client_name = excluded.client_name,
+         payment_condition = excluded.payment_condition,
+         subtotal_cents = excluded.subtotal_cents,
+         tax_cents = excluded.tax_cents,
+         total_cents = excluded.total_cents,
+         item_count = excluded.item_count,
+         status = excluded.status,
+         sync_status = 'synced',
+         updated_at = excluded.updated_at`,
+      [
+        targetOrderId,
+        serverOrder.id,
+        workDayLocalId,
+        clientLocalId,
+        clientName,
+        serverOrder.payment_condition || "Contado 48h",
+        serverOrder.subtotal_cents ?? 0,
+        serverOrder.tax_cents ?? 0,
+        serverOrder.total_cents ?? 0,
+        serverOrder.item_count ?? 0,
+        serverOrder.status || "active",
+        serverOrder.created_at || nowIso(),
+        serverOrder.updated_at || nowIso(),
+      ]
+    );
+
+    await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [targetOrderId]);
+    for (const it of serverOrder.items || []) {
+      const localProd = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM products WHERE server_id = ? OR id = ?`,
+        [it.product_id, it.product_id]
+      );
+      const localPres = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+        [it.presentation_id, it.presentation_id]
+      );
+
+      await db.runAsync(
+        `INSERT INTO order_items
+          (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
+           presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot,
+           quantity, subtotal_cents)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          it.id || uuid(),
+          targetOrderId,
+          localProd ? localProd.id : it.product_id,
+          localPres ? localPres.id : it.presentation_id,
+          it.product_name_snapshot || "",
+          it.sku_snapshot || "",
+          it.presentation_name_snapshot || "",
+          it.unit_equivalence_snapshot ?? 1,
+          it.unit_price_cents_snapshot ?? 0,
+          it.quantity ?? 0,
+          it.subtotal_cents ?? 0,
+        ]
+      );
+    }
+
+    await db.runAsync(
+      `UPDATE work_days SET
+         order_count = (SELECT COUNT(*) FROM orders WHERE work_day_id = ? AND status = 'active'),
+         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE work_day_id = ? AND status = 'active')
+       WHERE id = ?`,
+      [workDayLocalId, workDayLocalId, workDayLocalId]
+    );
+  });
 }
 
 /** Reemplaza los artículos de una preventa abierta y devuelve/resta el stock correctamente. */
