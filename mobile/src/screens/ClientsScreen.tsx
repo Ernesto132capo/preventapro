@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { View, Text, TextInput, FlatList, StyleSheet, Linking, Pressable, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -8,9 +8,11 @@ import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { listActiveClients, setVisitStatus, deleteClientLocal } from "../db/repositories/clients";
 import { Client } from "../domain/types";
+import { useSync } from "../context/SyncContext";
 
 export function ClientsScreen() {
   const navigation = useNavigation<any>();
+  const { syncTick } = useSync();
   const [clients, setClients] = useState<Client[]>([]);
   const [search, setSearch] = useState("");
 
@@ -23,6 +25,11 @@ export function ClientsScreen() {
       load();
     }, [load])
   );
+
+  // Recarga automatica cuando el sync en background trae nuevos datos del servidor
+  useEffect(() => {
+    if (syncTick > 0) load();
+  }, [syncTick]);
 
   async function toggleVisited(c: Client) {
     const next = c.visit_status === "visited" ? "pending" : "visited";

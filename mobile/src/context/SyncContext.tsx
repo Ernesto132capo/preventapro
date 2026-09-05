@@ -1,4 +1,5 @@
 ﻿import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
+import { AppState, AppStateStatus } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
 import { runSync, pushOnlySync, SyncResult } from "../services/sync";
 import { countPending, getFailedErrors, discardFailed } from "../db/outbox";
@@ -13,9 +14,9 @@ interface SyncContextValue {
   lastSyncedAt: string | null;
   lastError: string | null;
   syncTick: number;
-  /** Sync completo (pull + push) - timer periodico y recarga manual */
+  /** Sync completo (pull + push) — timer periodico y recarga manual */
   forceSync: () => Promise<void>;
-  /** Solo push del outbox - usar despues de crear/editar un registro local */
+  /** Solo push del outbox — usar despues de crear/editar un registro local */
   pushSync: () => Promise<void>;
   discardFailedItems: () => Promise<void>;
   resetLocalData: () => Promise<void>;
@@ -31,8 +32,13 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [syncTick, setSyncTick] = useState(0);
+
+  // Refs para evitar stale closures en el timer y el listener de AppState
   const syncingRef = useRef(false);
-  const isConnectedRef = useRef(isConnected);
+  const isConnectedRef = useRef(true);
+  const isActiveRef = useRef(true);   // false cuando la app esta en background
+  const userRef = useRef(user);
+  userRef.current = user;
   isConnectedRef.current = isConnected;
 
   const refreshPendingCount = useCallback(async () => {
@@ -60,29 +66,20 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     }
   }, [refreshPendingCount]);
 
-  const forceSync = useCallback(async () => {
-    if (!user || syncingRef.current) return;
-    syncingRef.current = true;
-    setConnection("syncing");
-    try {
-      const result = await runSync(user.id);
-      await applyResult(result);
-    } catch (err: any) {
-      await refreshPendingCount();
-      setLastError(err?.message || "Fallo la sincronizacion.");
-      setConnection(isConnectedRef.current ? "online" : "offline");
-    } finally {
-      syncingRef.current = false;
-    }
-  }, [user, refreshPendingCount, applyResult]);
+  const applyResultRef = useRef(applyResult);
+  applyResultRef.current = applyResult;
 
-  const pushSync = useCallback(async () => {
-    if (!user || syncingRef.current) return;
+  /**
+   * Sync completo via ref — siempre llama la version actual aunque el timer
+   * tenga una closure antigua. Seguro de usar dentro de setInterval.
+   */
+  const runForceSyncRef = useRef(async () => {
+    if (!userRef.current || syncingRef.current || !isConnectedRef.current) return;
     syncingRef.current = true;
     setConnection("syncing");
     try {
-      const result = await pushOnlySync(user.id);
-      await applyResult(result);
+      const result = await runSync(userRef.current.id);
+      await applyResultRef.current(result);
     } catch (err: any) {
       await refreshPendingCount();
       setLastError(err?.message || "Fallo la sincronizacion.");
@@ -90,7 +87,30 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     } finally {
       syncingRef.current = false;
     }
-  }, [user, refreshPendingCount, applyResult]);
+  });
+
+  /** forceSync expuesto al exterior (para botones manuales, reabrir jornada, etc.) */
+  const forceSync = useCallback(async () => {
+    await runForceSyncRef.current();
+  }, []);
+
+  /** pushSync: solo push del outbox sin pull de catalogo.
+   *  Usar despues de crear/editar clientes, productos o preventas. */
+  const pushSync = useCallback(async () => {
+    if (!userRef.current || syncingRef.current) return;
+    syncingRef.current = true;
+    setConnection("syncing");
+    try {
+      const result = await pushOnlySync(userRef.current.id);
+      await applyResultRef.current(result);
+    } catch (err: any) {
+      await refreshPendingCount();
+      setLastError(err?.message || "Fallo la sincronizacion.");
+      setConnection(isConnectedRef.current ? "online" : "offline");
+    } finally {
+      syncingRef.current = false;
+    }
+  }, [refreshPendingCount]);
 
   const discardFailedItems = useCallback(async () => {
     await discardFailed();
@@ -102,32 +122,53 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     await resetLocalDatabase();
     setLastError(null);
     await refreshPendingCount();
-    await forceSync();
-  }, [forceSync, refreshPendingCount]);
+    await runForceSyncRef.current();
+  }, [refreshPendingCount]);
 
+  // Detectar cambios de conectividad
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener((state) => {
       const online = !!state.isConnected && !!state.isInternetReachable;
       setIsConnected(online);
       isConnectedRef.current = online;
-      if (online && user) {
-        forceSync();
+      if (online) {
+        runForceSyncRef.current();
       } else {
         setConnection("offline");
       }
     });
     return () => unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  }, []);
 
+  // Pausar sync cuando la app va a background; reanudar al volver a foreground
+  useEffect(() => {
+    const handleAppState = (nextState: AppStateStatus) => {
+      if (nextState === "active") {
+        isActiveRef.current = true;
+        // Al volver a foreground, sincronizar de inmediato si hay conexion
+        if (isConnectedRef.current) runForceSyncRef.current();
+      } else {
+        isActiveRef.current = false;
+      }
+    };
+    const sub = AppState.addEventListener("change", handleAppState);
+    return () => sub.remove();
+  }, []);
+
+  // Timer periodico: cada 60 segundos, solo si la app esta activa y conectada
   useEffect(() => {
     refreshPendingCount();
+    // Sync inicial al montar
+    runForceSyncRef.current();
+
     const interval = setInterval(() => {
-      if (isConnectedRef.current && user) forceSync();
-    }, 15000);
+      if (isActiveRef.current && isConnectedRef.current) {
+        runForceSyncRef.current();
+      }
+    }, 60000); // 60 segundos — saludable para Firestore
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  }, []);
 
   return (
     <SyncContext.Provider

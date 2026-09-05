@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { View, Text, TextInput, FlatList, StyleSheet, Pressable, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -8,9 +8,11 @@ import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { listProducts, ProductWithPresentations, deleteProductLocal } from "../db/repositories/products";
 import { centsToBs } from "../domain/pricing";
+import { useSync } from "../context/SyncContext";
 
 export function ProductsScreen() {
   const navigation = useNavigation<any>();
+  const { syncTick } = useSync();
   const [products, setProducts] = useState<ProductWithPresentations[]>([]);
   const [search, setSearch] = useState("");
 
@@ -23,6 +25,11 @@ export function ProductsScreen() {
       load();
     }, [load])
   );
+
+  // Recarga automatica cuando el sync en background trae nuevos datos del servidor
+  useEffect(() => {
+    if (syncTick > 0) load();
+  }, [syncTick]);
 
   function confirmDelete(p: ProductWithPresentations) {
     Alert.alert(
