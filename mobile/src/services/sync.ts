@@ -4,7 +4,7 @@ import { enqueue, listPending, markDone, markFailed, markSyncing, deferForDepend
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
 import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
 import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
-import { resolveServerWorkDayId, upsertServerWorkDay, getOrCreateOpenWorkDay } from "../db/repositories/workdays";
+import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay } from "../db/repositories/workdays";
 
 export interface SyncResult {
   ok: boolean;
@@ -50,6 +50,12 @@ async function pullCatalog(): Promise<{ clients: number; products: number }> {
     for (const o of data.orders) {
       await upsertOrderFromServer(o);
     }
+  }
+
+  // Actualizar estado de la jornada compartida de hoy si vino en el pull
+  if (data.workDay) {
+    const todayLocal = await getTodayWorkDay("team");
+    await upsertServerWorkDay(todayLocal.id, data.workDay);
   }
 
   await setMeta("last_pull_at", data.serverTime);
@@ -107,22 +113,17 @@ async function reconcileResetServerMappings() {
   }
 }
 
-/** Asegura que la jornada local de hoy tenga un server_id resuelto antes de subir preventas. */
+/** Asegura que la jornada local de hoy tenga un server_id y estado resuelto antes de subir preventas. */
 async function resolveTodayWorkDay(userId: string) {
-  const local = await getOrCreateOpenWorkDay(userId);
+  const local = await getTodayWorkDay(userId);
   const res = await apiFetch<any>(`/workdays/current`);
-  // Siempre renovamos el vínculo: si el backend se reinició, el server_id local
-  // anterior ya no existe y las preventas recibirían "Jornada no encontrada".
   await upsertServerWorkDay(local.id, res.workDay);
-  // Tras volver a iniciar sesión (p. ej. si se restauró el backend), las
-  // preventas offline pueden pertenecer a la jornada local del usuario anterior.
-  // Las vinculamos a la jornada abierta actual para que no queden bloqueadas.
   const db = await getDb();
-  const openLocalDays = await db.getAllAsync<{ id: string }>(
-    `SELECT id FROM work_days WHERE work_date = ? AND status = 'open'`,
+  const allTodayDays = await db.getAllAsync<{ id: string }>(
+    `SELECT id FROM work_days WHERE work_date = ?`,
     [local.work_date]
   );
-  for (const day of openLocalDays) await upsertServerWorkDay(day.id, res.workDay);
+  for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
 
 async function pushClient(row: OutboxRow) {

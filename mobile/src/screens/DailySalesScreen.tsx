@@ -8,7 +8,7 @@ import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { getOrCreateOpenWorkDay, resolveServerWorkDayId, markWorkDayClosed } from "../db/repositories/workdays";
+import { getOrCreateOpenWorkDay, resolveServerWorkDayId, markWorkDayClosed, upsertServerWorkDay } from "../db/repositories/workdays";
 import { listOrdersForWorkDay, countUnsyncedOrders } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
@@ -77,13 +77,15 @@ export function DailySalesScreen() {
         body: { confirmation: confirmText },
       });
       await markWorkDayClosed(workDay.id, res.workDay.order_count, res.workDay.total_cents);
+      await upsertServerWorkDay(workDay.id, res.workDay);
       setClosing(false);
       setShowCloseForm(false);
       Alert.alert(
-        "Jornada cerrada",
-        `Total del día: ${centsToBs(res.workDay.total_cents)}. Los reportes Excel ya están disponibles en el servidor.`
+        "Jornada concluida",
+        `Total final del día: ${centsToBs(res.workDay.total_cents)}. Preventas concluidas: ${res.workDay.order_count}.`
       );
-      load();
+      await forceSync();
+      await load();
     } catch (err) {
       setClosing(false);
       setError(err instanceof ApiError ? err.message : "No se pudo cerrar la jornada.");

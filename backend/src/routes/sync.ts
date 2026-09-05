@@ -27,12 +27,17 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
     const isInitial = !req.query.since || since.startsWith("1970");
 
-    const [clientDocs, productDocs, rawPresentationDocs, categoryDocs, neighborhoodDocs, openWorkDaysSnap] = await Promise.all([
+    const todayParts = new Intl.DateTimeFormat("en-US", { timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+    const v = (t: string) => todayParts.find((x) => x.type === t)?.value;
+    const todayDate = `${v("year")}-${v("month")}-${v("day")}`;
+
+    const [clientDocs, productDocs, rawPresentationDocs, categoryDocs, neighborhoodDocs, todayWorkDaysSnap, openWorkDaysSnap] = await Promise.all([
       isInitial ? col.clients.where("active", "==", true).get() : col.clients.where("updatedAt", ">", since).get(),
       isInitial ? col.products.where("active", "==", true).get() : col.products.where("updatedAt", ">", since).get(),
       col.products.firestore.collectionGroup("presentations").get(),
       col.categories.where("active", "==", true).get(),
       col.neighborhoods.where("active", "==", true).get(),
+      col.workDays.where("workDate", "==", todayDate).get(),
       col.workDays.where("status", "==", "open").get(),
     ]);
 
@@ -44,15 +49,18 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
     const presentations = filteredPresDocs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
 
-    // Fetch orders for active open workdays so all preventistas see shared orders
-    const openWorkDayIds = openWorkDaysSnap.docs.map((d) => d.id);
+    // Fetch orders for today's workday (open or closed) and any open workdays
+    const relevantWorkDayIds = Array.from(new Set([
+      ...todayWorkDaysSnap.docs.map((d) => d.id),
+      ...openWorkDaysSnap.docs.map((d) => d.id),
+    ]));
     let orders: any[] = [];
-    if (openWorkDayIds.length > 0) {
+    if (relevantWorkDayIds.length > 0) {
       const orderDocs = (
-        openWorkDayIds.length <= 10
-          ? await col.orders.where("workDayId", "in", openWorkDayIds).get()
+        relevantWorkDayIds.length <= 10
+          ? await col.orders.where("workDayId", "in", relevantWorkDayIds).get()
           : await col.orders.get()
-      ).docs.filter((d) => openWorkDayIds.includes(d.data().workDayId));
+      ).docs.filter((d) => relevantWorkDayIds.includes(d.data().workDayId));
 
       orders = await Promise.all(
         orderDocs.map(async (d) => {
@@ -82,8 +90,27 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       );
     }
 
+    const todayWorkDayDoc =
+      todayWorkDaysSnap.docs.find((d) => d.data().status === "open") ||
+      todayWorkDaysSnap.docs.find((d) => d.data().status === "closed") ||
+      openWorkDaysSnap.docs[0];
+
+    const workDayData = todayWorkDayDoc
+      ? {
+          id: todayWorkDayDoc.id,
+          user_id: todayWorkDayDoc.data().userId,
+          work_date: todayWorkDayDoc.data().workDate,
+          status: todayWorkDayDoc.data().status,
+          order_count: todayWorkDayDoc.data().orderCount ?? 0,
+          total_cents: todayWorkDayDoc.data().totalCents ?? 0,
+          created_at: todayWorkDayDoc.data().createdAt,
+          closed_at: todayWorkDayDoc.data().closedAt ?? null,
+        }
+      : null;
+
     res.json({
       serverTime: new Date().toISOString(),
+      workDay: workDayData,
       clients: clientDocs.docs.map((d) => client(d.id, d.data())),
       products: productDocs.docs.map((d) => product(d.id, d.data())),
       presentations,
