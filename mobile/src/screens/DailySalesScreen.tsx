@@ -199,45 +199,6 @@ export function DailySalesScreen() {
         </View>
       )}
 
-      {workDay.status === "closed" && (
-        <View style={styles.closeSection}>
-          <Card style={{ backgroundColor: colors.surfaceAlt2, borderColor: colors.emerald }}>
-            <Text style={{ fontWeight: "700", color: colors.navy, fontSize: 14 }}>
-              Jornada concluida
-            </Text>
-            <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
-              Si un cliente te llama más tarde o necesitas registrar preventas adicionales hoy, puedes reabrir la jornada.
-            </Text>
-            <Button
-              label="Reabrir jornada del día"
-              variant="secondary"
-              onPress={() => Alert.alert(
-                "Reabrir jornada",
-                "¿Deseas volver a abrir la jornada para añadir más preventas hoy?",
-                [
-                  { text: "Cancelar", style: "cancel" },
-                  {
-                    text: "Reabrir",
-                    onPress: async () => {
-                      try {
-                        const sId = await resolveServerWorkDayId(workDay.id);
-                        if (sId) await apiFetch(`/workdays/${sId}/reopen`, { method: "POST" });
-                        await reopenWorkDayLocal(workDay.id);
-                        await forceSync();
-                        await load();
-                        Alert.alert("Jornada reabierta", "Ya puedes registrar nuevas preventas hoy.");
-                      } catch (e: any) {
-                        Alert.alert("Error al reabrir", e?.message || "No se pudo reabrir.");
-                      }
-                    },
-                  },
-                ]
-              )}
-              style={{ marginTop: spacing.md }}
-            />
-          </Card>
-        </View>
-      )}
     </View>
   );
 }
