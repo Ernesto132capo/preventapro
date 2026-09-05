@@ -6,7 +6,7 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
 function today() { const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()); const v = (t: string) => p.find(x => x.type === t)?.value; return `${v("year")}-${v("month")}-${v("day")}`; }
-function serial(id: string, d: any) { return { id, user_id: d.userId, work_date: d.workDate, status: d.status, order_count: d.orderCount ?? 0, total_cents: d.totalCents ?? 0, created_at: d.createdAt, closed_at: d.closedAt ?? null }; }
+function serial(id: string, d: any) { return { id, server_id: id, user_id: d.userId, work_date: d.workDate, status: d.status, order_count: d.orderCount ?? 0, total_cents: d.totalCents ?? 0, created_at: d.createdAt, closed_at: d.closedAt ?? null }; }
 async function recalc(id: string) { const orders = (await col.orders.where("workDayId", "==", id).get()).docs.map(d => d.data()).filter(d => d.status !== "cancelled"); const total = orders.reduce((n, d) => n + (d.totalCents ?? 0), 0); await col.workDays.doc(id).update({ orderCount: orders.length, totalCents: total, updatedAt: nowIso() }); return { orderCount: orders.length, totalCents: total }; }
 
 workdaysRouter.get("/current", async (req: AuthedRequest, res) => {

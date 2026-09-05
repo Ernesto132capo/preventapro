@@ -8,6 +8,7 @@ import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { useAuth } from "../context/AuthContext";
 import { deleteClosedWorkDayLocal, listClosedWorkDays } from "../db/repositories/workdays";
+import { listOrdersForWorkDay } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { WorkDay } from "../domain/types";
 import { API_BASE_URL } from "../services/config";
@@ -17,6 +18,9 @@ import { apiFetch, getAccessToken } from "../services/api";
 export function HistoryScreen() {
   const { user } = useAuth();
   const [workDays, setWorkDays] = useState<WorkDay[]>([]);
+  const [expandedWorkDayId, setExpandedWorkDayId] = useState<string | null>(null);
+  const [ordersMap, setOrdersMap] = useState<Record<string, any[]>>({});
+  const [loadingOrders, setLoadingOrders] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -30,6 +34,30 @@ export function HistoryScreen() {
     }
     setWorkDays(await listClosedWorkDays());
   }, []);
+
+  const toggleExpand = async (item: WorkDay) => {
+    if (expandedWorkDayId === item.id) {
+      setExpandedWorkDayId(null);
+      return;
+    }
+    setExpandedWorkDayId(item.id);
+    if (!ordersMap[item.id]) {
+      const serverId = item.server_id || item.id;
+      setLoadingOrders(item.id);
+      try {
+        const res = await apiFetch<any>(`/workdays/${serverId}/orders`);
+        if (res?.orders) {
+          setOrdersMap((prev) => ({ ...prev, [item.id]: res.orders }));
+        }
+      } catch {
+        // Fallback local
+        const localOrders = await listOrdersForWorkDay(item.id);
+        setOrdersMap((prev) => ({ ...prev, [item.id]: localOrders }));
+      } finally {
+        setLoadingOrders(null);
+      }
+    }
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -77,28 +105,65 @@ export function HistoryScreen() {
             <Text style={styles.total}>{centsToBs(item.total_cents)}</Text>
             <Text style={styles.sub}>{item.order_count} preventa(s)</Text>
             <Text style={styles.sub}>Creado a las {creationTime(item.created_at)}</Text>
-            {item.server_id && (
-              <View style={styles.reportsRow}>
-                <Button
-                  label="lista_de_productos.xlsx"
-                  variant="outline"
-                  onPress={() => openReport(item.server_id!, "lista_de_productos.xlsx")}
-                  style={{ marginRight: spacing.sm, minHeight: 36, paddingHorizontal: 10 }}
-                />
-                <Button
-                  label="resumen_clientes.xlsx"
-                  variant="outline"
-                  onPress={() => openReport(item.server_id!, "resumen_clientes.xlsx")}
-                  style={{ minHeight: 36, paddingHorizontal: 10 }}
-                />
-                <Button
-                  label="Boletas para imprimir (PDF)"
-                  variant="outline"
-                  onPress={() => openReport(item.server_id!, "boletas_clientes.pdf")}
-                  style={{ minHeight: 36, paddingHorizontal: 10 }}
-                />
-              </View>
-            )}
+            {(() => {
+              const serverId = item.server_id || item.id;
+              if (!serverId) return null;
+              const isExpanded = expandedWorkDayId === item.id;
+              return (
+                <View style={{ marginTop: spacing.md }}>
+                  <Text style={styles.sectionLabel}>Archivos y reportes descargables:</Text>
+                  <View style={styles.reportsRow}>
+                    <Button
+                      label="📊 Lista de productos (.xlsx)"
+                      variant="outline"
+                      onPress={() => openReport(serverId, "lista_de_productos.xlsx")}
+                      style={styles.reportBtn}
+                    />
+                    <Button
+                      label="📑 Resumen de clientes (.xlsx)"
+                      variant="outline"
+                      onPress={() => openReport(serverId, "resumen_clientes.xlsx")}
+                      style={styles.reportBtn}
+                    />
+                    <Button
+                      label="🖨️ Boletas para imprimir (.pdf)"
+                      variant="primary"
+                      onPress={() => openReport(serverId, "boletas_clientes.pdf")}
+                      style={styles.reportBtn}
+                    />
+                  </View>
+
+                  <Button
+                    label={isExpanded ? "Ocultar preventas" : "Ver preventas de esta jornada"}
+                    variant="outline"
+                    onPress={() => toggleExpand(item)}
+                    style={{ marginTop: spacing.sm, minHeight: 38 }}
+                  />
+
+                  {isExpanded && (
+                    <View style={styles.ordersContainer}>
+                      {loadingOrders === item.id ? (
+                        <Text style={styles.loadingOrdersText}>Cargando preventas...</Text>
+                      ) : (ordersMap[item.id] || []).length === 0 ? (
+                        <Text style={styles.loadingOrdersText}>No hay preventas registradas en esta jornada.</Text>
+                      ) : (
+                        (ordersMap[item.id] || []).map((ord: any, idx: number) => (
+                          <View key={ord.id || idx} style={styles.orderCard}>
+                            <View style={styles.rowBetween}>
+                              <Text style={styles.orderClientText}>{ord.business_name || ord.client_name || "Cliente"}</Text>
+                              <Text style={styles.orderTotalText}>{centsToBs(ord.totalCents ?? ord.total_cents ?? 0)}</Text>
+                            </View>
+                            <Text style={styles.orderSubText}>
+                              {ord.item_count ?? (ord.items ? ord.items.length : 0)} producto(s) · {ord.payment_condition || ord.paymentCondition || "Contado"}
+                            </Text>
+                          </View>
+                        ))
+                      )}
+                    </View>
+                  )}
+                </View>
+              );
+            })()}
             <Button
               label="Eliminar registro"
               variant="danger"
@@ -121,5 +186,13 @@ const styles = StyleSheet.create({
   date: { fontSize: 14, fontWeight: "700", color: colors.textPrimary, textTransform: "capitalize" },
   total: { fontSize: 22, fontWeight: "700", color: colors.textPrimary, marginTop: 4 },
   sub: { fontSize: 12, color: colors.textMuted },
-  reportsRow: { flexDirection: "row", marginTop: spacing.md, flexWrap: "wrap", gap: spacing.sm },
+  sectionLabel: { fontSize: 13, fontWeight: "600", color: colors.textPrimary, marginBottom: spacing.xs },
+  reportsRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, marginBottom: spacing.xs },
+  reportBtn: { minHeight: 38, paddingHorizontal: 12, flexGrow: 1 },
+  ordersContainer: { marginTop: spacing.sm, backgroundColor: colors.surfaceAlt2, padding: spacing.sm, borderRadius: 8 },
+  loadingOrdersText: { fontSize: 13, color: colors.textMuted, textAlign: "center", paddingVertical: spacing.sm },
+  orderCard: { backgroundColor: colors.surface, padding: spacing.sm, borderRadius: 6, marginBottom: spacing.xs },
+  orderClientText: { fontSize: 14, fontWeight: "600", color: colors.textPrimary },
+  orderTotalText: { fontSize: 14, fontWeight: "700", color: colors.navy },
+  orderSubText: { fontSize: 12, color: colors.textSecondary, marginTop: 2 },
 });

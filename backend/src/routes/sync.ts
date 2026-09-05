@@ -49,51 +49,44 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
     const presentations = filteredPresDocs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
 
-    // Fetch orders for today's workday (open or closed) and any open workdays
-    const relevantWorkDayIds = Array.from(new Set([
-      ...todayWorkDaysSnap.docs.map((d) => d.id),
-      ...openWorkDaysSnap.docs.map((d) => d.id),
-    ]));
-    let orders: any[] = [];
-    if (relevantWorkDayIds.length > 0) {
-      const orderDocs = (
-        relevantWorkDayIds.length <= 10
-          ? await col.orders.where("workDayId", "in", relevantWorkDayIds).get()
-          : await col.orders.get()
-      ).docs.filter((d) => relevantWorkDayIds.includes(d.data().workDayId));
-
-      orders = await Promise.all(
-        orderDocs.map(async (d) => {
-          const data = d.data();
-          const itemsSnap = await orderItemsCol(d.id).get();
-          const clientDoc = await col.clients.doc(data.clientId).get();
-          return {
-            id: d.id,
-            work_day_id: data.workDayId,
-            user_id: data.userId,
-            client_id: data.clientId,
-            client_name: clientDoc.data()?.businessName || "Cliente",
-            payment_condition: data.paymentCondition || "Contado 48h",
-            subtotal_cents: data.subtotalCents ?? 0,
-            tax_cents: data.taxCents ?? 0,
-            total_cents: data.totalCents ?? 0,
-            item_count: data.itemCount ?? 0,
-            status: data.status || "active",
-            created_at: data.createdAt,
-            updated_at: data.updatedAt,
-            items: itemsSnap.docs.map((it) => ({
-              id: it.id,
-              ...it.data(),
-            })),
-          };
-        })
-      );
-    }
-
+    // Determinar la jornada activa o más reciente de hoy
     const todayWorkDayDoc =
       todayWorkDaysSnap.docs.find((d) => d.data().status === "open") ||
-      todayWorkDaysSnap.docs.find((d) => d.data().status === "closed") ||
+      todayWorkDaysSnap.docs.sort((a, b) => (b.data().createdAt || "").localeCompare(a.data().createdAt || ""))[0] ||
       openWorkDaysSnap.docs[0];
+
+    let orders: any[] = [];
+    if (todayWorkDayDoc) {
+      const orderDocs = await col.orders.where("workDayId", "==", todayWorkDayDoc.id).get();
+      orders = await Promise.all(
+        orderDocs.docs
+          .filter((d) => d.data().status !== "cancelled")
+          .map(async (d) => {
+            const data = d.data();
+            const itemsSnap = await orderItemsCol(d.id).get();
+            const clientDoc = await col.clients.doc(data.clientId).get();
+            return {
+              id: d.id,
+              work_day_id: data.workDayId,
+              user_id: data.userId,
+              client_id: data.clientId,
+              client_name: clientDoc.data()?.businessName || "Cliente",
+              payment_condition: data.paymentCondition || "Contado 48h",
+              subtotal_cents: data.subtotalCents ?? 0,
+              tax_cents: data.taxCents ?? 0,
+              total_cents: data.totalCents ?? 0,
+              item_count: data.itemCount ?? 0,
+              status: data.status || "active",
+              created_at: data.createdAt,
+              updated_at: data.updatedAt,
+              items: itemsSnap.docs.map((it) => ({
+                id: it.id,
+                ...it.data(),
+              })),
+            };
+          })
+      );
+    }
 
     const workDayData = todayWorkDayDoc
       ? {

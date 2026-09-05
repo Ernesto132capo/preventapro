@@ -56,6 +56,23 @@ async function pullCatalog(): Promise<{ clients: number; products: number }> {
   if (data.workDay) {
     const todayLocal = await getTodayWorkDay("team");
     await upsertServerWorkDay(todayLocal.id, data.workDay);
+
+    // Limpiar órdenes locales viejas o fantasmas que ya no pertenecen a la jornada de hoy
+    if (data.orders && Array.isArray(data.orders)) {
+      const validServerOrderIds = new Set(data.orders.map((o: any) => o.id));
+      const db = await getDb();
+      const localOrders = await db.getAllAsync<{ id: string; server_id: string | null; sync_status: string }>(
+        `SELECT id, server_id, sync_status FROM orders WHERE (work_day_id = ? OR work_day_id = ?) AND status = 'active'`,
+        [todayLocal.id, data.workDay.id]
+      );
+      for (const lo of localOrders) {
+        // Solo descartar órdenes ya sincronizadas cuyo server_id ya no existe en la jornada actual
+        if (lo.sync_status === "synced" && lo.server_id && !validServerOrderIds.has(lo.server_id)) {
+          await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [lo.id]);
+          await db.runAsync(`DELETE FROM orders WHERE id = ?`, [lo.id]);
+        }
+      }
+    }
   }
 
   await setMeta("last_pull_at", data.serverTime);

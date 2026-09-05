@@ -91,7 +91,12 @@ export function DashboardScreen() {
       </View>
 
       <Card style={{ backgroundColor: colors.navy, marginTop: spacing.lg }}>
-        <Text style={styles.totalLabel}>Total preventado hoy</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.totalLabel}>Total preventado hoy</Text>
+          {workDay.status === "closed" && (
+            <StatusPill kind="synced" label="Jornada Concluida" />
+          )}
+        </View>
         <Text style={styles.totalValue}>{centsToBs(workDay.total_cents)}</Text>
         <View style={styles.metaRow}>
           <Text style={styles.metaText}>{workDay.order_count} preventa{workDay.order_count === 1 ? "" : "s"}</Text>
@@ -102,6 +107,23 @@ export function DashboardScreen() {
           )}
         </View>
       </Card>
+
+      {workDay.status === "closed" && (
+        <Card style={{ marginTop: spacing.md, backgroundColor: colors.surfaceAlt2, borderColor: colors.emerald }}>
+          <Text style={{ fontWeight: "700", color: colors.navy, fontSize: 14 }}>
+            ✅ La jornada de hoy ya fue concluida.
+          </Text>
+          <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 2 }}>
+            Puedes consultar el resumen, descargar los reportes en Excel o generar las boletas en PDF desde Registros Históricos.
+          </Text>
+          <Button
+            label="📁 Ver Reportes y Registros Históricos"
+            variant="primary"
+            onPress={() => navigation.navigate("Historial")}
+            style={{ marginTop: spacing.sm }}
+          />
+        </Card>
+      )}
 
       {pendingCount > 0 && (
         <Card style={{ marginTop: spacing.md, backgroundColor: colors.amberBg, borderColor: colors.amberBg }}>
@@ -120,7 +142,6 @@ export function DashboardScreen() {
             style={{ marginTop: spacing.sm }}
           />
         </Card>
-        
       )}
 
       {lastError && (
@@ -140,6 +161,12 @@ export function DashboardScreen() {
         <Button label="Nueva Preventa" onPress={() => navigation.navigate("Preventa")} style={{ flex: 1, marginRight: spacing.sm }} />
         <Button label="Nuevo Cliente" onPress={() => navigation.navigate("NuevoCliente")} variant="outline" style={{ flex: 1 }} />
       </View>
+      <Button
+        label="📁 Registros Históricos y Reportes"
+        onPress={() => navigation.navigate("Historial")}
+        variant="outline"
+        style={{ marginTop: spacing.sm }}
+      />
 
       <Text style={styles.sectionTitle}>Preventas recientes</Text>
       {recentOrders.length === 0 ? (
@@ -168,6 +195,7 @@ export function DashboardScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
+  rowBetween: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
   headerActions: { flexDirection: "row", alignItems: "center" },
   logoutButton: { minHeight: 34, paddingHorizontal: 10, marginLeft: spacing.sm },
