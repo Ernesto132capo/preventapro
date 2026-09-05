@@ -1,0 +1,8 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+dist/
+reports/*/
+.expo/
+backend/firebase-service-account.json

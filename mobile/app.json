@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "PreventaPro",
+    "slug": "preventapro",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#001428"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "bo.preventapro.app"
+    },
+    "android": {
+      "package": "bo.preventapro.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#001428"
+      },
+      "permissions": [
+        "CAMERA",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [],
+    "extra": {
+      "eas": {
+        "projectId": "1f2dcbf1-a3a1-4a0c-a4ec-7da54ad4ba5b"
+      }
+    }
+  }
+}
