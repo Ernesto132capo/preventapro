@@ -7,7 +7,20 @@ syncRouter.use(requireAuth);
 
 function client(id: string, d: any) { return { id, business_name: d.businessName, contact_name: d.contactName ?? null, phone: d.phone ?? null, neighborhood_id: d.neighborhoodId ?? null, address: d.address ?? null, lat: d.lat ?? null, lng: d.lng ?? null, visit_status: d.visitStatus ?? "pending", active: d.active === false ? 0 : 1, created_at: d.createdAt, updated_at: d.updatedAt }; }
 function product(id: string, d: any) { return { id, sku: d.sku, name: d.name, category_id: d.categoryId ?? null, photo_url: d.photoUrl ?? null, base_cost_cents: d.baseCostCents ?? 0, base_unit_name: d.baseUnitName ?? "Unidad", active: d.active === false ? 0 : 1, created_at: d.createdAt, updated_at: d.updatedAt }; }
-function presentation(id: string, d: any) { return { id, product_id: d.productId, name: d.name, sort_order: d.sortOrder, unit_equivalence: d.unitEquivalence, price_cents: d.priceCents, cost_cents: d.costCents, active: d.active === false ? 0 : 1, created_at: d.createdAt, updated_at: d.updatedAt }; }
+function presentation(id: string, d: any, parentProductId?: string) {
+  return {
+    id,
+    product_id: d.productId || parentProductId || null,
+    name: d.name,
+    sort_order: d.sortOrder ?? 0,
+    unit_equivalence: d.unitEquivalence ?? 1,
+    price_cents: d.priceCents ?? 0,
+    cost_cents: d.costCents ?? 0,
+    active: d.active === false ? 0 : 1,
+    created_at: d.createdAt || new Date().toISOString(),
+    updated_at: d.updatedAt || new Date().toISOString(),
+  };
+}
 
 syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   try {
@@ -23,7 +36,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       col.categories.where("active", "==", true).get(),
       col.neighborhoods.where("active", "==", true).get(),
     ]);
-    const presentations = presentationDocs.docs.map((d) => presentation(d.id, d.data()));
+    const presentations = presentationDocs.docs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
     res.json({
       serverTime: new Date().toISOString(),
       clients: clientDocs.docs.map((d) => client(d.id, d.data())),
