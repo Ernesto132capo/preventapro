@@ -11,11 +11,15 @@ function presentation(id: string, d: any) { return { id, product_id: d.productId
 
 syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   try {
-    const since = String(req.query.since || "1970-01-01T00:00:00.000Z");
+    const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
+    const isInitial = !req.query.since || since.startsWith("1970");
+
     const [clientDocs, productDocs, presentationDocs, categoryDocs, neighborhoodDocs] = await Promise.all([
-      col.clients.where("updatedAt", ">", since).get(),
-      col.products.where("updatedAt", ">", since).get(),
-      col.products.firestore.collectionGroup("presentations").where("updatedAt", ">", since).get(),
+      isInitial ? col.clients.where("active", "==", true).get() : col.clients.where("updatedAt", ">", since).get(),
+      isInitial ? col.products.where("active", "==", true).get() : col.products.where("updatedAt", ">", since).get(),
+      isInitial
+        ? col.products.firestore.collectionGroup("presentations").where("active", "==", true).get()
+        : col.products.firestore.collectionGroup("presentations").where("updatedAt", ">", since).get(),
       col.categories.where("active", "==", true).get(),
       col.neighborhoods.where("active", "==", true).get(),
     ]);
