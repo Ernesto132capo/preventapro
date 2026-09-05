@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { View, Text, ScrollView, StyleSheet, RefreshControl, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
@@ -15,7 +15,7 @@ import { apiFetch } from "../services/api";
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
-  const { connection, pendingCount, forceSync, lastError, discardFailedItems, resetLocalData } = useSync();
+  const { connection, pendingCount, forceSync, lastError, discardFailedItems, resetLocalData, syncTick } = useSync();
   const navigation = useNavigation<any>();
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
@@ -48,6 +48,11 @@ export function DashboardScreen() {
       load();
     }, [load])
   );
+
+  // Recarga automática cada vez que termina un sync en background
+  useEffect(() => {
+    if (syncTick > 0) load();
+  }, [syncTick]);
 
   async function onRefresh() {
     setRefreshing(true);
@@ -99,7 +104,7 @@ export function DashboardScreen() {
     >
       <View style={styles.headerRow}>
         <View>
-          <Text style={styles.greeting}>Hola, {user.fullName.split(" ")[0]}</Text>
+          <Text style={styles.greeting}>Hola, Preventista 👋</Text>
           <Text style={styles.date}>{new Date().toLocaleDateString("es-BO", { weekday: "long", day: "numeric", month: "long" })}</Text>
         </View>
         <View style={styles.headerActions}>

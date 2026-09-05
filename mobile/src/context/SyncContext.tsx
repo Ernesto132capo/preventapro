@@ -12,6 +12,7 @@ interface SyncContextValue {
   pendingCount: number;
   lastSyncedAt: string | null;
   lastError: string | null;
+  syncTick: number; // incrementa cada vez que termina un sync exitoso
   forceSync: () => Promise<void>;
   discardFailedItems: () => Promise<void>;
   resetLocalData: () => Promise<void>;
@@ -26,6 +27,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const [pendingCount, setPendingCount] = useState(0);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [syncTick, setSyncTick] = useState(0);
   const syncingRef = useRef(false);
 
   const refreshPendingCount = useCallback(async () => {
@@ -44,12 +46,14 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
         setLastSyncedAt(new Date().toISOString());
         setLastError(null);
         setConnection("online");
+        setSyncTick((t) => t + 1); // notifica a las pantallas que actualicen sus datos
       } else if (result.ok) {
         const detail = failedRows
           .map((r) => `[${r.entity_type}] ${r.last_error || "sin detalle"}`)
           .join(" | ");
         setLastError(`${failedRows.length} elemento(s) con error: ${detail}`);
         setConnection(isConnected ? "online" : "offline");
+        setSyncTick((t) => t + 1);
       } else {
         setLastError(result.error || "No se pudo sincronizar.");
         setConnection(isConnected ? "online" : "offline");
@@ -59,7 +63,6 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       setLastError(err?.message || "Falló una operación local durante la sincronización.");
       setConnection(isConnected ? "online" : "offline");
     } finally {
-      // Nunca bloquear posteriores intentos por un fallo inesperado.
       syncingRef.current = false;
     }
   }, [user, isConnected, refreshPendingCount]);
@@ -74,7 +77,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     await resetLocalDatabase();
     setLastError(null);
     await refreshPendingCount();
-    await forceSync(); // recrea jornada y vuelve a descargar catálogo/clientes
+    await forceSync();
   }, [forceSync, refreshPendingCount]);
 
   useEffect(() => {
@@ -95,14 +98,14 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     refreshPendingCount();
     const interval = setInterval(() => {
       if (isConnected && user) forceSync();
-    }, 60000); // sincronización automática periódica cuando hay conexión
+    }, 15000); // auto-sync cada 15 segundos para reflejar cambios de otros dispositivos
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isConnected, user]);
 
   return (
     <SyncContext.Provider
-      value={{ connection, pendingCount, lastSyncedAt, lastError, forceSync, discardFailedItems, resetLocalData }}
+      value={{ connection, pendingCount, lastSyncedAt, lastError, syncTick, forceSync, discardFailedItems, resetLocalData }}
     >
       {children}
     </SyncContext.Provider>

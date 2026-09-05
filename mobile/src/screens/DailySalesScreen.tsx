@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { View, Text, FlatList, StyleSheet, TextInput, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
@@ -16,7 +16,7 @@ import { apiFetch, ApiError } from "../services/api";
 
 export function DailySalesScreen() {
   const { user } = useAuth();
-  const { forceSync, connection } = useSync();
+  const { forceSync, connection, syncTick } = useSync();
   const navigation = useNavigation<any>();
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
@@ -45,6 +45,11 @@ export function DailySalesScreen() {
       load();
     }, [load])
   );
+
+  // Recarga automática cada vez que termina un sync en background
+  useEffect(() => {
+    if (syncTick > 0) load();
+  }, [syncTick]);
 
   async function handleClose() {
     setError(null);
