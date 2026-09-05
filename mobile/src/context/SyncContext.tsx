@@ -73,12 +73,12 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
    * Sync completo via ref — siempre llama la version actual aunque el timer
    * tenga una closure antigua. Seguro de usar dentro de setInterval.
    */
-  const runForceSyncRef = useRef(async () => {
+  const runForceSyncRef = useRef(async (forcePull = false) => {
     if (!userRef.current || syncingRef.current || !isConnectedRef.current) return;
     syncingRef.current = true;
     setConnection("syncing");
     try {
-      const result = await runSync(userRef.current.id);
+      const result = await runSync(userRef.current.id, { forcePull });
       await applyResultRef.current(result);
     } catch (err: any) {
       await refreshPendingCount();
@@ -91,7 +91,9 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   /** forceSync expuesto al exterior (para botones manuales, reabrir jornada, etc.) */
   const forceSync = useCallback(async () => {
-    await runForceSyncRef.current();
+    // El usuario pidió actualizar: no reutilizar la respuesta cacheada del
+    // servidor aunque el cursor no haya cambiado todavía.
+    await runForceSyncRef.current(true);
   }, []);
 
   /** pushSync: solo push del outbox sin pull de catalogo.

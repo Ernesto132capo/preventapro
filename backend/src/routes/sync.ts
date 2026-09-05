@@ -49,10 +49,14 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   try {
     const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
     const isInitial = !req.query.since || since.startsWith("1970");
+    const force = req.query.force === "1";
 
     // Un pull sin cambios vuelve a consultar el mismo cursor. Es atendido por
     // memoria (cero lecturas Firestore) hasta que una mutación lo invalida.
-    const cached = !isInitial ? pullCache.get(since) : undefined;
+    // `force=1` es exclusivo del refresh manual: vacía la caché y consulta
+    // Firestore de inmediato, incluso si el cursor ya tenía una respuesta.
+    if (force) invalidatePullCache();
+    const cached = !force && !isInitial ? pullCache.get(since) : undefined;
     if (cached) {
       const clientEtag = req.headers["if-none-match"];
       if (clientEtag === cached.etag) {

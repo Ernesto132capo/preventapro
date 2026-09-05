@@ -14,7 +14,7 @@ export interface SyncResult {
 }
 
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
-async function pullCatalog(): Promise<{ clients: number; products: number }> {
+async function pullCatalog(force = false): Promise<{ clients: number; products: number }> {
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
@@ -24,7 +24,7 @@ async function pullCatalog(): Promise<{ clients: number; products: number }> {
     since = "1970-01-01T00:00:00.000Z";
   }
 
-  const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}`);
+  const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}${force ? "&force=1" : ""}`);
 
   for (const c of data.clients) await upsertClientFromServer(c);
 
@@ -379,16 +379,18 @@ export async function pushOnlySync(userId: string): Promise<SyncResult> {
  * Usar en el timer periódico para recoger cambios de otros dispositivos.
  * Respeta un cooldown mínimo para no disparar pulls duplicados.
  */
-export async function runSync(userId: string): Promise<SyncResult> {
+export async function runSync(userId: string, options: { forcePull?: boolean } = {}): Promise<SyncResult> {
   try {
     const now = Date.now();
-    const skipPull = now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
+    // El refresh manual siempre hace pull; sólo los triggers automáticos
+    // respetan el cooldown para no duplicar lecturas.
+    const skipPull = !options.forcePull && now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
 
     await resolveTodayWorkDay(userId);
 
     let pulled = { clients: 0, products: 0 };
     if (!skipPull) {
-      pulled = await pullCatalog();
+      pulled = await pullCatalog(options.forcePull);
       lastFullPullAt = Date.now();
     }
 
