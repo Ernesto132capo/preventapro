@@ -110,24 +110,37 @@ export function DailySalesScreen() {
         <Text style={styles.summarySub}>{workDay.order_count} preventa(s)</Text>
       </Card>
 
-      <FlatList
-        data={orders}
-        keyExtractor={(o) => o.id}
-        contentContainerStyle={{ paddingHorizontal: spacing.lg }}
-        ListEmptyComponent={<EmptyState message="Aún no hay preventas registradas hoy." />}
-        renderItem={({ item }) => (
-          <Card style={{ marginBottom: spacing.sm }}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.orderClient}>{item.client_name}</Text>
-              <StatusPill
-                kind={item.sync_status === "synced" ? "synced" : item.sync_status === "failed" ? "failed" : "pending"}
-              />
-            </View>
-            <Text style={styles.orderMeta}>{item.item_count} items · {new Date(item.created_at).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" })}</Text>
-            <Text style={styles.orderTotal}>{centsToBs(item.total_cents)}</Text>
+      {workDay.status === "closed" ? (
+        <View style={{ paddingHorizontal: spacing.lg }}>
+          <Card>
+            <Text style={{ color: colors.textPrimary, fontWeight: "600", fontSize: 14 }}>
+              Jornada concluida
+            </Text>
+            <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
+              Las preventas de hoy ya fueron cerradas y consolidadas. Para ver la lista detallada, editar o agregar nuevas preventas, reabre la jornada con el botón de abajo. También puedes consultar los reportes en Registros Históricos.
+            </Text>
           </Card>
-        )}
-      />
+        </View>
+      ) : (
+        <FlatList
+          data={orders}
+          keyExtractor={(o) => o.id}
+          contentContainerStyle={{ paddingHorizontal: spacing.lg }}
+          ListEmptyComponent={<EmptyState message="Aún no hay preventas registradas hoy." />}
+          renderItem={({ item }) => (
+            <Card style={{ marginBottom: spacing.sm }}>
+              <View style={styles.rowBetween}>
+                <Text style={styles.orderClient}>{item.client_name}</Text>
+                <StatusPill
+                  kind={item.sync_status === "synced" ? "synced" : item.sync_status === "failed" ? "failed" : "pending"}
+                />
+              </View>
+              <Text style={styles.orderMeta}>{item.item_count} items · {new Date(item.created_at).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" })}</Text>
+              <Text style={styles.orderTotal}>{centsToBs(item.total_cents)}</Text>
+            </Card>
+          )}
+        />
+      )}
 
       {workDay.status === "open" && orders.length > 0 && (
         <View style={styles.closeSection}>

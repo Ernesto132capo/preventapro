@@ -213,7 +213,16 @@ export function DashboardScreen() {
       />
 
       <Text style={styles.sectionTitle}>Preventas recientes</Text>
-      {recentOrders.length === 0 ? (
+      {workDay.status === "closed" ? (
+        <Card>
+          <Text style={{ color: colors.textPrimary, fontWeight: "600", fontSize: 14 }}>
+            Jornada cerrada
+          </Text>
+          <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
+            Las preventas de hoy están archivadas y consolidadas en los reportes. Para ver las preventas individuales, editarlas o añadir más pedidos, presiona "Reabrir Jornada" arriba.
+          </Text>
+        </Card>
+      ) : recentOrders.length === 0 ? (
         <Card>
           <Text style={{ color: colors.textMuted }}>Aún no registras preventas hoy.</Text>
         </Card>
