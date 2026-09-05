@@ -81,8 +81,8 @@ export function ProductFormScreen() {
       } else {
         await createProductLocal({ name: name.trim(), presentations });
       }
+      await forceSync();
       setSaving(false);
-      forceSync().catch((err) => console.warn("Background sync error:", err));
       navigation.goBack();
     } catch (err: any) {
       setSaving(false);

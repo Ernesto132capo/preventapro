@@ -50,11 +50,9 @@ export function ClientFormScreen() {
       const client = isEditing
         ? await updateClientLocal(clientId!, { businessName, contactName, phone, address })
         : await createClientLocal({ businessName, contactName, phone, address });
+      await forceSync();
       setSaving(false);
-      forceSync().catch((err) => console.warn("Background sync error:", err));
       if (returnToPreventa && !isEditing) {
-        // Solo se pasan valores serializables por navegación; evita el warning
-        // de React Navigation por enviar una función en params.
         navigation.navigate("Tabs", { screen: "Preventa", params: { preselectedClientId: client.id } });
       } else {
         navigation.goBack();
