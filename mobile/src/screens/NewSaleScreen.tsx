@@ -134,9 +134,6 @@ export function NewSaleScreen() {
         await updateOrderLocal(editingOrderId, cart, paymentCondition);
       } else {
         const workDay = await getOrCreateOpenWorkDay(user!.id);
-        if (workDay.status === "closed") {
-          throw new Error("La jornada de preventa de hoy ya fue concluida. No se pueden registrar más preventas.");
-        }
         await createOrderLocal({
           workDayLocalId: workDay.id,
           clientId: selectedClient.id,

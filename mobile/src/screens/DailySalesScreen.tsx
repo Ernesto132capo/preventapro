@@ -8,7 +8,7 @@ import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { getOrCreateOpenWorkDay, resolveServerWorkDayId, markWorkDayClosed, upsertServerWorkDay } from "../db/repositories/workdays";
+import { getOrCreateOpenWorkDay, resolveServerWorkDayId, markWorkDayClosed, upsertServerWorkDay, reopenWorkDayLocal } from "../db/repositories/workdays";
 import { listOrdersForWorkDay, countUnsyncedOrders } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
@@ -136,8 +136,7 @@ export function DailySalesScreen() {
           ) : (
             <Card>
               <Text style={styles.closeWarning}>
-                Esta acción cerrará la jornada de forma permanente. No podrás editar estas preventas después.
-                Escribe CONFIRMAR para continuar.
+                Esta acción cerrará la jornada. Escribe CONFIRMAR para continuar (podrás reabrirla si entra un pedido de última hora).
               </Text>
               <TextInput
                 style={styles.confirmInput}
@@ -153,6 +152,46 @@ export function DailySalesScreen() {
               </View>
             </Card>
           )}
+        </View>
+      )}
+
+      {workDay.status === "closed" && (
+        <View style={styles.closeSection}>
+          <Card style={{ backgroundColor: colors.surfaceAlt2, borderColor: colors.emerald }}>
+            <Text style={{ fontWeight: "700", color: colors.navy, fontSize: 14 }}>
+              Jornada concluida
+            </Text>
+            <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
+              Si un cliente te llama más tarde o necesitas registrar preventas adicionales hoy, puedes reabrir la jornada.
+            </Text>
+            <Button
+              label="Reabrir jornada del día"
+              variant="secondary"
+              onPress={() => Alert.alert(
+                "Reabrir jornada",
+                "¿Deseas volver a abrir la jornada para añadir más preventas hoy?",
+                [
+                  { text: "Cancelar", style: "cancel" },
+                  {
+                    text: "Reabrir",
+                    onPress: async () => {
+                      try {
+                        const sId = await resolveServerWorkDayId(workDay.id);
+                        if (sId) await apiFetch(`/workdays/${sId}/reopen`, { method: "POST" });
+                        await reopenWorkDayLocal(workDay.id);
+                        await forceSync();
+                        await load();
+                        Alert.alert("Jornada reabierta", "Ya puedes registrar nuevas preventas hoy.");
+                      } catch (e: any) {
+                        Alert.alert("Error al reabrir", e?.message || "No se pudo reabrir.");
+                      }
+                    },
+                  },
+                ]
+              )}
+              style={{ marginTop: spacing.md }}
+            />
+          </Card>
         </View>
       )}
     </View>

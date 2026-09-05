@@ -18,9 +18,13 @@ export function OrderDetailScreen() {
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
   async function remove() {
-    await cancelOrderLocal(route.params.orderId);
-    await forceSync();
-    navigation.goBack();
+    try {
+      await cancelOrderLocal(route.params.orderId);
+      await forceSync();
+      navigation.goBack();
+    } catch (err: any) {
+      Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa.");
+    }
   }
 
   if (!data?.order) return null;

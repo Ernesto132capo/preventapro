@@ -7,10 +7,11 @@ import { StatusPill } from "../components/StatusPill";
 import { Button } from "../components/Button";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { getOrCreateOpenWorkDay, listClosedWorkDays } from "../db/repositories/workdays";
+import { getOrCreateOpenWorkDay, listClosedWorkDays, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { listOrdersForWorkDay, cancelOrderLocal } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
+import { apiFetch } from "../services/api";
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
@@ -53,6 +54,34 @@ export function DashboardScreen() {
     await forceSync();
     await load();
     setRefreshing(false);
+  }
+
+  async function handleReopen() {
+    if (!workDay) return;
+    try {
+      const serverId = await resolveServerWorkDayId(workDay.id);
+      if (serverId) {
+        await apiFetch(`/workdays/${serverId}/reopen`, { method: "POST" });
+      }
+      await reopenWorkDayLocal(workDay.id);
+      await forceSync();
+      await load();
+      Alert.alert("Jornada reabierta", "Puedes seguir registrando pedidos en la jornada de hoy.");
+    } catch (err: any) {
+      Alert.alert("Error al reabrir", err?.message || "No se pudo reabrir la jornada.");
+    }
+  }
+
+  async function handleDeleteOrder(orderId: string) {
+    try {
+      await cancelOrderLocal(orderId);
+      // Actualizar vista local de inmediato para que no se congele o buguee
+      setRecentOrders((prev) => prev.filter((o) => o.id !== orderId));
+      await forceSync();
+      await load();
+    } catch (err: any) {
+      Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa.");
+    }
   }
 
   if (!user || !workDay) return null;
@@ -114,14 +143,29 @@ export function DashboardScreen() {
             ✅ La jornada de hoy ya fue concluida.
           </Text>
           <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 2 }}>
-            Puedes consultar el resumen, descargar los reportes en Excel o generar las boletas en PDF desde Registros Históricos.
+            Si necesitas añadir más preventas (por ejemplo, pedidos de última hora), puedes reabrir la jornada.
           </Text>
-          <Button
-            label="📁 Ver Reportes y Registros Históricos"
-            variant="primary"
-            onPress={() => navigation.navigate("Historial")}
-            style={{ marginTop: spacing.sm }}
-          />
+          <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm }}>
+            <Button
+              label="Reabrir Jornada"
+              variant="secondary"
+              onPress={() => Alert.alert(
+                "Reabrir jornada",
+                "¿Deseas volver a abrir la jornada para añadir más preventas hoy?",
+                [
+                  { text: "Cancelar", style: "cancel" },
+                  { text: "Reabrir", onPress: handleReopen },
+                ]
+              )}
+              style={{ flex: 1 }}
+            />
+            <Button
+              label="Ver Reportes"
+              variant="outline"
+              onPress={() => navigation.navigate("Historial")}
+              style={{ flex: 1 }}
+            />
+          </View>
         </Card>
       )}
 
@@ -184,7 +228,15 @@ export function DashboardScreen() {
             <View style={styles.actionsRow}>
               <Button label="Ver" variant="outline" onPress={() => navigation.navigate("DetallePreventa", { orderId: o.id })} style={{ flex: 1 }} />
               <Button label="Editar" variant="outline" onPress={() => navigation.navigate("EditarPreventa", { orderId: o.id })} style={{ flex: 1 }} />
-              <Button label="Eliminar" variant="danger" onPress={() => Alert.alert("Eliminar preventa", "La preventa se cancelará.", [{ text: "Cancelar", style: "cancel" }, { text: "Eliminar", style: "destructive", onPress: async () => { await cancelOrderLocal(o.id); await forceSync(); await load(); } }])} style={{ flex: 1 }} />
+              <Button
+                label="Eliminar"
+                variant="danger"
+                onPress={() => Alert.alert("Eliminar preventa", "¿Estás seguro de que deseas cancelar y eliminar esta preventa?", [
+                  { text: "Cancelar", style: "cancel" },
+                  { text: "Eliminar", style: "destructive", onPress: () => handleDeleteOrder(o.id) },
+                ])}
+                style={{ flex: 1 }}
+              />
             </View>
           </Card>
         ))
