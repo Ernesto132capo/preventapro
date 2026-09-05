@@ -25,9 +25,16 @@ export function DashboardScreen() {
   const load = useCallback(async () => {
     if (!user) return;
     const wd = await getOrCreateOpenWorkDay(user.id);
-    setWorkDay(wd);
     const orders = await listOrdersForWorkDay(wd.id);
     setRecentOrders(orders.slice(0, 5));
+
+    const totalCents = orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+    const orderCount = orders.length;
+    setWorkDay({
+      ...wd,
+      total_cents: totalCents,
+      order_count: orderCount,
+    });
 
     const closed = await listClosedWorkDays(user.id);
     const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);

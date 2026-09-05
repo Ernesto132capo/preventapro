@@ -219,13 +219,7 @@ export async function upsertOrderFromServer(serverOrder: any) {
       );
     }
 
-    await db.runAsync(
-      `UPDATE work_days SET
-         order_count = (SELECT COUNT(*) FROM orders WHERE work_day_id = ? AND status = 'active'),
-         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE work_day_id = ? AND status = 'active')
-       WHERE id = ?`,
-      [workDayLocalId, workDayLocalId, workDayLocalId]
-    );
+    await refreshWorkDayTotals(db, workDayLocalId);
   });
 }
 
@@ -279,10 +273,27 @@ export async function cancelOrderLocal(orderId: string): Promise<void> {
 }
 
 async function refreshWorkDayTotals(db: any, workDayId: string) {
-  await db.runAsync(
-    `UPDATE work_days SET order_count = (SELECT COUNT(*) FROM orders WHERE work_day_id = ? AND status = 'active'), total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE work_day_id = ? AND status = 'active') WHERE id = ?`,
-    [workDayId, workDayId, workDayId]
+  const wd: any = await db.getFirstAsync(
+    `SELECT id, server_id FROM work_days WHERE id = ?`,
+    [workDayId]
   );
+  if (wd?.server_id) {
+    await db.runAsync(
+      `UPDATE work_days SET
+         order_count = (SELECT COUNT(*) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active'),
+         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active')
+       WHERE id = ?`,
+      [workDayId, wd.server_id, wd.server_id, workDayId, wd.server_id, wd.server_id, workDayId]
+    );
+  } else {
+    await db.runAsync(
+      `UPDATE work_days SET
+         order_count = (SELECT COUNT(*) FROM orders WHERE work_day_id = ? AND status = 'active'),
+         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE work_day_id = ? AND status = 'active')
+       WHERE id = ?`,
+      [workDayId, workDayId, workDayId]
+    );
+  }
 }
 
 export async function markOrderSynced(localId: string, serverId: string) {

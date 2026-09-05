@@ -29,8 +29,15 @@ export function DailySalesScreen() {
   const load = useCallback(async () => {
     if (!user) return;
     const wd = await getOrCreateOpenWorkDay(user.id);
-    setWorkDay(wd);
-    setOrders(await listOrdersForWorkDay(wd.id));
+    const ords = await listOrdersForWorkDay(wd.id);
+    setOrders(ords);
+    const totalCents = ords.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+    const orderCount = ords.length;
+    setWorkDay({
+      ...wd,
+      total_cents: totalCents,
+      order_count: orderCount,
+    });
   }, [user]);
 
   useFocusEffect(
