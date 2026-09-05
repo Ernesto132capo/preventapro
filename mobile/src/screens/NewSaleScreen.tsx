@@ -22,7 +22,7 @@ export function NewSaleScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
   const { user } = useAuth();
-  const { forceSync } = useSync();
+  const { forceSync, pushSync } = useSync();
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
   const [step, setStep] = useState<Step>("client");
@@ -173,7 +173,7 @@ export function NewSaleScreen() {
       }
       // En cuanto se guarda, intenta subirla sin esperar a una recarga ni al
       // intervalo automático de sincronización.
-      await forceSync();
+      await pushSync();
       setSaving(false);
       setCart([]);
       setSelectedClient(null);

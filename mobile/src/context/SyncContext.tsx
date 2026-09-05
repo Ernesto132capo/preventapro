@@ -1,6 +1,6 @@
-import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
+﻿import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import NetInfo from "@react-native-community/netinfo";
-import { runSync, SyncResult } from "../services/sync";
+import { runSync, pushOnlySync, SyncResult } from "../services/sync";
 import { countPending, getFailedErrors, discardFailed } from "../db/outbox";
 import { resetLocalDatabase } from "../db/client";
 import { useAuth } from "./AuthContext";
@@ -12,8 +12,11 @@ interface SyncContextValue {
   pendingCount: number;
   lastSyncedAt: string | null;
   lastError: string | null;
-  syncTick: number; // incrementa cada vez que termina un sync exitoso
+  syncTick: number;
+  /** Sync completo (pull + push) - timer periodico y recarga manual */
   forceSync: () => Promise<void>;
+  /** Solo push del outbox - usar despues de crear/editar un registro local */
+  pushSync: () => Promise<void>;
   discardFailedItems: () => Promise<void>;
   resetLocalData: () => Promise<void>;
 }
@@ -29,43 +32,65 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const [lastError, setLastError] = useState<string | null>(null);
   const [syncTick, setSyncTick] = useState(0);
   const syncingRef = useRef(false);
+  const isConnectedRef = useRef(isConnected);
+  isConnectedRef.current = isConnected;
 
   const refreshPendingCount = useCallback(async () => {
     setPendingCount(await countPending());
   }, []);
+
+  const applyResult = useCallback(async (result: SyncResult) => {
+    await refreshPendingCount();
+    const failedRows = await getFailedErrors();
+    if (result.ok && failedRows.length === 0) {
+      setLastSyncedAt(new Date().toISOString());
+      setLastError(null);
+      setConnection("online");
+      setSyncTick((t) => t + 1);
+    } else if (result.ok) {
+      const detail = failedRows
+        .map((r) => `[${r.entity_type}] ${r.last_error || "sin detalle"}`)
+        .join(" | ");
+      setLastError(`${failedRows.length} elemento(s) con error: ${detail}`);
+      setConnection(isConnectedRef.current ? "online" : "offline");
+      setSyncTick((t) => t + 1);
+    } else {
+      setLastError(result.error || "No se pudo sincronizar.");
+      setConnection(isConnectedRef.current ? "online" : "offline");
+    }
+  }, [refreshPendingCount]);
 
   const forceSync = useCallback(async () => {
     if (!user || syncingRef.current) return;
     syncingRef.current = true;
     setConnection("syncing");
     try {
-      const result: SyncResult = await runSync(user.id);
-      await refreshPendingCount();
-      const failedRows = await getFailedErrors();
-      if (result.ok && failedRows.length === 0) {
-        setLastSyncedAt(new Date().toISOString());
-        setLastError(null);
-        setConnection("online");
-        setSyncTick((t) => t + 1); // notifica a las pantallas que actualicen sus datos
-      } else if (result.ok) {
-        const detail = failedRows
-          .map((r) => `[${r.entity_type}] ${r.last_error || "sin detalle"}`)
-          .join(" | ");
-        setLastError(`${failedRows.length} elemento(s) con error: ${detail}`);
-        setConnection(isConnected ? "online" : "offline");
-        setSyncTick((t) => t + 1);
-      } else {
-        setLastError(result.error || "No se pudo sincronizar.");
-        setConnection(isConnected ? "online" : "offline");
-      }
+      const result = await runSync(user.id);
+      await applyResult(result);
     } catch (err: any) {
       await refreshPendingCount();
-      setLastError(err?.message || "Falló una operación local durante la sincronización.");
-      setConnection(isConnected ? "online" : "offline");
+      setLastError(err?.message || "Fallo la sincronizacion.");
+      setConnection(isConnectedRef.current ? "online" : "offline");
     } finally {
       syncingRef.current = false;
     }
-  }, [user, isConnected, refreshPendingCount]);
+  }, [user, refreshPendingCount, applyResult]);
+
+  const pushSync = useCallback(async () => {
+    if (!user || syncingRef.current) return;
+    syncingRef.current = true;
+    setConnection("syncing");
+    try {
+      const result = await pushOnlySync(user.id);
+      await applyResult(result);
+    } catch (err: any) {
+      await refreshPendingCount();
+      setLastError(err?.message || "Fallo la sincronizacion.");
+      setConnection(isConnectedRef.current ? "online" : "offline");
+    } finally {
+      syncingRef.current = false;
+    }
+  }, [user, refreshPendingCount, applyResult]);
 
   const discardFailedItems = useCallback(async () => {
     await discardFailed();
@@ -84,6 +109,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     const unsubscribe = NetInfo.addEventListener((state) => {
       const online = !!state.isConnected && !!state.isInternetReachable;
       setIsConnected(online);
+      isConnectedRef.current = online;
       if (online && user) {
         forceSync();
       } else {
@@ -97,15 +123,15 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     refreshPendingCount();
     const interval = setInterval(() => {
-      if (isConnected && user) forceSync();
-    }, 15000); // auto-sync cada 15 segundos para reflejar cambios de otros dispositivos
+      if (isConnectedRef.current && user) forceSync();
+    }, 15000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConnected, user]);
+  }, [user]);
 
   return (
     <SyncContext.Provider
-      value={{ connection, pendingCount, lastSyncedAt, lastError, syncTick, forceSync, discardFailedItems, resetLocalData }}
+      value={{ connection, pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, resetLocalData }}
     >
       {children}
     </SyncContext.Provider>

@@ -11,7 +11,7 @@ import { createClientLocal, updateClientLocal, getClient } from "../db/repositor
 export function ClientFormScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { forceSync } = useSync();
+  const { forceSync, pushSync } = useSync();
   const returnToPreventa = route.params?.returnToPreventa as boolean | undefined;
   const clientId = route.params?.clientId as string | undefined;
   const isEditing = !!clientId;
@@ -50,7 +50,7 @@ export function ClientFormScreen() {
       const client = isEditing
         ? await updateClientLocal(clientId!, { businessName, contactName, phone, address })
         : await createClientLocal({ businessName, contactName, phone, address });
-      await forceSync();
+      await pushSync();
       setSaving(false);
       if (returnToPreventa && !isEditing) {
         navigation.navigate("Tabs", { screen: "Preventa", params: { preselectedClientId: client.id } });

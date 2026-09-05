@@ -335,7 +335,6 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
   }
 
   // Segunda pasada corta para resolver dependencias que ya se destrabaron en esta misma sincronización
-  // (ej: un cliente se sincronizó y ahora su preventa dependiente puede subir).
   const remaining = await listPending();
   for (const row of remaining) {
     if (row.entity_type !== "order") continue;
@@ -349,11 +348,44 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
   return { done, deferred, failed };
 }
 
-export async function runSync(userId: string): Promise<SyncResult> {
+// Tiempo mínimo entre pulls completos (evita saturar el servidor con GETs repetidos)
+let lastFullPullAt = 0;
+const MIN_PULL_INTERVAL_MS = 12000; // 12 segundos
+
+/**
+ * PUSH-ONLY sync: solo sube el outbox al servidor sin hacer pull de catálogo.
+ * Usar después de mutaciones locales (crear cliente, producto, preventa).
+ * Mucho más liviano que el sync completo.
+ */
+export async function pushOnlySync(userId: string): Promise<SyncResult> {
   try {
     await resolveTodayWorkDay(userId);
-    const pulled = await pullCatalog();
-    await reconcileResetServerMappings();
+    const pushed = await pushOutbox(userId);
+    return { ok: true, pulled: { clients: 0, products: 0 }, pushed };
+  } catch (err: any) {
+    const message = err instanceof ApiError ? err.message : err?.message || "No se pudo sincronizar.";
+    return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
+  }
+}
+
+/**
+ * FULL sync: pull de catálogo + push del outbox.
+ * Usar en el timer periódico para recoger cambios de otros dispositivos.
+ * Respeta un cooldown mínimo para no disparar pulls duplicados.
+ */
+export async function runSync(userId: string): Promise<SyncResult> {
+  try {
+    const now = Date.now();
+    const skipPull = now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
+
+    await resolveTodayWorkDay(userId);
+
+    let pulled = { clients: 0, products: 0 };
+    if (!skipPull) {
+      pulled = await pullCatalog();
+      lastFullPullAt = Date.now();
+    }
+
     const pushed = await pushOutbox(userId);
     return { ok: true, pulled, pushed };
   } catch (err: any) {
@@ -362,3 +394,4 @@ export async function runSync(userId: string): Promise<SyncResult> {
     return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
   }
 }
+

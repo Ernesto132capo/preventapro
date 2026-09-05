@@ -21,7 +21,7 @@ const DEFAULT_PRESENTATIONS: EditPresentationInput[] = [
 export function ProductFormScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { forceSync } = useSync();
+  const { forceSync, pushSync } = useSync();
   const productId = route.params?.productId as string | undefined;
   const isEditing = !!productId;
 
@@ -81,7 +81,7 @@ export function ProductFormScreen() {
       } else {
         await createProductLocal({ name: name.trim(), presentations });
       }
-      await forceSync();
+      await pushSync();
       setSaving(false);
       navigation.goBack();
     } catch (err: any) {
