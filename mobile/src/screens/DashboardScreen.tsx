@@ -202,7 +202,30 @@ export function DashboardScreen() {
       )}
 
       <View style={styles.quickRow}>
-        <Button label="Nueva Preventa" onPress={() => navigation.navigate("Preventa")} style={{ flex: 1, marginRight: spacing.sm }} />
+        <Button
+          label="Nueva Preventa"
+          onPress={() => {
+            if (workDay.status === "closed") {
+              Alert.alert(
+                "Jornada Concluida",
+                "La jornada de hoy ya fue concluida. ¿Deseas reabrirla para registrar una nueva preventa?",
+                [
+                  { text: "Cancelar", style: "cancel" },
+                  {
+                    text: "Reabrir Jornada",
+                    onPress: async () => {
+                      await handleReopen();
+                      navigation.navigate("Preventa");
+                    },
+                  },
+                ]
+              );
+            } else {
+              navigation.navigate("Preventa");
+            }
+          }}
+          style={{ flex: 1, marginRight: spacing.sm }}
+        />
         <Button label="Nuevo Cliente" onPress={() => navigation.navigate("NuevoCliente")} variant="outline" style={{ flex: 1 }} />
       </View>
       <Button
@@ -219,8 +242,21 @@ export function DashboardScreen() {
             Jornada cerrada
           </Text>
           <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
-            Las preventas de hoy están archivadas y consolidadas en los reportes. Para ver las preventas individuales, editarlas o añadir más pedidos, presiona "Reabrir Jornada" arriba.
+            Las preventas de hoy están archivadas y consolidadas en los reportes. Para ver las preventas individuales, editarlas o añadir más pedidos, presiona "Reabrir Jornada".
           </Text>
+          <Button
+            label="Reabrir Jornada"
+            variant="secondary"
+            onPress={() => Alert.alert(
+              "Reabrir jornada",
+              "¿Deseas volver a abrir la jornada para añadir más preventas hoy?",
+              [
+                { text: "Cancelar", style: "cancel" },
+                { text: "Reabrir", onPress: handleReopen },
+              ]
+            )}
+            style={{ marginTop: spacing.md }}
+          />
         </Card>
       ) : recentOrders.length === 0 ? (
         <Card>

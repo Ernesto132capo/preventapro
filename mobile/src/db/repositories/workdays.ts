@@ -10,14 +10,32 @@ function todayStr(): string {
   return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
-/** Devuelve la jornada de hoy, priorizando la abierta o retornando la cerrada si ya concluyó. */
+/** Devuelve la jornada de hoy. Si fue concluida, retorna 'closed' y no la sobreescribe a 'open'. */
 export async function getTodayWorkDay(userId: string): Promise<WorkDay> {
   const db = await getDb();
   const today = todayStr();
-  let row = await db.getFirstAsync<any>(
-    `SELECT * FROM work_days WHERE work_date = ? ORDER BY CASE WHEN status = 'open' THEN 1 ELSE 2 END, created_at DESC LIMIT 1`,
+  
+  // Buscar todas las jornadas registradas para hoy
+  const rows = await db.getAllAsync<any>(
+    `SELECT * FROM work_days WHERE work_date = ? ORDER BY CASE WHEN status = 'closed' THEN 0 ELSE 1 END, CASE WHEN server_id IS NOT NULL THEN 0 ELSE 1 END, created_at DESC`,
     [today]
   );
+
+  let row = rows[0];
+  if (rows.length > 1) {
+    const primaryId = row.id;
+    const hasClosed = rows.some((r) => r.status === "closed");
+    for (let i = 1; i < rows.length; i++) {
+      const dupId = rows[i].id;
+      await db.runAsync(`UPDATE orders SET work_day_id = ? WHERE work_day_id = ?`, [primaryId, dupId]);
+      await db.runAsync(`DELETE FROM work_days WHERE id = ?`, [dupId]);
+    }
+    if (hasClosed) {
+      await db.runAsync(`UPDATE work_days SET status = 'closed' WHERE id = ?`, [primaryId]);
+      row.status = "closed";
+    }
+  }
+
   if (!row) {
     const id = uuid();
     await db.runAsync(
@@ -40,27 +58,11 @@ export async function getWorkDay(id: string): Promise<WorkDay | null> {
 
 export async function upsertServerWorkDay(localId: string, serverWorkDay: any) {
   const db = await getDb();
-  if (serverWorkDay.status === "closed") {
-    // Si el servidor cerró la jornada, marcarla como cerrada para todos los preventistas
-    await db.runAsync(
-      `UPDATE work_days SET server_id = ?, status = 'closed', order_count = ?, total_cents = ?, sync_status = 'synced' WHERE id = ?`,
-      [serverWorkDay.id, serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, localId]
-    );
-    await db.runAsync(
-      `UPDATE work_days SET status = 'closed', order_count = ?, total_cents = ?, sync_status = 'synced' WHERE server_id = ? OR work_date = ?`,
-      [serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, serverWorkDay.id, serverWorkDay.work_date]
-    );
-  } else {
-    // Si el servidor tiene la jornada abierta o reabierta
-    await db.runAsync(
-      `UPDATE work_days SET server_id = ?, status = 'open', order_count = ?, total_cents = ?, sync_status = 'synced' WHERE id = ?`,
-      [serverWorkDay.id, serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, localId]
-    );
-    await db.runAsync(
-      `UPDATE work_days SET status = 'open', order_count = ?, total_cents = ?, sync_status = 'synced' WHERE server_id = ? OR work_date = ?`,
-      [serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, serverWorkDay.id, serverWorkDay.work_date]
-    );
-  }
+  const newStatus = serverWorkDay.status === "closed" ? "closed" : "open";
+  await db.runAsync(
+    `UPDATE work_days SET server_id = ?, status = ?, order_count = ?, total_cents = ?, sync_status = 'synced' WHERE id = ? OR server_id = ? OR work_date = ?`,
+    [serverWorkDay.id, newStatus, serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, localId, serverWorkDay.id, serverWorkDay.work_date]
+  );
 }
 
 export async function resolveServerWorkDayId(localId: string): Promise<string | null> {
@@ -71,9 +73,11 @@ export async function resolveServerWorkDayId(localId: string): Promise<string | 
   );
   if (row?.server_id) return row.server_id;
 
-  // Fallback: buscar cualquier jornada abierta que ya tenga server_id resuelto
+  // Fallback: buscar cualquier jornada de hoy que ya tenga server_id resuelto
+  const today = todayStr();
   const openWd = await db.getFirstAsync<{ server_id: string | null }>(
-    `SELECT server_id FROM work_days WHERE server_id IS NOT NULL AND status = 'open' ORDER BY created_at DESC LIMIT 1`
+    `SELECT server_id FROM work_days WHERE server_id IS NOT NULL AND work_date = ? ORDER BY created_at DESC LIMIT 1`,
+    [today]
   );
   if (openWd?.server_id) {
     await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [openWd.server_id, localId]);
@@ -85,22 +89,21 @@ export async function resolveServerWorkDayId(localId: string): Promise<string | 
 
 export async function markWorkDayClosed(localId: string, orderCount: number, totalCents: number) {
   const db = await getDb();
-  await db.runAsync(`UPDATE work_days SET status = 'closed', order_count = ?, total_cents = ? WHERE id = ?`, [
-    orderCount,
-    totalCents,
-    localId,
-  ]);
+  const row = await db.getFirstAsync<any>(`SELECT work_date FROM work_days WHERE id = ?`, [localId]);
+  const date = row?.work_date || todayStr();
+  await db.runAsync(
+    `UPDATE work_days SET status = 'closed', order_count = ?, total_cents = ? WHERE id = ? OR work_date = ?`,
+    [orderCount, totalCents, localId, date]
+  );
 }
 
 export async function reopenWorkDayLocal(localId: string) {
   const db = await getDb();
-  await db.runAsync(`UPDATE work_days SET status = 'open' WHERE id = ?`, [localId]);
-  const wd = await db.getFirstAsync<{ server_id: string | null; work_date: string }>(
-    `SELECT server_id, work_date FROM work_days WHERE id = ?`,
-    [localId]
-  );
-  if (wd?.server_id) {
-    await db.runAsync(`UPDATE work_days SET status = 'open' WHERE server_id = ? OR work_date = ?`, [wd.server_id, wd.work_date]);
+  const row = await db.getFirstAsync<any>(`SELECT work_date, server_id FROM work_days WHERE id = ?`, [localId]);
+  const date = row?.work_date || todayStr();
+  await db.runAsync(`UPDATE work_days SET status = 'open' WHERE id = ? OR work_date = ?`, [localId, date]);
+  if (row?.server_id) {
+    await db.runAsync(`UPDATE work_days SET status = 'open' WHERE server_id = ?`, [row.server_id]);
   }
 }
 

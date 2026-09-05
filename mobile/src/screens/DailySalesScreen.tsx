@@ -92,6 +92,22 @@ export function DailySalesScreen() {
     }
   }
 
+  async function handleReopen() {
+    if (!workDay) return;
+    try {
+      const serverId = await resolveServerWorkDayId(workDay.id);
+      if (serverId) {
+        await apiFetch(`/workdays/${serverId}/reopen`, { method: "POST" });
+      }
+      await reopenWorkDayLocal(workDay.id);
+      await forceSync();
+      await load();
+      Alert.alert("Jornada reabierta", "Puedes seguir registrando pedidos en la jornada de hoy.");
+    } catch (err: any) {
+      Alert.alert("Error al reabrir", err?.message || "No se pudo reabrir la jornada.");
+    }
+  }
+
   if (!workDay) return null;
 
   return (
@@ -117,8 +133,23 @@ export function DailySalesScreen() {
               Jornada concluida
             </Text>
             <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 4 }}>
-              Las preventas de hoy ya fueron cerradas y consolidadas. Para ver la lista detallada, editar o agregar nuevas preventas, reabre la jornada con el botón de abajo. También puedes consultar los reportes en Registros Históricos.
+              Las preventas de hoy ya fueron cerradas y consolidadas. Para ver la lista detallada, editar o agregar nuevas preventas, reabre la jornada. También puedes consultar los reportes en Registros Históricos.
             </Text>
+            <Button
+              label="Reabrir Jornada"
+              variant="secondary"
+              onPress={() =>
+                Alert.alert(
+                  "Reabrir jornada",
+                  "¿Deseas volver a abrir la jornada para añadir más preventas hoy?",
+                  [
+                    { text: "Cancelar", style: "cancel" },
+                    { text: "Reabrir", onPress: handleReopen },
+                  ]
+                )
+              }
+              style={{ marginTop: spacing.md }}
+            />
           </Card>
         </View>
       ) : (

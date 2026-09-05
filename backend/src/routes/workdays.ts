@@ -11,23 +11,20 @@ async function recalc(id: string) { const orders = (await col.orders.where("work
 
 workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   const date = today();
-  // 1. Buscar si hay una jornada abierta hoy para el equipo
-  const openResult = await col.workDays.where("workDate", "==", date).where("status", "==", "open").limit(1).get();
-  if (!openResult.empty) {
-    const ref = openResult.docs[0].ref;
+  // 1. Buscar todas las jornadas registradas para hoy
+  const todayResult = await col.workDays.where("workDate", "==", date).get();
+  if (!todayResult.empty) {
+    const docs = todayResult.docs.sort((a, b) =>
+      (b.data().updatedAt || b.data().createdAt || "").localeCompare(a.data().updatedAt || a.data().createdAt || "")
+    );
+    const targetDoc = docs[0];
+    const ref = targetDoc.ref;
     await recalc(ref.id);
     const doc = await ref.get();
     return res.json({ workDay: serial(doc.id, doc.data()!) });
   }
 
-  // 2. Si no hay abierta, verificar si ya fue cerrada hoy (la jornada ya concluyó)
-  const closedResult = await col.workDays.where("workDate", "==", date).where("status", "==", "closed").limit(1).get();
-  if (!closedResult.empty) {
-    const doc = closedResult.docs[0];
-    return res.json({ workDay: serial(doc.id, doc.data()!) });
-  }
-
-  // 3. Primera vez del día: crear la jornada abierta compartida
+  // 2. Primera vez del día: crear la jornada abierta compartida
   const ref = col.workDays.doc(uuid());
   const ts = nowIso();
   const newWorkDay = {
@@ -92,7 +89,19 @@ workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
   const totals = await recalc(ref.id),
     ts = nowIso();
   await ref.update({ status: "closed", ...totals, closedAt: ts, updatedAt: ts });
-  res.json({ workDay: serial(ref.id, { ...d.data(), status: "closed", ...totals, closedAt: ts }) });
+
+  // Asegurar que cualquier otra jornada huérfana de hoy quede cerrada
+  const workDate = d.data()?.workDate;
+  if (workDate) {
+    const others = await col.workDays.where("workDate", "==", workDate).where("status", "==", "open").get();
+    for (const od of others.docs) {
+      if (od.id !== ref.id) {
+        await od.ref.update({ status: "closed", closedAt: ts, updatedAt: ts });
+      }
+    }
+  }
+
+  res.json({ workDay: serial(ref.id, { ...d.data(), status: "closed", ...totals, closedAt: ts, updatedAt: ts }) });
 });
 
 workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
@@ -102,5 +111,16 @@ workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
   const totals = await recalc(ref.id);
   const ts = nowIso();
   await ref.update({ status: "open", ...totals, closedAt: null, updatedAt: ts });
-  res.json({ workDay: serial(ref.id, { ...d.data(), status: "open", ...totals, closedAt: null }) });
+
+  const workDate = d.data()?.workDate;
+  if (workDate) {
+    const others = await col.workDays.where("workDate", "==", workDate).get();
+    for (const od of others.docs) {
+      if (od.id !== ref.id) {
+        await od.ref.update({ status: "open", closedAt: null, updatedAt: ts });
+      }
+    }
+  }
+
+  res.json({ workDay: serial(ref.id, { ...d.data(), status: "open", ...totals, closedAt: null, updatedAt: ts }) });
 });

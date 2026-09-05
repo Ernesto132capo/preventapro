@@ -4,20 +4,47 @@ import { useFocusEffect, useNavigation, useRoute } from "@react-navigation/nativ
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { getOrderWithItems, cancelOrderLocal } from "../db/repositories/orders";
+import { getTodayWorkDay } from "../db/repositories/workdays";
 import { centsToBs } from "../domain/pricing";
 import { colors, spacing } from "../theme/tokens";
 import { useSync } from "../context/SyncContext";
+import { useAuth } from "../context/AuthContext";
 
 export function OrderDetailScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
   const { forceSync } = useSync();
+  const { user } = useAuth();
   const [data, setData] = useState<{ order: any; items: any[] } | null>(null);
 
   const load = useCallback(async () => setData(await getOrderWithItems(route.params.orderId)), [route.params.orderId]);
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
+  async function handleEdit() {
+    if (user) {
+      const todayWd = await getTodayWorkDay(user.id);
+      if (todayWd.status === "closed") {
+        Alert.alert(
+          "Jornada Concluida",
+          "La jornada de hoy está cerrada. Debes reabrir la jornada desde el Inicio para poder editar preventas."
+        );
+        return;
+      }
+    }
+    navigation.navigate("EditarPreventa", { orderId: data?.order.id });
+  }
+
   async function remove() {
+    if (user) {
+      const todayWd = await getTodayWorkDay(user.id);
+      if (todayWd.status === "closed") {
+        Alert.alert(
+          "Jornada Concluida",
+          "La jornada de hoy está cerrada. Debes reabrir la jornada desde el Inicio para poder eliminar preventas."
+        );
+        return;
+      }
+    }
     try {
       await cancelOrderLocal(route.params.orderId);
       await forceSync();
@@ -45,7 +72,7 @@ export function OrderDetailScreen() {
       ))}
       <Card style={styles.totalCard}><Text style={styles.total}>Total: {centsToBs(order.total_cents)}</Text></Card>
       <View style={styles.actions}>
-        <Button label="Editar" onPress={() => navigation.navigate("EditarPreventa", { orderId: order.id })} style={{ flex: 1 }} />
+        <Button label="Editar" onPress={handleEdit} style={{ flex: 1 }} />
         <Button label="Eliminar" variant="danger" onPress={() => Alert.alert("Eliminar preventa", "La preventa se cancelará.", [{ text: "Cancelar", style: "cancel" }, { text: "Eliminar", style: "destructive", onPress: remove }])} style={{ flex: 1 }} />
       </View>
     </ScrollView>

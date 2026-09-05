@@ -49,11 +49,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
     const presentations = filteredPresDocs.map((d) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
 
-    // Determinar la jornada activa o más reciente de hoy
-    const todayWorkDayDoc =
-      todayWorkDaysSnap.docs.find((d) => d.data().status === "open") ||
-      todayWorkDaysSnap.docs.sort((a, b) => (b.data().createdAt || "").localeCompare(a.data().createdAt || ""))[0] ||
-      openWorkDaysSnap.docs[0];
+    // Determinar la jornada más reciente de hoy (respetando si ya fue cerrada)
+    const sortedTodayDocs = todayWorkDaysSnap.docs.sort((a, b) =>
+      (b.data().updatedAt || b.data().createdAt || "").localeCompare(a.data().updatedAt || a.data().createdAt || "")
+    );
+    const todayWorkDayDoc = sortedTodayDocs[0] || openWorkDaysSnap.docs[0];
 
     let orders: any[] = [];
     if (todayWorkDayDoc) {

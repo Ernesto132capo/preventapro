@@ -8,12 +8,13 @@ import { EmptyState } from "../components/EmptyState";
 import { getClient, listActiveClients } from "../db/repositories/clients";
 import { listProducts, ProductWithPresentations } from "../db/repositories/products";
 import { createOrderLocal, getOrderWithItems, updateOrderLocal } from "../db/repositories/orders";
-import { getOrCreateOpenWorkDay } from "../db/repositories/workdays";
+import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { buildCartLine, calcOrderTotals, recalcLineQuantity, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
-import { CartLine, Client, Presentation, Product } from "../domain/types";
+import { CartLine, Client, Presentation, Product, WorkDay } from "../domain/types";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
+import { apiFetch } from "../services/api";
 
 type Step = "client" | "products";
 
@@ -23,6 +24,7 @@ export function NewSaleScreen() {
   const { user } = useAuth();
   const { forceSync } = useSync();
 
+  const [workDay, setWorkDay] = useState<WorkDay | null>(null);
   const [step, setStep] = useState<Step>("client");
   const [clientSearch, setClientSearch] = useState("");
   const [clients, setClients] = useState<Client[]>([]);
@@ -36,6 +38,12 @@ export function NewSaleScreen() {
   const [error, setError] = useState<string | null>(null);
   const editingOrderId = route.params?.orderId as string | undefined;
 
+  const checkWorkDay = useCallback(async () => {
+    if (!user) return;
+    const wd = await getTodayWorkDay(user.id);
+    setWorkDay(wd);
+  }, [user]);
+
   const loadClients = useCallback(async () => {
     setClients(await listActiveClients(clientSearch));
   }, [clientSearch]);
@@ -46,10 +54,27 @@ export function NewSaleScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      checkWorkDay();
       loadClients();
       loadProducts();
-    }, [loadClients, loadProducts])
+    }, [checkWorkDay, loadClients, loadProducts])
   );
+
+  async function handleReopen() {
+    if (!workDay) return;
+    try {
+      const serverId = await resolveServerWorkDayId(workDay.id);
+      if (serverId) {
+        await apiFetch(`/workdays/${serverId}/reopen`, { method: "POST" });
+      }
+      await reopenWorkDayLocal(workDay.id);
+      await forceSync();
+      await checkWorkDay();
+      Alert.alert("Jornada reabierta", "Ahora puedes continuar registrando pedidos.");
+    } catch (e: any) {
+      Alert.alert("Error al reabrir", e?.message || "No se pudo reabrir la jornada.");
+    }
+  }
 
   useEffect(() => {
     if (route.params?.preselectedClientId) {
@@ -130,12 +155,17 @@ export function NewSaleScreen() {
     }
     setSaving(true);
     try {
+      const currentWd = await getTodayWorkDay(user!.id);
+      if (currentWd.status === "closed") {
+        setError("La jornada de hoy está concluida. Debes reabrir la jornada para registrar preventas.");
+        setSaving(false);
+        return;
+      }
       if (editingOrderId) {
         await updateOrderLocal(editingOrderId, cart, paymentCondition);
       } else {
-        const workDay = await getOrCreateOpenWorkDay(user!.id);
         await createOrderLocal({
-          workDayLocalId: workDay.id,
+          workDayLocalId: currentWd.id,
           clientId: selectedClient.id,
           paymentCondition,
           lines: cart,
@@ -155,6 +185,34 @@ export function NewSaleScreen() {
       setSaving(false);
       setError(err.message || "No se pudo guardar la preventa.");
     }
+  }
+
+  if (workDay?.status === "closed") {
+    return (
+      <View style={[styles.screen, { justifyContent: "center", alignItems: "center", padding: spacing.xl }]}>
+        <Card style={{ width: "100%", padding: spacing.xl, alignItems: "center" }}>
+          <Text style={{ fontSize: 44, marginBottom: spacing.md }}>🔒</Text>
+          <Text style={{ fontSize: 20, fontWeight: "700", color: colors.navy, textAlign: "center", marginBottom: spacing.xs }}>
+            Jornada Concluida
+          </Text>
+          <Text style={{ fontSize: 14, color: colors.textSecondary, textAlign: "center", marginBottom: spacing.xl, lineHeight: 20 }}>
+            La jornada de hoy ya fue finalizada. Para registrar nuevas preventas o editar pedidos existentes, primero debes reabrir la jornada.
+          </Text>
+          <Button
+            label="Reabrir Jornada"
+            variant="secondary"
+            onPress={handleReopen}
+            style={{ width: "100%", marginBottom: spacing.sm }}
+          />
+          <Button
+            label="Volver al Inicio"
+            variant="outline"
+            onPress={() => navigation.navigate("Inicio")}
+            style={{ width: "100%" }}
+          />
+        </Card>
+      </View>
+    );
   }
 
   if (step === "client") {
