@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { col, nowIso, presentationsCol } from "../db/firestore";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
+import { invalidatePullCache } from "./sync";
 
 export const catalogRouter = Router();
 catalogRouter.use(requireAuth);
@@ -29,6 +30,7 @@ catalogRouter.post("/categories", async (req, res) => {
   if (!name) return res.status(400).json({ error: "El nombre de categoría es obligatorio." });
   if (!(await col.categories.where("name", "==", name).limit(1).get()).empty) return res.status(409).json({ error: "Esa categoría ya existe." });
   const id = uuid(), ts = nowIso(); await col.categories.doc(id).set({ name, active: true, createdAt: ts, updatedAt: ts });
+  invalidatePullCache();
   res.status(201).json({ id, name });
 });
 
@@ -57,7 +59,7 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
   const id = uuid(), ts = nowIso(), product = { sku: d.sku, name: d.name, categoryId: d.categoryId ?? null, photoUrl: d.photoUrl ?? null, baseCostCents: d.baseCostCents, baseUnitName: d.baseUnitName, createdBy: req.userId, active: true, createdAt: ts, updatedAt: ts };
   const batch = col.products.firestore.batch(); batch.set(col.products.doc(id), product);
   d.presentations.forEach((p, sortOrder) => batch.set(presentationsCol(id).doc(uuid()), { ...p, productId: id, sortOrder, active: true, createdAt: ts, updatedAt: ts }));
-  await batch.commit(); res.status(201).json({ product: await serialProduct(id, product) });
+  await batch.commit(); invalidatePullCache(); res.status(201).json({ product: await serialProduct(id, product) });
 });
 
 catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
@@ -67,13 +69,13 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
   const batch = col.products.firestore.batch(); batch.update(ref, { name: d.name, categoryId: d.categoryId ?? old.categoryId ?? null, baseCostCents: d.baseCostCents ?? old.baseCostCents ?? 0, baseUnitName: d.baseUnitName ?? old.baseUnitName ?? "Unidad", updatedAt: ts });
   current.docs.filter((p) => !names.has(p.data().name)).forEach((p) => batch.update(p.ref, { active: false, updatedAt: ts }));
   d.presentations.forEach((p, sortOrder) => { const match = byName.get(p.name), pref = match?.ref ?? presentationsCol(ref.id).doc(uuid()); batch.set(pref, { ...p, productId: ref.id, sortOrder, active: true, createdAt: match?.data().createdAt ?? ts, updatedAt: ts }, { merge: true }); });
-  await batch.commit(); res.json({ product: await serialProduct(ref.id, { ...old, name: d.name, categoryId: d.categoryId ?? old.categoryId, baseCostCents: d.baseCostCents ?? old.baseCostCents, baseUnitName: d.baseUnitName ?? old.baseUnitName, updatedAt: ts }) });
+  await batch.commit(); invalidatePullCache(); res.json({ product: await serialProduct(ref.id, { ...old, name: d.name, categoryId: d.categoryId ?? old.categoryId, baseCostCents: d.baseCostCents ?? old.baseCostCents, baseUnitName: d.baseUnitName ?? old.baseUnitName, updatedAt: ts }) });
 });
 
 catalogRouter.patch("/presentations/:id/stock", async (req, res) => {
   const { quantityAvailable } = req.body || {}; if (typeof quantityAvailable !== "number" || quantityAvailable < 0) return res.status(400).json({ error: "quantityAvailable inválido." });
   const group = await col.products.firestore.collectionGroup("presentations").where("__name__", "==", req.params.id).limit(1).get();
   if (group.empty) return res.status(404).json({ error: "Presentación sin registro de inventario." });
-  await group.docs[0].ref.update({ stock: quantityAvailable, updatedAt: nowIso() }); res.json({ ok: true });
+  await group.docs[0].ref.update({ stock: quantityAvailable, updatedAt: nowIso() }); invalidatePullCache(); res.json({ ok: true });
 });
-catalogRouter.delete("/products/:id", async (req, res) => { await col.products.doc(req.params.id).update({ active: false, updatedAt: nowIso() }); res.json({ ok: true }); });
+catalogRouter.delete("/products/:id", async (req, res) => { await col.products.doc(req.params.id).update({ active: false, updatedAt: nowIso() }); invalidatePullCache(); res.json({ ok: true }); });

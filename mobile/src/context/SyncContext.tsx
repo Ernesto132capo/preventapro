@@ -155,7 +155,9 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     return () => sub.remove();
   }, []);
 
-  // Timer periodico: cada 60 segundos, solo si la app esta activa y conectada
+  // Timer periódico de baja frecuencia. Las mutaciones usan pushSync y al volver
+  // a foreground se hace pull inmediato, por lo que no hace falta sondear cada
+  // minuto y castigar Firestore cuando nadie modificó datos.
   useEffect(() => {
     refreshPendingCount();
     // Sync inicial al montar
@@ -165,7 +167,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       if (isActiveRef.current && isConnectedRef.current) {
         runForceSyncRef.current();
       }
-    }, 60000); // 60 segundos — saludable para Firestore
+    }, 5 * 60 * 1000); // 5 minutos; el backend además cachea por cursor
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

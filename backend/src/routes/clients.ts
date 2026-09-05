@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { col, nowIso } from "../db/firestore";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
+import { invalidatePullCache } from "./sync";
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -38,6 +39,7 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
   const id = uuid(), ts = nowIso();
   const data = { ...d, contactName: d.contactName ?? null, phone: d.phone ?? null, neighborhoodId: d.neighborhoodId ?? null, address: d.address ?? null, lat: d.lat ?? null, lng: d.lng ?? null, assignedUserId: req.userId, createdBy: req.userId, visitStatus: "pending", active: true, createdAt: ts, updatedAt: ts };
   await col.clients.doc(id).set(data);
+  invalidatePullCache();
   res.status(201).json({ client: serializeClient(id, data) });
 });
 
@@ -55,6 +57,7 @@ clientsRouter.put("/:id", async (req, res) => {
   if (d.lat !== undefined) changes.lat = d.lat;
   if (d.lng !== undefined) changes.lng = d.lng;
   await ref.update(changes);
+  invalidatePullCache();
   res.json({ client: serializeClient(ref.id, { ...snap.data(), ...changes }) });
 });
 
@@ -62,11 +65,13 @@ clientsRouter.patch("/:id/visit-status", async (req, res) => {
   const { status } = req.body || {};
   if (!['pending', 'visited'].includes(status)) return res.status(400).json({ error: "Estado inválido." });
   await col.clients.doc(req.params.id).update({ visitStatus: status, updatedAt: nowIso() });
+  invalidatePullCache();
   res.json({ ok: true });
 });
 
 clientsRouter.delete("/:id", async (req, res) => {
   const orders = await col.orders.where("clientId", "==", req.params.id).limit(1).get();
   await col.clients.doc(req.params.id).update({ active: false, updatedAt: nowIso() });
+  invalidatePullCache();
   res.json({ ok: true, hadHistory: !orders.empty });
 });

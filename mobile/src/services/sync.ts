@@ -75,7 +75,13 @@ async function pullCatalog(): Promise<{ clients: number; products: number }> {
     }
   }
 
-  await setMeta("last_pull_at", data.serverTime);
+  // Si no hubo cambios, conservar el cursor anterior permite que el siguiente
+  // poll sea atendido desde la caché del backend sin tocar Firestore.
+  // `cursor` existe en el backend nuevo; `serverTime` mantiene compatibilidad
+  // durante un despliegue gradual.
+  if (data.hasChanges !== false) {
+    await setMeta("last_pull_at", data.cursor || data.serverTime);
+  }
   return { clients: data.clients.length, products: data.products.length };
 }
 
@@ -350,7 +356,7 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
 
 // Tiempo mínimo entre pulls completos (evita saturar el servidor con GETs repetidos)
 let lastFullPullAt = 0;
-const MIN_PULL_INTERVAL_MS = 12000; // 12 segundos
+const MIN_PULL_INTERVAL_MS = 60_000; // el timer ya es de 60 s; evita pulls duplicados por eventos de red/UI
 
 /**
  * PUSH-ONLY sync: solo sube el outbox al servidor sin hacer pull de catálogo.
@@ -394,4 +400,3 @@ export async function runSync(userId: string): Promise<SyncResult> {
     return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
   }
 }
-
