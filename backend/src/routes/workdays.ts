@@ -54,7 +54,7 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   await ref.set(newWorkDay);
   const payload = { workDay: serial(ref.id, newWorkDay) };
   workdayCacheEntry = { date, data: payload };
-  invalidatePullCache();
+  invalidatePullCache("workdays");
   res.json(payload);
 });
 
@@ -108,7 +108,7 @@ workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
     ts = nowIso();
   await ref.update({ status: "closed", ...totals, closedAt: ts, updatedAt: ts });
   invalidateWorkdayCache();
-  invalidatePullCache();
+  invalidatePullCache("workdays");
 
   // Asegurar que cualquier otra jornada huérfana de hoy quede cerrada
   const workDate = d.data()?.workDate;
@@ -130,7 +130,7 @@ workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
   const ts = nowIso();
   await ref.update({ status: "open", ...totals, closedAt: null, updatedAt: ts });
   invalidateWorkdayCache();
-  invalidatePullCache();
+  invalidatePullCache("workdays");
 
   const workDate = d.data()?.workDate;
   if (workDate) {
