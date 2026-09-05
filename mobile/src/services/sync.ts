@@ -15,7 +15,15 @@ export interface SyncResult {
 
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
 async function pullCatalog(): Promise<{ clients: number; products: number }> {
-  const since = (await getMeta("last_pull_at")) || "1970-01-01T00:00:00.000Z";
+  const db = await getDb();
+  const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
+  const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
+
+  let since = (await getMeta("last_pull_at")) || "1970-01-01T00:00:00.000Z";
+  if (prodCount === 0 || clientCount === 0) {
+    since = "1970-01-01T00:00:00.000Z";
+  }
+
   const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}`);
 
   for (const c of data.clients) await upsertClientFromServer(c);
