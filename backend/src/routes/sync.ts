@@ -83,6 +83,19 @@ function simpleHash(str: string): string {
   return (h >>> 0).toString(36);
 }
 
+// ─── TTL para el flag `force=1` ────────────────────────────────────────────────
+// `force=1` existe para el botón de refresh manual: debe traer datos frescos.
+// Pero sin límite, una ráfaga de taps (o un retry en loop) multiplica lecturas
+// reales a Firestore aunque nada haya cambiado. Con este TTL, un force=1 que
+// llega a menos de FORCE_TTL_MS del último force real se atiende como un pull
+// normal (con caché en memoria, cero lecturas nuevas), sin dejar de ser
+// "fresco" — porque la única forma de que la caché tenga datos viejos de
+// verdad es que nadie la haya invalidado, y eso solo pasa cuando SÍ hay una
+// mutación crítica (crear/editar cliente, producto, preventa, jornada), lo
+// cual limpia su caché de inmediato sin importar este TTL.
+const FORCE_TTL_MS = Number(process.env.SYNC_FORCE_TTL_MS) || 45_000;
+let lastRealForceFetchAt = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 syncRouter.get("/pull", async (req: AuthedRequest, res) => {
@@ -92,7 +105,16 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   try {
     const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
     const isInitial = !req.query.since || since.startsWith("1970");
-    const force = req.query.force === "1";
+    const requestedForce = req.query.force === "1";
+
+    // Si el último force=1 real fue hace menos de FORCE_TTL_MS, lo degradamos a
+    // un pull normal: se sirve de la caché en memoria (0 lecturas a Firestore)
+    // en vez de repetir todas las queries. El cliente igual recibe una
+    // respuesta válida y actualizada al segundo, solo que reusando lo ya leído.
+    const now = Date.now();
+    const forceThrottled = requestedForce && now - lastRealForceFetchAt < FORCE_TTL_MS;
+    const force = requestedForce && !forceThrottled;
+    if (force) lastRealForceFetchAt = now;
 
     // Un pull sin cambios vuelve a consultar el mismo cursor. Es atendido por
     // memoria (cero lecturas Firestore) hasta que una mutación lo invalida.
@@ -186,17 +208,26 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           [...new Set(activeOrders.map((d) => d.data().clientId))],
         ];
 
-        // 1 lectura por client único (batch), en vez de 1 por orden
+        // 1 lectura por client único (batch), en vez de 1 por orden — y si el
+        // cliente ya vino en el delta de `clientDocs` de este mismo pull, ni
+        // siquiera esa lectura hace falta: reusamos el doc ya traído.
         const clientMap = new Map<string, string>();
+        for (const d of clientDocs) {
+          const name = (d.data() as any).businessName || "Cliente";
+          clientMap.set(d.id, name);
+          clientNameCache.set(d.id, name);
+        }
         await Promise.all(
-          clientIds.map(async (cid) => {
-            const cachedName = clientNameCache.get(cid);
-            if (cachedName) { clientMap.set(cid, cachedName); return; }
-            const cdoc = await col.clients.doc(cid).get();
-            const name = cdoc.data()?.businessName || "Cliente";
-            clientNameCache.set(cid, name);
-            clientMap.set(cid, name);
-          })
+          clientIds
+            .filter((cid) => !clientMap.has(cid))
+            .map(async (cid) => {
+              const cachedName = clientNameCache.get(cid);
+              if (cachedName) { clientMap.set(cid, cachedName); return; }
+              const cdoc = await col.clients.doc(cid).get();
+              const name = cdoc.data()?.businessName || "Cliente";
+              clientNameCache.set(cid, name);
+              clientMap.set(cid, name);
+            })
         );
 
         orders = activeOrders.map((d, i) => {
@@ -246,6 +277,10 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       serverTime: nowIsoStr,
       cursor: nowIsoStr,
       hasChanges,
+      // Diagnóstico: true si este pull pidió force=1 pero fue atendido como uno
+      // normal (con caché) porque el último force real fue hace menos de
+      // FORCE_TTL_MS. No afecta la data devuelta, solo informa el motivo.
+      refreshThrottled: forceThrottled,
       workDay: workDayData,
       clients: clientDocs.map((d: any) => client(d.id, d.data())),
       products: productDocs.map((d: any) => product(d.id, d.data())),
