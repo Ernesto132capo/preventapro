@@ -7,8 +7,29 @@ import { invalidatePullCache } from "./sync";
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
 function today() { const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()); const v = (t: string) => p.find(x => x.type === t)?.value; return `${v("year")}-${v("month")}-${v("day")}`; }
-function serial(id: string, d: any) { return { id, server_id: id, user_id: d.userId, work_date: d.workDate, status: d.status, order_count: d.orderCount ?? 0, total_cents: d.totalCents ?? 0, created_at: d.createdAt, closed_at: d.closedAt ?? null }; }
+function serial(id: string, d: any) { return { id, server_id: id, user_id: d.userId, work_date: d.workDate, status: d.status, order_count: d.orderCount ?? 0, total_cents: d.totalCents ?? 0, created_at: d.createdAt, closed_at: d.closedAt ?? null, auto_closed: d.autoClosed === true }; }
 async function recalc(id: string) { const orders = (await col.orders.where("workDayId", "==", id).get()).docs.map(d => d.data()).filter(d => d.status !== "cancelled"); const total = orders.reduce((n, d) => n + (d.totalCents ?? 0), 0); await col.workDays.doc(id).update({ orderCount: orders.length, totalCents: total, updatedAt: nowIso() }); return { orderCount: orders.length, totalCents: total }; }
+
+// Si un preventista olvida cerrar la jornada y cambia el día calendario (00:00
+// hora Bolivia), esa jornada vieja quedaría en el limbo: ya no es "hoy" (no
+// aparece en ventas del día) pero tampoco está "closed" (no aparece en
+// Historial, que solo lista jornadas cerradas) — invisible para siempre con
+// todos sus pedidos adentro. Esta función la cierra automáticamente, con sus
+// totales reales, justo antes de abrir la jornada del nuevo día.
+async function closeStaleOpenWorkDays(currentDate: string): Promise<boolean> {
+  const staleOpen = await col.workDays.where("status", "==", "open").get();
+  const ts = nowIso();
+  let closedAny = false;
+  for (const staleDoc of staleOpen.docs) {
+    const staleData = staleDoc.data();
+    if (staleData.workDate && staleData.workDate !== currentDate) {
+      const totals = await recalc(staleDoc.id);
+      await staleDoc.ref.update({ status: "closed", ...totals, closedAt: ts, updatedAt: ts, autoClosed: true });
+      closedAny = true;
+    }
+  }
+  return closedAny;
+}
 
 // ─── Caché en memoria para /workdays/current ─────────────────────────────────
 // Evita releer Firestore en cada poll de 60s cuando la jornada no cambió.
@@ -48,7 +69,13 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     return res.json(payload);
   }
 
-  // 2. Primera vez del día: crear la jornada compartida
+  // 2. Primera vez del día: antes de abrir la jornada nueva, cerrar
+  // automáticamente cualquier jornada de un día anterior que haya quedado
+  // abierta (ver closeStaleOpenWorkDays). Así nunca queda una jornada
+  // huérfana sin poder verse ni en "hoy" ni en el Historial.
+  const closedStale = await closeStaleOpenWorkDays(date);
+  if (closedStale) invalidatePullCache("workdays");
+
   const ref = col.workDays.doc(uuid());
   const ts = nowIso();
   const newWorkDay = { userId: req.userId, workDate: date, status: "open", orderCount: 0, totalCents: 0, createdAt: ts, updatedAt: ts };
