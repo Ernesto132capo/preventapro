@@ -146,17 +146,20 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       cachedDocs("workdays", workdayQueryCache, todayDate, async () => (await col.workDays.where("workDate", "==", todayDate).get()).docs, force),
     ]);
 
-    // ── Presentaciones: filtro por timestamp en pulls incrementales ─────────────
-    // ANTES: collectionGroup().get() sin filtro = TODOS los documentos de
-    //        presentaciones en Firestore, independientemente de si cambiaron.
-    // AHORA: en pulls incrementales solo descargamos las modificadas desde `since`.
+    // ── Presentaciones: filtro por timestamp EN FIRESTORE, no en JS ─────────────
+    // ANTES: collectionGroup().get() sin ningún where = TODOS los documentos de
+    //        presentaciones de TODOS los productos, en cada pull (inicial e
+    //        incremental), filtrados recién en memoria. Esto causaba los picos
+    //        de cientos de lecturas aunque `since` viajara correcto.
+    // AHORA: el filtro se aplica en el propio query de Firestore, igual que en
+    //        clients/products: solo se leen los documentos que realmente
+    //        cumplen la condición.
+    const presentationsGroup = col.products.firestore.collectionGroup("presentations");
     const rawPresentationDocs = await cachedDocs("presentations", presentationQueryCache, cursorKey, async () => {
-      const snap = await col.products.firestore.collectionGroup("presentations").get();
-      return snap.docs.filter((d: any) => {
-        const data = d.data();
-        if (isInitial) return data.active !== false;
-        return (data.updatedAt && data.updatedAt > since) || (data.createdAt && data.createdAt > since);
-      });
+      const snap = isInitial
+        ? await presentationsGroup.where("active", "==", true).get()
+        : await presentationsGroup.where("updatedAt", ">", since).get();
+      return snap.docs;
     }, force);
 
     const presentations = rawPresentationDocs.map((d: any) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
