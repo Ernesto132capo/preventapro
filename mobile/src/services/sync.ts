@@ -75,12 +75,11 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
     }
   }
 
-  // Si no hubo cambios, conservar el cursor anterior permite que el siguiente
-  // poll sea atendido desde la caché del backend sin tocar Firestore.
-  // `cursor` existe en el backend nuevo; `serverTime` mantiene compatibilidad
-  // durante un despliegue gradual.
-  if (data.hasChanges !== false) {
-    await setMeta("last_pull_at", data.cursor || data.serverTime);
+  // Guardar siempre el cursor real del servidor (timestamp más fresco)
+  // para que las próximas recargas usen el since incremental y no 1970.
+  const newCursor = data.cursor || data.serverTime;
+  if (newCursor) {
+    await setMeta("last_pull_at", newCursor);
   }
   return { clients: data.clients.length, products: data.products.length };
 }
@@ -448,11 +447,6 @@ async function rescueLocalConflict(userId: string) {
   } catch (e) {
     console.warn("[rescueLocalConflict] Error limpiando outbox trabado:", e);
   }
-
-  // Forzar reseteo del cursor para alinear todos los datos locales con el servidor
-  try {
-    await setMeta("last_pull_at", "1970-01-01T00:00:00.000Z");
-  } catch {}
 }
 
 /**

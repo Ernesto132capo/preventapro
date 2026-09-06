@@ -48,8 +48,8 @@ const clientNameCache = new Map<string, string>();
 const sourceReadsInFlight = new Map<string, Promise<any[]>>();
 const forcedPullsInFlight = new Map<string, Promise<PullCache>>();
 
-async function cachedDocs(domain: string, cache: Map<string, any[]>, key: string, load: () => Promise<any[]>): Promise<any[]> {
-  if (cache.has(key)) return cache.get(key)!;
+async function cachedDocs(domain: string, cache: Map<string, any[]>, key: string, load: () => Promise<any[]>, force = false): Promise<any[]> {
+  if (!force && cache.has(key)) return cache.get(key)!;
   const flightKey = `${domain}:${key}`;
   const inFlight = sourceReadsInFlight.get(flightKey);
   if (inFlight) return inFlight;
@@ -139,11 +139,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     //        y una sola query de workdays (eliminamos la query redundante de "open").
     const cursorKey = isInitial ? "__initial__" : since;
     const [clientDocs, productDocs, categoryDocs, neighborhoodDocs, todayWorkDayDocs] = await Promise.all([
-      cachedDocs("clients", clientQueryCache, cursorKey, async () => (isInitial ? await col.clients.where("active", "==", true).get() : await col.clients.where("updatedAt", ">", since).get()).docs),
-      cachedDocs("products", productQueryCache, cursorKey, async () => (isInitial ? await col.products.where("active", "==", true).get() : await col.products.where("updatedAt", ">", since).get()).docs),
-      cachedDocs("categories", categoryQueryCache, cursorKey, async () => isInitial ? (await col.categories.where("active", "==", true).get()).docs : []),
-      cachedDocs("neighborhoods", neighborhoodQueryCache, cursorKey, async () => isInitial ? (await col.neighborhoods.where("active", "==", true).get()).docs : []),
-      cachedDocs("workdays", workdayQueryCache, todayDate, async () => (await col.workDays.where("workDate", "==", todayDate).get()).docs),
+      cachedDocs("clients", clientQueryCache, cursorKey, async () => (isInitial ? await col.clients.where("active", "==", true).get() : await col.clients.where("updatedAt", ">", since).get()).docs, force),
+      cachedDocs("products", productQueryCache, cursorKey, async () => (isInitial ? await col.products.where("active", "==", true).get() : await col.products.where("updatedAt", ">", since).get()).docs, force),
+      cachedDocs("categories", categoryQueryCache, cursorKey, async () => isInitial ? (await col.categories.where("active", "==", true).get()).docs : [], force),
+      cachedDocs("neighborhoods", neighborhoodQueryCache, cursorKey, async () => isInitial ? (await col.neighborhoods.where("active", "==", true).get()).docs : [], force),
+      cachedDocs("workdays", workdayQueryCache, todayDate, async () => (await col.workDays.where("workDate", "==", todayDate).get()).docs, force),
     ]);
 
     // ── Presentaciones: filtro por timestamp en pulls incrementales ─────────────
@@ -157,7 +157,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         if (isInitial) return data.active !== false;
         return (data.updatedAt && data.updatedAt > since) || (data.createdAt && data.createdAt > since);
       });
-    });
+    }, force);
 
     const presentations = rawPresentationDocs.map((d: any) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
 
@@ -173,13 +173,13 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // AHORA: cargamos todos los clients involucrados en una sola pasada en batch.
     let orders: any[] = [];
     if (todayWorkDayDoc) {
-      const orderDocs = await cachedDocs("orders", orderQueryCache, todayWorkDayDoc.id, async () => (await col.orders.where("workDayId", "==", todayWorkDayDoc.id).get()).docs);
+      const orderDocs = await cachedDocs("orders", orderQueryCache, todayWorkDayDoc.id, async () => (await col.orders.where("workDayId", "==", todayWorkDayDoc.id).get()).docs, force);
       const activeOrders = orderDocs.filter((d) => d.data().status !== "cancelled");
 
       if (activeOrders.length > 0) {
         // Batch de items en paralelo (en vez de await secuencial)
         const [itemsSnaps, clientIds] = [
-          await Promise.all(activeOrders.map((d) => cachedDocs("order-items", orderItemQueryCache, d.id, async () => (await orderItemsCol(d.id).get()).docs))),
+          await Promise.all(activeOrders.map((d) => cachedDocs("order-items", orderItemQueryCache, d.id, async () => (await orderItemsCol(d.id).get()).docs, force))),
           [...new Set(activeOrders.map((d) => d.data().clientId))],
         ];
 
@@ -238,11 +238,10 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       Boolean(todayWorkDayDoc && String(todayWorkDayDoc.data().updatedAt || todayWorkDayDoc.data().createdAt || "") > since) ||
       orders.some((order) => String(order.updated_at || order.created_at || "") > since);
 
+    const nowIsoStr = new Date().toISOString();
     const responseBody = {
-      serverTime: new Date().toISOString(),
-      // El móvil conserva el cursor cuando no hubo cambios; así el siguiente
-      // poll usa exactamente la misma clave y llega a esta caché.
-      cursor: hasChanges ? new Date().toISOString() : since,
+      serverTime: nowIsoStr,
+      cursor: nowIsoStr,
       hasChanges,
       workDay: workDayData,
       clients: clientDocs.map((d: any) => client(d.id, d.data())),
