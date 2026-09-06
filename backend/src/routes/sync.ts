@@ -151,10 +151,12 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     //        presentaciones en Firestore, independientemente de si cambiaron.
     // AHORA: en pulls incrementales solo descargamos las modificadas desde `since`.
     const rawPresentationDocs = await cachedDocs("presentations", presentationQueryCache, cursorKey, async () => {
-      const snap = isInitial
-        ? await col.products.firestore.collectionGroup("presentations").where("active", "==", true).get()
-        : await col.products.firestore.collectionGroup("presentations").where("updatedAt", ">", since).get();
-      return snap.docs;
+      const snap = await col.products.firestore.collectionGroup("presentations").get();
+      return snap.docs.filter((d: any) => {
+        const data = d.data();
+        if (isInitial) return data.active !== false;
+        return (data.updatedAt && data.updatedAt > since) || (data.createdAt && data.createdAt > since);
+      });
     });
 
     const presentations = rawPresentationDocs.map((d: any) => presentation(d.id, d.data(), d.ref.parent?.parent?.id));
