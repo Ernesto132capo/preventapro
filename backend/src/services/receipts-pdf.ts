@@ -1,7 +1,7 @@
 import PDFDocument from "pdfkit";
 import fs from "fs";
 import path from "path";
-import { col, orderItemsCol } from "../db/firestore";
+import { col, orderItemsCol, getNextReceiptNumber } from "../db/firestore";
 
 interface ReceiptLine {
   order_id: string;
@@ -9,6 +9,7 @@ interface ReceiptLine {
   total_cents: number;
   business_name: string;
   address: string | null;
+  receipt_number: number;
   product_name_snapshot: string;
   presentation_name_snapshot: string;
   quantity: number;
@@ -27,7 +28,21 @@ function localDate(value: string) {
 /** Un PDF imprimible: varias boletas por página, separadas por línea de corte. */
 export async function generateClientReceiptsPdf(workDayId: string, outDir: string): Promise<string> {
   const orders = (await col.orders.where("workDayId", "==", workDayId).get()).docs.filter(d => d.data().status !== "cancelled");
-  const lines = (await Promise.all(orders.map(async order => { const d=order.data(), client=(await col.clients.doc(d.clientId).get()).data(), items=await orderItemsCol(order.id).get(); return items.docs.map(i => ({ order_id:order.id, created_at:d.createdAt, total_cents:d.totalCents, business_name:client?.businessName??"", address:client?.address??null, ...i.data() })); }))).flat() as ReceiptLine[];
+
+  // Compatibilidad hacia atrás: una preventa creada antes de existir el
+  // correlativo (o restaurada desde un respaldo previo a este cambio) recibe
+  // su número recién acá, de forma perezosa, y queda persistido para
+  // siempre — nunca se vuelve a recalcular en el próximo reporte.
+  const receiptNumbers = new Map<string, number>();
+  for (const order of orders) {
+    const existing = order.data().receiptNumber;
+    if (existing) { receiptNumbers.set(order.id, existing); continue; }
+    const assigned = await getNextReceiptNumber();
+    await order.ref.update({ receiptNumber: assigned });
+    receiptNumbers.set(order.id, assigned);
+  }
+
+  const lines = (await Promise.all(orders.map(async order => { const d=order.data(), client=(await col.clients.doc(d.clientId).get()).data(), items=await orderItemsCol(order.id).get(); return items.docs.map(i => ({ order_id:order.id, created_at:d.createdAt, total_cents:d.totalCents, business_name:client?.businessName??"", address:client?.address??null, receipt_number: receiptNumbers.get(order.id)!, ...i.data() })); }))).flat() as ReceiptLine[];
 
   const byOrder = new Map<string, ReceiptLine[]>();
   for (const line of lines) byOrder.set(line.order_id, [...(byOrder.get(line.order_id) || []), line]);
@@ -40,7 +55,6 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
     stream.on("finish", resolve);
     stream.on("error", reject);
 
-    let number = 1;
     for (const order of byOrder.values()) {
       const first = order[0];
       // Cada línea necesita ~21 pt; calculamos el alto antes de dibujarla para
@@ -53,7 +67,7 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
         .text("COMPROBANTE DE VENTA", 42, doc.y, { width: 511, align: "center" });
       doc.moveDown(0.35);
       doc.fillColor("#111827").font("Helvetica").fontSize(10);
-      doc.text(`Nro. de comprobante: C-${String(number).padStart(4, "0")}`, 42, doc.y, { width: 511 });
+      doc.text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 });
       doc.text(`Cliente: ${first.business_name}`);
       doc.text(`Fecha: ${localDate(first.created_at)}`);
       if (first.address) doc.text(`Dirección: ${first.address}`);
@@ -86,7 +100,6 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
       doc.moveDown(0.45);
       doc.dash(3, { space: 3 }).moveTo(42, doc.y).lineTo(553, doc.y).strokeColor("#6B7280").stroke().undash();
       doc.moveDown(0.55);
-      number++;
     }
     if (byOrder.size === 0) doc.fontSize(14).text("No hay preventas activas para esta jornada.");
     doc.end();

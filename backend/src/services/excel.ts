@@ -1,11 +1,12 @@
 import ExcelJS from "exceljs";
 import path from "path";
-import { col, orderItemsCol } from "../db/firestore";
+import { col, orderItemsCol, getNextReceiptNumber } from "../db/firestore";
 
 interface ProductLineRow {
   business_name: string; address: string | null; product_name_snapshot: string;
   presentation_name_snapshot: string; quantity: number; unit_price_cents_snapshot: number;
   subtotal_cents: number; order_id: string; order_total_cents: number; created_at: string;
+  receipt_number: number;
 }
 
 const headerFill = "001428";
@@ -17,7 +18,20 @@ const moneyFormat = "#,##0.00";
 
 async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[]> {
   const orders = (await col.orders.where("workDayId", "==", workDayId).get()).docs.filter(d => d.data().status !== "cancelled");
-  const rows = (await Promise.all(orders.map(async o => { const d=o.data(), client=(await col.clients.doc(d.clientId).get()).data(); const items=await orderItemsCol(o.id).get(); return items.docs.map(i => ({ business_name:client?.businessName??"",address:client?.address??null,order_id:o.id,order_total_cents:d.totalCents,created_at:d.createdAt,...i.data() })); }))).flat() as ProductLineRow[];
+
+  // Compatibilidad hacia atrás: igual que en receipts-pdf.ts, una preventa
+  // sin correlativo asignado (previa a este cambio) lo recibe recién acá y
+  // queda persistido para siempre.
+  const receiptNumbers = new Map<string, number>();
+  for (const order of orders) {
+    const existing = order.data().receiptNumber;
+    if (existing) { receiptNumbers.set(order.id, existing); continue; }
+    const assigned = await getNextReceiptNumber();
+    await order.ref.update({ receiptNumber: assigned });
+    receiptNumbers.set(order.id, assigned);
+  }
+
+  const rows = (await Promise.all(orders.map(async o => { const d=o.data(), client=(await col.clients.doc(d.clientId).get()).data(); const items=await orderItemsCol(o.id).get(); return items.docs.map(i => ({ business_name:client?.businessName??"",address:client?.address??null,order_id:o.id,order_total_cents:d.totalCents,created_at:d.createdAt,receipt_number:receiptNumbers.get(o.id)!,...i.data() })); }))).flat() as ProductLineRow[];
   return rows.sort((a,b)=>a.business_name.localeCompare(b.business_name)||a.created_at.localeCompare(b.created_at));
 }
 
@@ -94,17 +108,17 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
   const wb = new ExcelJS.Workbook();
   const byOrder = new Map<string, ProductLineRow[]>();
   for (const row of rows) byOrder.set(row.order_id, [...(byOrder.get(row.order_id) || []), row]);
-  let number = 1;
   for (const lines of byOrder.values()) {
     const first = lines[0];
-    const sheet = wb.addWorksheet(`Boleta ${String(number).padStart(3, "0")}`);
+    const receiptCode = String(first.receipt_number).padStart(6, "0");
+    const sheet = wb.addWorksheet(`Boleta ${receiptCode}`);
     sheet.columns = [{ width: 30 }, { width: 20 }, { width: 12 }, { width: 18 }, { width: 18 }];
     sheet.mergeCells("A1:E1");
     sheet.getCell("A1").value = "BOLETA DE PREVENTA";
     sheet.getCell("A1").font = { bold: true, size: 16, color: { argb: "FFFFFFFF" } };
     sheet.getCell("A1").fill = { type: "pattern", pattern: "solid", fgColor: { argb: headerFill } };
     sheet.getCell("A1").alignment = { horizontal: "center" };
-    sheet.addRow(["Nro. de boleta", `B-${String(number).padStart(4, "0")}`]);
+    sheet.addRow(["Nro. de boleta", receiptCode]);
     sheet.addRow(["Cliente", first.business_name]);
     sheet.addRow(["Fecha", first.created_at]);
     if (first.address) sheet.addRow(["Dirección", first.address]);
@@ -116,7 +130,6 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
     }
     const total = sheet.addRow(["", "", "", "TOTAL", first.order_total_cents / 100]);
     total.font = { bold: true }; total.getCell(5).numFmt = moneyFormat;
-    number++;
   }
   if (byOrder.size === 0) wb.addWorksheet("Sin boletas").getCell("A1").value = "No hay preventas activas.";
   const filePath = path.join(outDir, "boletas_clientes.xlsx");

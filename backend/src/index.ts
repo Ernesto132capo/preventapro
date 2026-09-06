@@ -11,6 +11,7 @@ import { workdaysRouter } from "./routes/workdays";
 import { ordersRouter } from "./routes/orders";
 import { syncRouter } from "./routes/sync";
 import { reportsRouter } from "./routes/reports";
+import { settingsRouter } from "./routes/settings";
 
 const app = express();
 app.use(cors());
@@ -35,6 +36,7 @@ app.use("/api/workdays", workdaysRouter);
 app.use("/api/orders", ordersRouter);
 app.use("/api/sync", syncRouter);
 app.use("/api/reports", reportsRouter);
+app.use("/api/settings", settingsRouter);
 
 // Manejador de errores centralizado — nunca dejar una excepción sin responder al cliente.
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
