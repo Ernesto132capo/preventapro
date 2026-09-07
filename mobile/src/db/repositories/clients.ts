@@ -146,3 +146,50 @@ export async function resolveServerClientId(localId: string): Promise<string | n
   if (row.server_id) return row.server_id;
   return row.sync_status === "synced" ? row.id : null;
 }
+
+/**
+ * Limpieza única del bug de duplicados: antes de que el pull incluyera
+ * `client_local_id`, un cliente creado offline podía terminar con dos filas
+ * locales apuntando al mismo `server_id` (la original y la que trajo el pull
+ * sin poder reconocerla). Junta esos grupos, conserva una sola fila por
+ * `server_id` — priorizando la que ya tenga preventas asociadas para no
+ * romper el historial — reasigna las preventas de las filas sobrantes a la
+ * que se conserva, y borra las duplicadas. Es seguro correrla varias veces:
+ * si no hay duplicados, no hace nada.
+ */
+export async function mergeDuplicateClients(): Promise<number> {
+  const db = await getDb();
+  const groups = await db.getAllAsync<{ server_id: string; ids: string }>(
+    `SELECT server_id, GROUP_CONCAT(id) as ids FROM clients
+     WHERE server_id IS NOT NULL AND active = 1
+     GROUP BY server_id HAVING COUNT(*) > 1`
+  );
+
+  let removed = 0;
+  for (const group of groups) {
+    const ids = group.ids.split(",");
+
+    // Preferí como "canónica" la fila que ya tenga preventas asociadas
+    // (para no romper el historial); si ninguna tiene, la más antigua.
+    const withOrders = await db.getFirstAsync<{ client_id: string }>(
+      `SELECT client_id FROM orders WHERE client_id IN (${ids.map(() => "?").join(",")}) LIMIT 1`,
+      ids
+    );
+    let canonicalId = withOrders?.client_id;
+    if (!canonicalId) {
+      const oldest = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM clients WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at ASC LIMIT 1`,
+        ids
+      );
+      canonicalId = oldest!.id;
+    }
+
+    for (const id of ids) {
+      if (id === canonicalId) continue;
+      await db.runAsync(`UPDATE orders SET client_id = ? WHERE client_id = ?`, [canonicalId, id]);
+      await db.runAsync(`DELETE FROM clients WHERE id = ?`, [id]);
+      removed++;
+    }
+  }
+  return removed;
+}

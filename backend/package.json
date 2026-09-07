@@ -8,11 +8,13 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",
+    "migrate:neon": "tsx scripts/migrate-firestore-to-neon.ts",
     "seed": "tsx src/db/seed.ts",
     "test": "vitest run"
   },
   "dependencies": {
     "@types/pdfkit": "^0.17.6",
+    "@types/pg": "^8.23.1",
     "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -20,6 +22,7 @@
     "express": "^4.19.2",
     "firebase-admin": "^12.6.0",
     "pdfkit": "^0.20.2",
+    "pg": "^8.23.0",
     "uuid": "^9.0.1",
     "zod": "^3.23.8"
   },

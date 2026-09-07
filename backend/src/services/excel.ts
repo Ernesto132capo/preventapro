@@ -1,6 +1,6 @@
 import ExcelJS from "exceljs";
 import path from "path";
-import { col, orderItemsCol, getNextReceiptNumber } from "../db/firestore";
+import { pool } from "../db/pg";
 
 interface ProductLineRow {
   business_name: string; address: string | null; product_name_snapshot: string;
@@ -17,22 +17,24 @@ const accentFill = "0F766E";
 const moneyFormat = "#,##0.00";
 
 async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[]> {
-  const orders = (await col.orders.where("workDayId", "==", workDayId).get()).docs.filter(d => d.data().status !== "cancelled");
-
-  // Compatibilidad hacia atrás: igual que en receipts-pdf.ts, una preventa
-  // sin correlativo asignado (previa a este cambio) lo recibe recién acá y
-  // queda persistido para siempre.
-  const receiptNumbers = new Map<string, number>();
-  for (const order of orders) {
-    const existing = order.data().receiptNumber;
-    if (existing) { receiptNumbers.set(order.id, existing); continue; }
-    const assigned = await getNextReceiptNumber();
-    await order.ref.update({ receiptNumber: assigned });
-    receiptNumbers.set(order.id, assigned);
-  }
-
-  const rows = (await Promise.all(orders.map(async o => { const d=o.data(), client=(await col.clients.doc(d.clientId).get()).data(); const items=await orderItemsCol(o.id).get(); return items.docs.map(i => ({ business_name:client?.businessName??"",address:client?.address??null,order_id:o.id,order_total_cents:d.totalCents,created_at:d.createdAt,receipt_number:receiptNumbers.get(o.id)!,...i.data() })); }))).flat() as ProductLineRow[];
-  return rows.sort((a,b)=>a.business_name.localeCompare(b.business_name)||a.created_at.localeCompare(b.created_at));
+  // JOIN en una sola consulta en vez de N+1 lecturas por orden (cliente + items).
+  // receipt_number siempre viene asignado por la secuencia de Postgres al crear
+  // la orden, así que ya no hace falta la asignación perezosa que existía con
+  // Firestore para órdenes legadas.
+  const { rows } = await pool.query(
+    `SELECT
+       c.business_name, c.address,
+       oi.product_name_snapshot, oi.presentation_name_snapshot, oi.quantity,
+       oi.unit_price_cents_snapshot, oi.subtotal_cents,
+       o.id AS order_id, o.total_cents AS order_total_cents, o.created_at, o.receipt_number
+     FROM orders o
+     JOIN clients c ON c.id = o.client_id
+     JOIN order_items oi ON oi.order_id = o.id
+     WHERE o.work_day_id = $1 AND o.status != 'cancelled'
+     ORDER BY c.business_name, o.created_at`,
+    [workDayId]
+  );
+  return rows as ProductLineRow[];
 }
 
 function styleTableHeader(row: ExcelJS.Row) {

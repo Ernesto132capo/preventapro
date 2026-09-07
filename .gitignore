@@ -6,3 +6,4 @@ dist/
 reports/*/
 .expo/
 backend/firebase-service-account.json
+.env

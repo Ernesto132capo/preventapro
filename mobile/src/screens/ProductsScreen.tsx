@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, FlatList, StyleSheet, Pressable, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -16,8 +16,20 @@ export function ProductsScreen() {
   const [products, setProducts] = useState<ProductWithPresentations[]>([]);
   const [search, setSearch] = useState("");
 
+  // Guarda anti-carrera: si el usuario escribe rápido, varias búsquedas
+  // quedan "en vuelo" a la vez y pueden responder en desorden (una búsqueda
+  // con más resultados tarda más y puede llegar después que una más
+  // reciente con menos resultados). Solo aplicamos la respuesta si el texto
+  // del buscador sigue siendo el mismo que cuando se disparó esa búsqueda.
+  const latestSearchRef = useRef(search);
+  useEffect(() => {
+    latestSearchRef.current = search;
+  }, [search]);
+
   const load = useCallback(async () => {
-    setProducts(await listProducts(search));
+    const term = search;
+    const data = await listProducts(term);
+    if (latestSearchRef.current === term) setProducts(data);
   }, [search]);
 
   useFocusEffect(

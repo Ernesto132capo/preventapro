@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { View, Text, ScrollView, StyleSheet, RefreshControl, Alert } from "react-native";
+import { View, Text, ScrollView, StyleSheet, RefreshControl, Alert, Modal, Pressable, TextInput } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
 import { Card } from "../components/Card";
@@ -9,6 +9,7 @@ import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
 import { getOrCreateOpenWorkDay, listClosedWorkDays, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { listOrdersForWorkDay, cancelOrderLocal } from "../db/repositories/orders";
+import { mergeDuplicateClients } from "../db/repositories/clients";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
 import { apiFetch } from "../services/api";
@@ -22,12 +23,86 @@ export function DashboardScreen() {
   const [recentOrders, setRecentOrders] = useState<LocalOrder[]>([]);
   const [yesterdayTotal, setYesterdayTotal] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [showUserModal, setShowUserModal] = useState(false);
+  const [stats, setStats] = useState<{ totalHistoricalOrders: number } | null>(null);
+  const [loadingStats, setLoadingStats] = useState(false);
+  const [showCounterModal, setShowCounterModal] = useState(false);
+  const [counterInput, setCounterInput] = useState("");
+
+  async function loadStats() {
+    setLoadingStats(true);
+    try {
+      const res = await apiFetch<any>(`/settings/stats`);
+      setStats({ totalHistoricalOrders: res.totalHistoricalOrders });
+    } catch {
+      // Si falla (sin conexión, etc.) simplemente no se muestra el dato — no es crítico.
+    } finally {
+      setLoadingStats(false);
+    }
+  }
+
+  function openUserModal() {
+    setShowUserModal(true);
+    loadStats();
+  }
+
+  function handleSaveCounter() {
+    const value = parseInt(counterInput, 10);
+    if (isNaN(value) || value < 0) {
+      Alert.alert("Número inválido", "Ingresa un número entero positivo (ej. 400340).");
+      return;
+    }
+    Alert.alert(
+      "Confirmar ajuste de contador",
+      `¿Seguro que deseas fijar el correlativo de boletas en ${value}? La próxima preventa emitirá el comprobante número ${value + 1}. Esta acción no se puede deshacer.`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Confirmar",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await apiFetch(`/settings/receipt-counter`, { method: "PUT", body: { value } });
+              setShowCounterModal(false);
+              setCounterInput("");
+              await loadStats();
+              Alert.alert("Contador actualizado", `El correlativo de boletas quedó en ${value}.`);
+            } catch (e: any) {
+              Alert.alert("Error", e?.message || "No se pudo actualizar el contador. Revisa tu conexión.");
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function handleMergeDuplicates() {
+    Alert.alert(
+      "Quitar clientes duplicados",
+      "Esto revisa la base de datos de este teléfono y combina clientes que quedaron duplicados por un problema ya corregido. Las preventas asociadas se conservan. ¿Deseas continuar?",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Continuar",
+          onPress: async () => {
+            const removed = await mergeDuplicateClients();
+            Alert.alert(
+              removed > 0 ? "Duplicados eliminados" : "Sin duplicados",
+              removed > 0
+                ? `Se combinaron ${removed} cliente${removed === 1 ? "" : "s"} duplicado${removed === 1 ? "" : "s"}. Sus preventas se conservaron.`
+                : "No se encontraron clientes duplicados en este teléfono."
+            );
+          },
+        },
+      ]
+    );
+  }
 
   const load = useCallback(async () => {
     if (!user) return;
     const wd = await getOrCreateOpenWorkDay(user.id);
     const orders = await listOrdersForWorkDay(wd.id);
-    setRecentOrders(orders.slice(0, 5));
+    setRecentOrders(orders);
 
     const totalCents = orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
     const orderCount = orders.length;
@@ -119,10 +194,15 @@ export function DashboardScreen() {
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
     >
       <View style={styles.headerRow}>
-        <View>
-          <Text style={styles.greeting}>Hola, Preventista 👋</Text>
-          <Text style={styles.date}>{new Date().toLocaleDateString("es-BO", { weekday: "long", day: "numeric", month: "long" })}</Text>
-        </View>
+        <Pressable style={styles.greetingRow} onPress={openUserModal}>
+          <View style={styles.userIconCircle}>
+            <Text style={styles.userIconText}>👤</Text>
+          </View>
+          <View>
+            <Text style={styles.greeting}>Hola, Preventista 👋</Text>
+            <Text style={styles.date}>{new Date().toLocaleDateString("es-BO", { weekday: "long", day: "numeric", month: "long" })}</Text>
+          </View>
+        </Pressable>
         <View style={styles.headerActions}>
           <StatusPill
             kind={connection === "syncing" ? "syncing" : connection === "online" ? "online" : "offline"}
@@ -139,6 +219,76 @@ export function DashboardScreen() {
           />
         </View>
       </View>
+
+      <Modal visible={showUserModal} transparent animationType="fade" onRequestClose={() => setShowUserModal(false)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setShowUserModal(false)}>
+          <Pressable style={styles.modalCard} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>Mi cuenta</Text>
+            <View style={{ marginTop: spacing.md }}>
+              <Text style={styles.modalLabel}>Código de preventista</Text>
+              <Text style={styles.modalValue}>{user?.code ?? "—"}</Text>
+            </View>
+            <View style={{ marginTop: spacing.sm }}>
+              <Text style={styles.modalLabel}>Nombre</Text>
+              <Text style={styles.modalValue}>{user?.fullName ?? "—"}</Text>
+            </View>
+            {!!user?.email && (
+              <View style={{ marginTop: spacing.sm }}>
+                <Text style={styles.modalLabel}>Correo</Text>
+                <Text style={styles.modalValue}>{user.email}</Text>
+              </View>
+            )}
+
+            <View style={styles.statsBox}>
+              <Text style={styles.modalLabel}>Total histórico de preventas</Text>
+              {loadingStats ? (
+                <Text style={styles.modalValue}>Cargando...</Text>
+              ) : (
+                <Text style={styles.statsValue}>
+                  {stats ? stats.totalHistoricalOrders.toLocaleString("es-BO") : "—"}
+                </Text>
+              )}
+              <Text style={styles.statsHint}>Acumulado global, sin importar jornadas cerradas.</Text>
+            </View>
+
+            <Button
+              label="✏️ Ajustar contador (temporal)"
+              variant="outline"
+              onPress={() => { setCounterInput(stats ? String(stats.totalHistoricalOrders) : ""); setShowCounterModal(true); }}
+              style={{ marginTop: spacing.md }}
+            />
+
+            <Button
+              label="🧹 Quitar clientes duplicados"
+              variant="outline"
+              onPress={() => { setShowUserModal(false); handleMergeDuplicates(); }}
+              style={{ marginTop: spacing.sm }}
+            />
+            <Button label="Cerrar" variant="outline" onPress={() => setShowUserModal(false)} style={{ marginTop: spacing.sm }} />
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={showCounterModal} transparent animationType="fade" onRequestClose={() => setShowCounterModal(false)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setShowCounterModal(false)}>
+          <Pressable style={styles.modalCard} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>Ajustar contador de boletas</Text>
+            <Text style={[styles.statsHint, { marginTop: spacing.sm }]}>
+              Uso temporal: fija el correlativo en el número donde va tu arrastre histórico. La próxima preventa emitirá el siguiente número. Puedes dejar de usar esta opción una vez configurado.
+            </Text>
+            <TextInput
+              style={styles.counterInput}
+              placeholder="Ej. 400340"
+              placeholderTextColor={colors.textMuted}
+              keyboardType="number-pad"
+              value={counterInput}
+              onChangeText={setCounterInput}
+            />
+            <Button label="Guardar" onPress={handleSaveCounter} style={{ marginTop: spacing.md }} />
+            <Button label="Cancelar" variant="outline" onPress={() => setShowCounterModal(false)} style={{ marginTop: spacing.sm }} />
+          </Pressable>
+        </Pressable>
+      </Modal>
 
       <Card style={{ backgroundColor: colors.navy, marginTop: spacing.lg }}>
         <View style={styles.rowBetween}>
@@ -336,6 +486,52 @@ const styles = StyleSheet.create({
   logoutButton: { minHeight: 34, paddingHorizontal: 10, marginLeft: spacing.sm },
   greeting: { fontSize: 20, fontWeight: "700", color: colors.textPrimary },
   date: { fontSize: 13, color: colors.textSecondary, textTransform: "capitalize" },
+  greetingRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, flex: 1 },
+  userIconCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.surfaceAlt,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  userIconText: { fontSize: 18 },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: spacing.lg,
+  },
+  modalCard: {
+    width: "100%",
+    maxWidth: 360,
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    padding: spacing.lg,
+  },
+  modalTitle: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
+  modalLabel: { fontSize: 12, color: colors.textMuted, textTransform: "uppercase" },
+  modalValue: { fontSize: 15, color: colors.textPrimary, fontWeight: "600", marginTop: 2 },
+  statsBox: {
+    marginTop: spacing.lg,
+    backgroundColor: colors.surfaceAlt,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  statsValue: { fontSize: 24, fontWeight: "700", color: colors.emerald, marginTop: 2 },
+  statsHint: { fontSize: 12, color: colors.textSecondary, marginTop: 4 },
+  counterInput: {
+    marginTop: spacing.md,
+    minHeight: 44,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: spacing.md,
+    backgroundColor: colors.surface,
+    color: colors.textPrimary,
+    fontSize: 16,
+  },
   totalLabel: { color: colors.surfaceAlt3, fontSize: 13 },
   totalValue: { color: "#fff", fontSize: 32, fontWeight: "700", marginTop: 4 },
   metaRow: { flexDirection: "row", justifyContent: "space-between", marginTop: spacing.md },

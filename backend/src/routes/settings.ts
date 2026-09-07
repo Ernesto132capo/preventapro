@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { getReceiptCounterValue, setReceiptCounterValue } from "../db/firestore";
+import { pool } from "../db/pg";
 import { requireAuth } from "../middleware/auth";
 
 export const settingsRouter = Router();
@@ -8,9 +8,11 @@ settingsRouter.use(requireAuth);
 
 // Estadísticas globales para el apartado "Perfil" de la app: el correlativo
 // de boletas ES el total histórico de preventas emitidas (nunca se reinicia),
-// así que no hace falta un contador aparte.
+// así que no hace falta un contador aparte. Ahora vive en la secuencia nativa
+// de Postgres receipt_number_seq en vez del documento counters/receiptNumber.
 settingsRouter.get("/stats", async (_req, res) => {
-  const totalHistoricalOrders = await getReceiptCounterValue();
+  const { rows } = await pool.query("SELECT last_value FROM receipt_number_seq");
+  const totalHistoricalOrders = Number(rows[0]?.last_value ?? 0);
   res.json({ totalHistoricalOrders });
 });
 
@@ -22,6 +24,6 @@ const counterSchema = z.object({ value: z.number().int().nonnegative() });
 settingsRouter.put("/receipt-counter", async (req, res) => {
   const parsed = counterSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-  const value = await setReceiptCounterValue(parsed.data.value);
-  res.json({ ok: true, value });
+  const { rows } = await pool.query("SELECT setval('receipt_number_seq', $1)", [parsed.data.value]);
+  res.json({ ok: true, value: Number(rows[0]?.setval ?? parsed.data.value) });
 });

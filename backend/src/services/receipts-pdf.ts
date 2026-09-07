@@ -1,7 +1,7 @@
 import PDFDocument from "pdfkit";
 import fs from "fs";
 import path from "path";
-import { col, orderItemsCol, getNextReceiptNumber } from "../db/firestore";
+import { pool } from "../db/pg";
 
 interface ReceiptLine {
   order_id: string;
@@ -27,22 +27,24 @@ function localDate(value: string) {
 
 /** Un PDF imprimible: varias boletas por página, separadas por línea de corte. */
 export async function generateClientReceiptsPdf(workDayId: string, outDir: string): Promise<string> {
-  const orders = (await col.orders.where("workDayId", "==", workDayId).get()).docs.filter(d => d.data().status !== "cancelled");
-
-  // Compatibilidad hacia atrás: una preventa creada antes de existir el
-  // correlativo (o restaurada desde un respaldo previo a este cambio) recibe
-  // su número recién acá, de forma perezosa, y queda persistido para
-  // siempre — nunca se vuelve a recalcular en el próximo reporte.
-  const receiptNumbers = new Map<string, number>();
-  for (const order of orders) {
-    const existing = order.data().receiptNumber;
-    if (existing) { receiptNumbers.set(order.id, existing); continue; }
-    const assigned = await getNextReceiptNumber();
-    await order.ref.update({ receiptNumber: assigned });
-    receiptNumbers.set(order.id, assigned);
-  }
-
-  const lines = (await Promise.all(orders.map(async order => { const d=order.data(), client=(await col.clients.doc(d.clientId).get()).data(), items=await orderItemsCol(order.id).get(); return items.docs.map(i => ({ order_id:order.id, created_at:d.createdAt, total_cents:d.totalCents, business_name:client?.businessName??"", address:client?.address??null, receipt_number: receiptNumbers.get(order.id)!, ...i.data() })); }))).flat() as ReceiptLine[];
+  // JOIN en una sola consulta en vez de N+1 lecturas por orden (cliente + items).
+  // receipt_number siempre viene asignado por la secuencia de Postgres al crear
+  // la orden, así que ya no hace falta la asignación perezosa que existía con
+  // Firestore para órdenes legadas.
+  const { rows } = await pool.query(
+    `SELECT
+       o.id AS order_id, o.created_at, o.total_cents, o.receipt_number,
+       c.business_name, c.address,
+       oi.product_name_snapshot, oi.presentation_name_snapshot, oi.quantity,
+       oi.unit_price_cents_snapshot, oi.subtotal_cents
+     FROM orders o
+     JOIN clients c ON c.id = o.client_id
+     JOIN order_items oi ON oi.order_id = o.id
+     WHERE o.work_day_id = $1 AND o.status != 'cancelled'
+     ORDER BY o.created_at`,
+    [workDayId]
+  );
+  const lines = rows as ReceiptLine[];
 
   const byOrder = new Map<string, ReceiptLine[]>();
   for (const line of lines) byOrder.set(line.order_id, [...(byOrder.get(line.order_id) || []), line]);

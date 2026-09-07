@@ -42,7 +42,7 @@ export function ClientFormScreen() {
   async function handleSave() {
     setError(null);
     if (!businessName.trim()) {
-      setError("El nombre del negocio es obligatorio.");
+      setError("El nombre del propietario es obligatorio.");
       return;
     }
     setSaving(true);
@@ -67,8 +67,8 @@ export function ClientFormScreen() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }}>
-      <Field label="Nombre del negocio *" value={businessName} onChangeText={setBusinessName} placeholder="Tienda Doña Rosa" />
-      <Field label="Nombre del contacto/propietario" value={contactName} onChangeText={setContactName} placeholder="Rosa Mamani" />
+      <Field label="Nombre del propietario *" value={businessName} onChangeText={setBusinessName} placeholder="Rosa Mamani" />
+      <Field label="Nombre del negocio" value={contactName} onChangeText={setContactName} placeholder="Tienda Doña Rosa" />
       <Field label="Teléfono / WhatsApp" value={phone} onChangeText={setPhone} placeholder="77712345" keyboardType="phone-pad" />
       <Field label="Dirección" value={address} onChangeText={setAddress} placeholder="Av. Principal 123" />
 

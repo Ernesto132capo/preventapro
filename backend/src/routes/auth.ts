@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { auth } from "../firebase/admin";
 import { codeToEmail, createAuthUser } from "../services/auth";
-import { col, nowIso } from "../db/firestore";
+import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 
 export const authRouter = Router();
@@ -13,18 +13,24 @@ export const authRouter = Router();
 // y el SDK cliente maneja solo la sesión persistida sin conexión.
 authRouter.get("/resolve-code/:code", async (req, res) => {
   const code = req.params.code;
-  const snap = await col.users.where("code", "==", code).where("active", "==", true).limit(1).get();
-  if (snap.empty) {
+  const { rows } = await pool.query(
+    "SELECT id FROM users WHERE code = $1 AND active = true LIMIT 1",
+    [code]
+  );
+  if (rows.length === 0) {
     return res.status(404).json({ error: "Código de preventista no encontrado." });
   }
   return res.json({ email: codeToEmail(code) });
 });
 
 authRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
-  const doc = await col.users.doc(req.userId!).get();
-  const d = doc.data();
+  const { rows } = await pool.query(
+    "SELECT id, code, real_email, full_name, active FROM users WHERE id = $1",
+    [req.userId]
+  );
+  const d = rows[0];
   return res.json({
-    user: { id: doc.id, code: d?.code, email: d?.realEmail ?? null, fullName: d?.fullName, active: d?.active },
+    user: { id: d?.id, code: d?.code, email: d?.real_email ?? null, fullName: d?.full_name, active: d?.active },
   });
 });
 
@@ -45,8 +51,8 @@ authRouter.post("/users", async (req, res) => {
   }
   const { code, email, password, fullName } = parsed.data;
 
-  const existing = await col.users.where("code", "==", code).limit(1).get();
-  if (!existing.empty) {
+  const existing = await pool.query("SELECT id FROM users WHERE code = $1 LIMIT 1", [code]);
+  if (existing.rows.length > 0) {
     return res.status(409).json({ error: "Ese código de preventista ya existe." });
   }
 
@@ -60,21 +66,19 @@ authRouter.post("/users", async (req, res) => {
     throw err;
   }
 
-  await col.users.doc(userRecord.uid).set({
-    code,
-    realEmail: email || null,
-    fullName,
-    active: true,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-  });
+  const ts = nowIso();
+  await pool.query(
+    `INSERT INTO users (id, code, real_email, full_name, active, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, true, $5, $5)`,
+    [userRecord.uid, code, email || null, fullName, ts]
+  );
 
   return res.status(201).json({ id: userRecord.uid, code, fullName });
 });
 
 // Desactivar un preventista (soft delete: nunca se borra, para no perder su historial de pedidos).
 authRouter.patch("/users/:id/deactivate", requireAuth, async (req, res) => {
-  await col.users.doc(req.params.id).update({ active: false, updatedAt: nowIso() });
+  await pool.query("UPDATE users SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
   await auth.updateUser(req.params.id, { disabled: true });
   return res.json({ ok: true });
 });

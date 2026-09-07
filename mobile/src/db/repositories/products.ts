@@ -16,15 +16,26 @@ export async function listProducts(search?: string): Promise<ProductWithPresenta
       )
     : await db.getAllAsync<Product>(`SELECT * FROM products WHERE active = 1 ORDER BY name COLLATE NOCASE ASC`);
 
-  const result: ProductWithPresentations[] = [];
-  for (const p of products) {
-    const presentations = await db.getAllAsync<Presentation>(
-      `SELECT * FROM product_presentations WHERE product_id = ? AND active = 1 ORDER BY sort_order ASC`,
-      [p.id]
-    );
-    result.push({ ...p, presentations });
+  if (products.length === 0) return [];
+
+  // 1 sola consulta batched para todas las presentaciones, en vez de una por
+  // producto (N+1). Además de más rápido, esto evita que búsquedas con más
+  // resultados tarden mucho más que búsquedas con pocos, que era la causa de
+  // que respuestas de una letra anterior llegaran después que las de una
+  // búsqueda más reciente y pisaran el resultado correcto en pantalla.
+  const placeholders = products.map(() => "?").join(",");
+  const allPresentations = await db.getAllAsync<Presentation>(
+    `SELECT * FROM product_presentations WHERE product_id IN (${placeholders}) AND active = 1 ORDER BY sort_order ASC`,
+    products.map((p) => p.id)
+  );
+  const byProduct = new Map<string, Presentation[]>();
+  for (const pres of allPresentations) {
+    const list = byProduct.get(pres.product_id) || [];
+    list.push(pres);
+    byProduct.set(pres.product_id, list);
   }
-  return result;
+
+  return products.map((p) => ({ ...p, presentations: byProduct.get(p.id) || [] }));
 }
 
 export async function getProduct(id: string): Promise<ProductWithPresentations | null> {

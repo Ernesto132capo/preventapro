@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, TextInput, FlatList, StyleSheet, Pressable, ScrollView, Alert } from "react-native";
 import { useFocusEffect, useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -48,8 +48,18 @@ export function NewSaleScreen() {
     setClients(await listActiveClients(clientSearch));
   }, [clientSearch]);
 
+  // Guarda anti-carrera (ver detalle en ProductsScreen.tsx): descarta
+  // respuestas de búsquedas de productos que ya quedaron obsoletas por
+  // haber seguido escribiendo.
+  const latestProductSearchRef = useRef(productSearch);
+  useEffect(() => {
+    latestProductSearchRef.current = productSearch;
+  }, [productSearch]);
+
   const loadProducts = useCallback(async () => {
-    setProducts(await listProducts(productSearch));
+    const term = productSearch;
+    const data = await listProducts(term);
+    if (latestProductSearchRef.current === term) setProducts(data);
   }, [productSearch]);
 
   useFocusEffect(

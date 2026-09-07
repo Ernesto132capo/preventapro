@@ -1,14 +1,21 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
-import { col, nowIso } from "../db/firestore";
+import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
 
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
+
 function today() { const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()); const v = (t: string) => p.find(x => x.type === t)?.value; return `${v("year")}-${v("month")}-${v("day")}`; }
-function serial(id: string, d: any) { return { id, server_id: id, user_id: d.userId, work_date: d.workDate, status: d.status, order_count: d.orderCount ?? 0, total_cents: d.totalCents ?? 0, created_at: d.createdAt, closed_at: d.closedAt ?? null, auto_closed: d.autoClosed === true }; }
-async function recalc(id: string) { const orders = (await col.orders.where("workDayId", "==", id).get()).docs.map(d => d.data()).filter(d => d.status !== "cancelled"); const total = orders.reduce((n, d) => n + (d.totalCents ?? 0), 0); await col.workDays.doc(id).update({ orderCount: orders.length, totalCents: total, updatedAt: nowIso() }); return { orderCount: orders.length, totalCents: total }; }
+function serial(row: any) { return { id: row.id, server_id: row.id, user_id: row.user_id, work_date: row.work_date, status: row.status, order_count: row.order_count ?? 0, total_cents: row.total_cents ?? 0, created_at: row.created_at, closed_at: row.closed_at ?? null, auto_closed: row.auto_closed === true }; }
+
+async function recalc(id: string) {
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders WHERE work_day_id = $1 AND status != 'cancelled'", [id]);
+  const { count, total } = rows[0];
+  await pool.query("UPDATE work_days SET order_count = $2, total_cents = $3, updated_at = $4 WHERE id = $1", [id, count, total, nowIso()]);
+  return { orderCount: count, totalCents: total };
+}
 
 // Si un preventista olvida cerrar la jornada y cambia el día calendario (00:00
 // hora Bolivia), esa jornada vieja quedaría en el limbo: ya no es "hoy" (no
@@ -17,14 +24,16 @@ async function recalc(id: string) { const orders = (await col.orders.where("work
 // todos sus pedidos adentro. Esta función la cierra automáticamente, con sus
 // totales reales, justo antes de abrir la jornada del nuevo día.
 async function closeStaleOpenWorkDays(currentDate: string): Promise<boolean> {
-  const staleOpen = await col.workDays.where("status", "==", "open").get();
+  const { rows } = await pool.query("SELECT * FROM work_days WHERE status = 'open'");
   const ts = nowIso();
   let closedAny = false;
-  for (const staleDoc of staleOpen.docs) {
-    const staleData = staleDoc.data();
-    if (staleData.workDate && staleData.workDate !== currentDate) {
-      const totals = await recalc(staleDoc.id);
-      await staleDoc.ref.update({ status: "closed", ...totals, closedAt: ts, updatedAt: ts, autoClosed: true });
+  for (const row of rows) {
+    if (row.work_date && row.work_date !== currentDate) {
+      const totals = await recalc(row.id);
+      await pool.query(
+        "UPDATE work_days SET status = 'closed', order_count = $2, total_cents = $3, closed_at = $4, updated_at = $4, auto_closed = true WHERE id = $1",
+        [row.id, totals.orderCount, totals.totalCents, ts]
+      );
       closedAny = true;
     }
   }
@@ -32,9 +41,9 @@ async function closeStaleOpenWorkDays(currentDate: string): Promise<boolean> {
 }
 
 // ─── Caché en memoria para /workdays/current ─────────────────────────────────
-// Evita releer Firestore en cada poll de 60s cuando la jornada no cambió.
+// Evita releer Postgres en cada poll de 60s cuando la jornada no cambió.
 // Se invalida en cada mutación de jornada o pedido; por eso no expira por
-// tiempo y los polls sin cambios no leen Firestore.
+// tiempo y los polls sin cambios no leen la base.
 interface WorkdayCache {
   date: string;
   data: object;
@@ -54,17 +63,17 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     return res.json(workdayCacheEntry.data);
   }
 
-  // 1. Buscar todas las jornadas de hoy (1 lectura de colección)
-  const todayResult = await col.workDays.where("workDate", "==", date).get();
-  if (!todayResult.empty) {
-    const docs = todayResult.docs.sort((a, b) =>
-      (b.data().updatedAt || b.data().createdAt || "").localeCompare(a.data().updatedAt || a.data().createdAt || "")
-    );
-    const d = docs[0];
+  // 1. Buscar todas las jornadas de hoy (1 query), la más reciente primero
+  const todayResult = await pool.query(
+    "SELECT * FROM work_days WHERE work_date = $1 ORDER BY COALESCE(updated_at, created_at) DESC",
+    [date]
+  );
+  if (todayResult.rows.length > 0) {
+    const row = todayResult.rows[0];
     // NOTA: NO llamamos recalc() aquí — recalc es una operación de escritura
     // que debe ocurrir únicamente en mutaciones (crear/cancelar orden, cerrar jornada).
     // Llamarla en cada GET de 60s generaba cientos de lecturas/escrituras extras.
-    const payload = { workDay: serial(d.id, d.data()) };
+    const payload = { workDay: serial(row) };
     workdayCacheEntry = { date, data: payload };
     return res.json(payload);
   }
@@ -76,97 +85,115 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   const closedStale = await closeStaleOpenWorkDays(date);
   if (closedStale) invalidatePullCache("workdays");
 
-  const ref = col.workDays.doc(uuid());
+  const id = uuid();
   const ts = nowIso();
-  const newWorkDay = { userId: req.userId, workDate: date, status: "open", orderCount: 0, totalCents: 0, createdAt: ts, updatedAt: ts };
-  await ref.set(newWorkDay);
-  const payload = { workDay: serial(ref.id, newWorkDay) };
+  const { rows } = await pool.query(
+    `INSERT INTO work_days (id, user_id, work_date, status, order_count, total_cents, created_at, updated_at)
+     VALUES ($1, $2, $3, 'open', 0, 0, $4, $4)
+     RETURNING *`,
+    [id, req.userId, date, ts]
+  );
+  const payload = { workDay: serial(rows[0]) };
   workdayCacheEntry = { date, data: payload };
   invalidatePullCache("workdays");
   res.json(payload);
 });
 
-workdaysRouter.get("/history", async (req: AuthedRequest, res) => {
-  const s = await col.workDays.where("status", "==", "closed").get();
-  res.json({
-    workDays: s.docs.map((d) => serial(d.id, d.data())).sort((a, b) => b.work_date.localeCompare(a.work_date)),
-  });
+workdaysRouter.get("/history", async (_req: AuthedRequest, res) => {
+  const { rows } = await pool.query("SELECT * FROM work_days WHERE status = 'closed' ORDER BY work_date DESC");
+  res.json({ workDays: rows.map(serial) });
 });
 
 workdaysRouter.get("/:id/orders", async (req, res) => {
-  const s = await col.orders.where("workDayId", "==", req.params.id).get();
-  const orders = await Promise.all(
-    s.docs
-      .filter((d) => d.data().status !== "cancelled")
-      .map(async (d) => {
-        const c = await col.clients.doc(d.data().clientId).get();
-        return {
-          id: d.id,
-          ...d.data(),
-          client_id: d.data().clientId,
-          work_day_id: d.data().workDayId,
-          business_name: c.data()?.businessName ?? "",
-          neighborhood_id: c.data()?.neighborhoodId ?? null,
-        };
-      })
+  const { rows } = await pool.query(
+    `SELECT o.*, c.business_name, c.neighborhood_id AS client_neighborhood_id
+     FROM orders o
+     JOIN clients c ON c.id = o.client_id
+     WHERE o.work_day_id = $1 AND o.status != 'cancelled'`,
+    [req.params.id]
   );
+  const orders = rows.map((row) => ({
+    ...row,
+    client_id: row.client_id,
+    work_day_id: row.work_day_id,
+    business_name: row.business_name ?? "",
+    neighborhood_id: row.client_neighborhood_id ?? null,
+  }));
   res.json({ orders });
 });
 
 workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
-  const ref = col.workDays.doc(req.params.id),
-    d = await ref.get();
-  if (!d.exists || d.data()?.status !== "closed") return res.status(404).json({ error: "Registro histórico no encontrado." });
-  const orders = await col.orders.where("workDayId", "==", ref.id).get();
-  const batch = col.workDays.firestore.batch();
-  orders.docs.forEach((o) => batch.delete(o.ref));
-  batch.delete(ref);
-  await batch.commit();
+  const { rows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [req.params.id]);
+  const row = rows[0];
+  if (!row || row.status !== "closed") return res.status(404).json({ error: "Registro histórico no encontrado." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const orderIds = await client.query("SELECT id FROM orders WHERE work_day_id = $1", [req.params.id]);
+    for (const o of orderIds.rows) {
+      await client.query("DELETE FROM order_items WHERE order_id = $1", [o.id]);
+    }
+    await client.query("DELETE FROM orders WHERE work_day_id = $1", [req.params.id]);
+    await client.query("DELETE FROM work_days WHERE id = $1", [req.params.id]);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
   res.json({ ok: true });
 });
 
 workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
   if (req.body?.confirmation !== "CONFIRMAR")
     return res.status(400).json({ error: 'Debes escribir exactamente "CONFIRMAR" para cerrar la jornada.' });
-  const ref = col.workDays.doc(req.params.id),
-    d = await ref.get();
-  if (!d.exists) return res.status(404).json({ error: "Jornada no encontrada." });
-  if (d.data()?.status === "closed") return res.status(409).json({ error: "La jornada ya está cerrada." });
-  const totals = await recalc(ref.id),
-    ts = nowIso();
-  await ref.update({ status: "closed", ...totals, closedAt: ts, updatedAt: ts });
+  const { rows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [req.params.id]);
+  const row = rows[0];
+  if (!row) return res.status(404).json({ error: "Jornada no encontrada." });
+  if (row.status === "closed") return res.status(409).json({ error: "La jornada ya está cerrada." });
+
+  const totals = await recalc(req.params.id), ts = nowIso();
+  const { rows: updated } = await pool.query(
+    "UPDATE work_days SET status = 'closed', order_count = $2, total_cents = $3, closed_at = $4, updated_at = $4 WHERE id = $1 RETURNING *",
+    [req.params.id, totals.orderCount, totals.totalCents, ts]
+  );
   invalidateWorkdayCache();
   invalidatePullCache("workdays");
 
   // Asegurar que cualquier otra jornada huérfana de hoy quede cerrada
-  const workDate = d.data()?.workDate;
+  const workDate = row.work_date;
   if (workDate) {
-    const others = await col.workDays.where("workDate", "==", workDate).where("status", "==", "open").get();
-    for (const od of others.docs) {
-      if (od.id !== ref.id) await od.ref.update({ status: "closed", closedAt: ts, updatedAt: ts });
-    }
+    await pool.query(
+      "UPDATE work_days SET status = 'closed', closed_at = $3, updated_at = $3 WHERE work_date = $1 AND status = 'open' AND id != $2",
+      [workDate, req.params.id, ts]
+    );
   }
 
-  res.json({ workDay: serial(ref.id, { ...d.data(), status: "closed", ...totals, closedAt: ts, updatedAt: ts }) });
+  res.json({ workDay: serial(updated[0]) });
 });
 
 workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
-  const ref = col.workDays.doc(req.params.id);
-  const d = await ref.get();
-  if (!d.exists) return res.status(404).json({ error: "Jornada no encontrada." });
-  const totals = await recalc(ref.id);
+  const { rows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [req.params.id]);
+  const row = rows[0];
+  if (!row) return res.status(404).json({ error: "Jornada no encontrada." });
+
+  const totals = await recalc(req.params.id);
   const ts = nowIso();
-  await ref.update({ status: "open", ...totals, closedAt: null, updatedAt: ts });
+  const { rows: updated } = await pool.query(
+    "UPDATE work_days SET status = 'open', order_count = $2, total_cents = $3, closed_at = NULL, updated_at = $4 WHERE id = $1 RETURNING *",
+    [req.params.id, totals.orderCount, totals.totalCents, ts]
+  );
   invalidateWorkdayCache();
   invalidatePullCache("workdays");
 
-  const workDate = d.data()?.workDate;
+  const workDate = row.work_date;
   if (workDate) {
-    const others = await col.workDays.where("workDate", "==", workDate).get();
-    for (const od of others.docs) {
-      if (od.id !== ref.id) await od.ref.update({ status: "open", closedAt: null, updatedAt: ts });
-    }
+    await pool.query(
+      "UPDATE work_days SET status = 'open', closed_at = NULL, updated_at = $3 WHERE work_date = $1 AND id != $2",
+      [workDate, req.params.id, ts]
+    );
   }
 
-  res.json({ workDay: serial(ref.id, { ...d.data(), status: "open", ...totals, closedAt: null, updatedAt: ts }) });
+  res.json({ workDay: serial(updated[0]) });
 });
