@@ -16,7 +16,7 @@ settingsRouter.get("/stats", async (_req, res) => {
   res.json({ totalHistoricalOrders });
 });
 
-const counterSchema = z.object({ value: z.number().int().nonnegative() });
+const counterSchema = z.object({ value: z.number().int().nonnegative().max(2_000_000_000) }).strict();
 
 // Ajuste manual temporal (ver pedido del cliente): permite alinear el
 // correlativo con el arrastre histórico de un sistema anterior. Sobrescribe

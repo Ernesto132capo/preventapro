@@ -1,8 +1,4 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { API_BASE_URL } from "./config";
-
-const ACCESS_TOKEN_KEY = "preventapro_access_token";
-const REFRESH_TOKEN_KEY = "preventapro_refresh_token";
 
 export class ApiError extends Error {
   status: number;
@@ -17,32 +13,28 @@ import { firebaseAuth } from "./firebase";
 export async function getAccessToken(): Promise<string | null> {
   if (firebaseAuth.currentUser) {
     try {
-      const token = await firebaseAuth.currentUser.getIdToken();
-      await AsyncStorage.setItem(ACCESS_TOKEN_KEY, token);
-      return token;
+      return await firebaseAuth.currentUser.getIdToken();
     } catch {
-      // Fallback si falla la llamada
+      return null;
     }
   }
-  return AsyncStorage.getItem(ACCESS_TOKEN_KEY);
+  return null;
 }
 
-export async function setTokens(accessToken: string, refreshToken: string) {
-  await AsyncStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-  if (refreshToken) {
-    await AsyncStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-  }
+// Firebase mantiene su propia sesión. No duplicamos ID tokens en AsyncStorage:
+// son credenciales de corta vida y deben pedirse al SDK cuando se necesiten.
+export async function setTokens(_accessToken: string, _refreshToken: string) {
+  return;
 }
 
 export async function clearTokens() {
-  await AsyncStorage.multiRemove([ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY]);
+  return;
 }
 
 async function refreshAccessToken(): Promise<string | null> {
   if (firebaseAuth.currentUser) {
     try {
       const newToken = await firebaseAuth.currentUser.getIdToken(true);
-      await AsyncStorage.setItem(ACCESS_TOKEN_KEY, newToken);
       return newToken;
     } catch {
       return null;
@@ -93,9 +85,9 @@ export async function apiFetch<T = any>(path: string, opts: RequestOptions = {})
     res = await doFetch(token);
   } catch (err: any) {
     if (err?.name === "AbortError") {
-      throw new ApiError("Tiempo de espera agotado. Verifica tu conexión.", 0);
+      throw new ApiError("El servidor está despertando o la conexión es lenta. Espera unos segundos e inténtalo de nuevo.", 0);
     }
-    throw new ApiError("Sin conexión al servidor.", 0);
+    throw new ApiError("No se pudo contactar al servidor. Si acaba de estar inactivo, espera unos segundos mientras Render lo despierta.", 0);
   }
 
   if (res.status === 401 && authRequired) {
@@ -114,6 +106,9 @@ export async function apiFetch<T = any>(path: string, opts: RequestOptions = {})
 
     if (!res.ok) {
     let message = data?.error || "Error del servidor.";
+    if ([502, 503, 504].includes(res.status)) {
+      message = "El servidor está despertando. Espera unos segundos y vuelve a intentar; tus datos locales no se perderán.";
+    }
     if (data?.details) {
       try {
         const fieldErrors = data.details.fieldErrors || {};

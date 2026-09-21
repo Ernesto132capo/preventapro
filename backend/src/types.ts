@@ -30,6 +30,39 @@ export interface Client {
   sync_status: SyncStatus;
 }
 
+export type ProductType = "standard" | "combo";
+
+export interface Category {
+  id: string;
+  name: string;
+  active: 0 | 1;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ComboOption {
+  id: string;
+  combo_id: string;
+  presentation_id: string;
+  product_id?: string;
+  product_name?: string;
+  presentation_name?: string;
+  max_quantity: number | null;
+  sort_order: number;
+  active: 0 | 1;
+}
+
+export interface ComboDefinition {
+  id: string;
+  product_id: string;
+  selection_min: number;
+  selection_max: number;
+  active: 0 | 1;
+  options?: ComboOption[];
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface Product {
   id: string;
   sku: string;
@@ -41,6 +74,8 @@ export interface Product {
   active: 0 | 1;
   promo_active: 0 | 1;
   promo_price_cents: number | null;
+  product_type?: ProductType;
+  combo_definition?: ComboDefinition | null;
 }
 
 export interface ProductPresentation {
@@ -51,16 +86,37 @@ export interface ProductPresentation {
   unit_equivalence: number;
   price_cents: number;
   cost_cents: number;
+  quantity_available?: number;
   active: 0 | 1;
+}
+
+export interface OrderItemSelectionInput {
+  selected_product_id: string;
+  selected_presentation_id: string;
+  quantity: number;
+  sort_order?: number;
+}
+
+export interface OrderItemSelectionSnapshot {
+  id?: string;
+  order_item_id?: string;
+  selected_product_id: string;
+  selected_presentation_id: string;
+  product_name_snapshot: string;
+  presentation_name_snapshot: string;
+  quantity: number;
+  sort_order: number;
 }
 
 export interface OrderItemInput {
   product_id: string;
   presentation_id: string;
   quantity: number;
+  selections?: OrderItemSelectionInput[];
 }
 
 export interface OrderItemSnapshot {
+  id?: string;
   product_id: string;
   presentation_id: string;
   product_name_snapshot: string;
@@ -70,6 +126,7 @@ export interface OrderItemSnapshot {
   unit_price_cents_snapshot: number;
   quantity: number;
   subtotal_cents: number;
+  selections?: OrderItemSelectionSnapshot[];
 }
 
 export interface PricedOrder {
@@ -79,3 +136,4 @@ export interface PricedOrder {
   total_cents: number;
   item_count: number;
 }
+

@@ -2,6 +2,7 @@ import { getDb, getMeta, setMeta } from "../db/client";
 import { apiFetch, ApiError } from "./api";
 import { enqueue, listPending, markDone, markFailed, markSyncing, deferForDependency, OutboxRow } from "../db/outbox";
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
+import { upsertCategoryFromServer, resolveServerCategoryId } from "../db/repositories/categories";
 import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
 import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay, markWorkDayClosed } from "../db/repositories/workdays";
@@ -26,6 +27,12 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
 
   const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}${force ? "&force=1" : ""}`);
 
+  if (data.categories && Array.isArray(data.categories)) {
+    for (const cat of data.categories) {
+      await upsertCategoryFromServer(cat);
+    }
+  }
+
   for (const c of data.clients) await upsertClientFromServer(c);
 
   // Agrupar presentaciones por producto para reusar upsertProductFromServer
@@ -43,6 +50,63 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
       quantity_available: invByPresentation[p.id] ?? 0,
     }));
     await upsertProductFromServer({ ...prod, presentations });
+  }
+
+  // Integrar definiciones y opciones de combos
+  if (data.comboDefinitions && Array.isArray(data.comboDefinitions)) {
+    for (const cd of data.comboDefinitions) {
+      const localProd = await db.getFirstAsync<{ id: string; sync_status: string }>(
+        `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
+        [cd.product_id, cd.product_id]
+      );
+      if (localProd && localProd.sync_status === "pending") {
+        continue;
+      }
+      const targetProdId = localProd ? localProd.id : cd.product_id;
+      const existingDef = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
+        [cd.id, targetProdId, cd.id]
+      );
+      const targetDefId = existingDef ? existingDef.id : cd.id;
+      await db.runAsync(
+        `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
+         VALUES (?, ?, ?, ?, ?, ?, 'synced')
+         ON CONFLICT(id) DO UPDATE SET
+           server_id = excluded.server_id, product_id = excluded.product_id,
+           selection_min = excluded.selection_min, selection_max = excluded.selection_max,
+           active = excluded.active, sync_status = 'synced'`,
+        [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
+      );
+    }
+  }
+
+  if (data.comboOptions && Array.isArray(data.comboOptions)) {
+    for (const co of data.comboOptions) {
+      const localPres = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+        [co.presentation_id, co.presentation_id]
+      );
+      const targetPresId = localPres ? localPres.id : co.presentation_id;
+      const localDef = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
+        [co.combo_id, co.combo_id]
+      );
+      const targetComboId = localDef ? localDef.id : co.combo_id;
+      const existingOpt = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM combo_options WHERE server_id = ? OR id = ?`,
+        [co.id, co.id]
+      );
+      const targetOptId = existingOpt ? existingOpt.id : co.id;
+      await db.runAsync(
+        `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
+         ON CONFLICT(id) DO UPDATE SET
+           server_id = excluded.server_id, combo_id = excluded.combo_id,
+           presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
+           sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
+        [targetOptId, co.id, targetComboId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
+      );
+    }
   }
 
   // Descargar e integrar preventas compartidas del equipo
@@ -68,6 +132,7 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
       for (const lo of localOrders) {
         // Solo descartar órdenes ya sincronizadas cuyo server_id ya no existe en la jornada actual
         if (lo.sync_status === "synced" && lo.server_id && !validServerOrderIds.has(lo.server_id)) {
+          await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [lo.id]);
           await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [lo.id]);
           await db.runAsync(`DELETE FROM orders WHERE id = ?`, [lo.id]);
         }
@@ -148,6 +213,29 @@ async function resolveTodayWorkDay(userId: string) {
   for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
 
+async function pushCategory(row: OutboxRow) {
+  const db = await getDb();
+  const category = await db.getFirstAsync<any>(`SELECT * FROM categories WHERE id = ?`, [row.local_entity_id]);
+  if (!category) return markDone(row.id);
+
+  if (category.active === 0) {
+    if (category.server_id) {
+      await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "DELETE" });
+    }
+    return markDone(row.id);
+  }
+
+  const body = { name: category.name };
+  if (category.server_id) {
+    const res = await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "PUT", body });
+    await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
+  } else {
+    const res = await apiFetch<any>(`/catalog/categories`, { method: "POST", body });
+    await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
+  }
+  await markDone(row.id);
+}
+
 async function pushClient(row: OutboxRow) {
   const db = await getDb();
   const client = await db.getFirstAsync<any>(`SELECT * FROM clients WHERE id = ?`, [row.local_entity_id]);
@@ -196,15 +284,56 @@ async function pushProduct(row: OutboxRow) {
     return markDone(row.id);
   }
 
+  let categoryServerId: string | undefined = undefined;
+  if (product.category_id) {
+    const resolvedCatId = await resolveServerCategoryId(product.category_id);
+    categoryServerId = resolvedCatId ?? undefined;
+  }
+
   // Solo se envían las presentaciones activas; las borradas localmente se omiten (el servidor las desactiva por ausencia).
   const presentations = await db.getAllAsync<any>(
-    `SELECT * FROM product_presentations WHERE product_id = ? AND active = 1 ORDER BY sort_order ASC`,
-    [product.id]
+    `SELECT * FROM product_presentations WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1 ORDER BY sort_order ASC`,
+    [product.id, product.server_id]
   );
+
+  let comboDefinitionBody: any = undefined;
+  if (product.product_type === "combo") {
+    const comboDef = await db.getFirstAsync<any>(
+      `SELECT * FROM combo_definitions WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1`,
+      [product.id, product.server_id]
+    );
+    if (comboDef) {
+      const comboOpts = await db.getAllAsync<any>(
+        `SELECT * FROM combo_options WHERE combo_id = ? AND active = 1 ORDER BY sort_order ASC`,
+        [comboDef.id]
+      );
+      const resolvedOptions = [];
+      for (const opt of comboOpts) {
+        const presServerId = await resolveServerPresentationId(opt.presentation_id);
+        if (!presServerId) {
+          // La presentación de la opción todavía no ha sincronizado; diferir
+          console.warn(`[pushProduct] Deferring combo product ${product.id}: option presentation not synced`);
+          return deferForDependency(row.id);
+        }
+        resolvedOptions.push({
+          presentationId: presServerId,
+          maxQuantity: opt.max_quantity,
+          sortOrder: opt.sort_order,
+        });
+      }
+      comboDefinitionBody = {
+        selectionMin: comboDef.selection_min,
+        selectionMax: comboDef.selection_max,
+        options: resolvedOptions,
+      };
+    }
+  }
+
   const body = {
     sku: product.sku,
     name: product.name,
-    categoryId: product.category_id ?? undefined,
+    categoryId: categoryServerId,
+    productType: product.product_type || "standard",
     baseCostCents: product.base_cost_cents,
     baseUnitName: product.base_unit_name,
     presentations: presentations.map((p) => ({
@@ -212,8 +341,9 @@ async function pushProduct(row: OutboxRow) {
       unitEquivalence: p.unit_equivalence,
       priceCents: p.price_cents,
       costCents: p.cost_cents,
-      stock: p.quantity_available,
+      stock: p.quantity_available ?? 0,
     })),
+    comboDefinition: comboDefinitionBody,
   };
 
   let serverProduct: any;
@@ -231,6 +361,12 @@ async function pushProduct(row: OutboxRow) {
     serverProduct.id,
     product.id,
   ]);
+  if (serverProduct.combo_definition) {
+    await db.runAsync(
+      `UPDATE combo_definitions SET server_id = ?, sync_status = 'synced' WHERE product_id = ? OR (product_id = ? AND product_id IS NOT NULL)`,
+      [serverProduct.combo_definition.id, product.id, product.server_id]
+    );
+  }
   // Emparejar por nombre (estable entre ediciones) en vez de por posición, para no desalinear
   // los ids si se agregó o quitó alguna presentación en esta misma edición.
   for (const localPres of presentations) {
@@ -278,7 +414,36 @@ async function pushOrder(row: OutboxRow, userId: string) {
       console.warn(`[pushOrder] Deferring order ${order.id}: item ${item.id} missing productServerId=${productServerId}, presentationServerId=${presentationServerId}`);
       return deferForDependency(row.id); // el producto creado offline todavía no sincronizó
     }
-    resolvedItems.push({ productId: productServerId, presentationId: presentationServerId, quantity: item.quantity });
+
+    const selections = await db.getAllAsync<any>(
+      `SELECT * FROM order_item_selections WHERE order_item_id = ? ORDER BY sort_order ASC`,
+      [item.id]
+    );
+    let resolvedSelections: any[] | undefined = undefined;
+    if (selections.length > 0) {
+      resolvedSelections = [];
+      for (const sel of selections) {
+        const selProdServerId = await resolveServerProductId(sel.selected_product_id);
+        const selPresServerId = await resolveServerPresentationId(sel.selected_presentation_id);
+        if (!selProdServerId || !selPresServerId) {
+          console.warn(`[pushOrder] Deferring order ${order.id}: selection missing server id`);
+          return deferForDependency(row.id);
+        }
+        resolvedSelections.push({
+          selectedProductId: selProdServerId,
+          selectedPresentationId: selPresServerId,
+          quantity: sel.quantity,
+          sortOrder: sel.sort_order,
+        });
+      }
+    }
+
+    resolvedItems.push({
+      productId: productServerId,
+      presentationId: presentationServerId,
+      quantity: item.quantity,
+      selections: resolvedSelections,
+    });
   }
 
   try {
@@ -334,16 +499,17 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
   for (const row of rows) {
     await markSyncing(row.id);
     try {
-      if (row.entity_type === "client") {
+      if (row.entity_type === "category") {
+        await pushCategory(row);
+        done++;
+      } else if (row.entity_type === "client") {
         await pushClient(row);
         done++;
       } else if (row.entity_type === "product") {
         await pushProduct(row);
         done++;
       } else if (row.entity_type === "order") {
-        const before = row.status;
         await pushOrder(row, userId);
-        // pushOrder decide su propio resultado (done/deferred/failed) internamente
       }
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Error desconocido";

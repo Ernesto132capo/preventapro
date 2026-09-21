@@ -38,11 +38,11 @@ authRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
 // rol admin; igual que en la versión SQLite, queda simple porque el spec no pide un
 // módulo de administración completo).
 const createUserSchema = z.object({
-  code: z.string().min(2),
-  email: z.string().email().optional(), // email real, solo informativo (no se usa para login)
-  password: z.string().min(6),
-  fullName: z.string().min(2),
-});
+  code: z.string().trim().min(2).max(50),
+  email: z.string().email().max(254).optional(), // email real, solo informativo (no se usa para login)
+  password: z.string().min(6).max(128),
+  fullName: z.string().trim().min(2).max(150),
+}).strict();
 
 authRouter.post("/users", async (req, res) => {
   const parsed = createUserSchema.safeParse(req.body);

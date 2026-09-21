@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
+import { z } from "zod";
 
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
@@ -146,7 +147,8 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
 });
 
 workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
-  if (req.body?.confirmation !== "CONFIRMAR")
+  const parsed = z.object({ confirmation: z.literal("CONFIRMAR") }).strict().safeParse(req.body);
+  if (!parsed.success)
     return res.status(400).json({ error: 'Debes escribir exactamente "CONFIRMAR" para cerrar la jornada.' });
   const { rows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [req.params.id]);
   const row = rows[0];

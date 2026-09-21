@@ -5,5 +5,18 @@ node_modules/
 dist/
 reports/*/
 .expo/
-backend/firebase-service-account.json
 .env
+.env.*
+!.env.example
+
+# Credenciales y configuración local de Firebase: nunca versionarlas.
+firebase-service-account.json
+firebase-service-account-*.json
+**/firebase-service-account.json
+firebase.json
+firestore.indexes.json
+
+# Tokens, claves y certificados locales.
+*.token
+*.pem
+*.key

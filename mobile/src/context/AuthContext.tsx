@@ -32,7 +32,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const token = await getAccessToken();
       const storedUser = await AsyncStorage.getItem(USER_KEY);
       if (token && storedUser) {
-        setUser(JSON.parse(storedUser));
+        try {
+          setUser(JSON.parse(storedUser));
+        } catch {
+          await AsyncStorage.removeItem(USER_KEY);
+        }
       }
       setLoading(false);
     })();
@@ -54,6 +58,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       };
       if (rememberSession) {
         await AsyncStorage.setItem(USER_KEY, JSON.stringify(authedUser));
+      } else {
+        // Evita revivir el perfil de una sesión anterior en un teléfono compartido.
+        await AsyncStorage.removeItem(USER_KEY);
       }
       setUser(authedUser);
       return true;

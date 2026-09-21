@@ -7,15 +7,12 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "migrate": "tsx src/db/migrate.ts",
-    "migrate:neon": "tsx scripts/migrate-firestore-to-neon.ts",
-    "seed": "tsx src/db/seed.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "migrate:combos": "tsx scripts/migrate-combos.ts"
   },
   "dependencies": {
     "@types/pdfkit": "^0.17.6",
     "@types/pg": "^8.23.1",
-    "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
@@ -27,7 +24,6 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.9",

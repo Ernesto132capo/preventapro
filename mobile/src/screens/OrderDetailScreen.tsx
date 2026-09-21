@@ -6,7 +6,7 @@ import { Card } from "../components/Card";
 import { getOrderWithItems, cancelOrderLocal } from "../db/repositories/orders";
 import { getTodayWorkDay } from "../db/repositories/workdays";
 import { centsToBs } from "../domain/pricing";
-import { colors, spacing } from "../theme/tokens";
+import { colors, radius, spacing } from "../theme/tokens";
 import { useSync } from "../context/SyncContext";
 import { useAuth } from "../context/AuthContext";
 
@@ -64,12 +64,35 @@ export function OrderDetailScreen() {
         <Text style={styles.meta}>Condición: {order.payment_condition}</Text>
       </Card>
       <Text style={styles.heading}>Productos</Text>
-      {items.map((item) => (
-        <Card key={item.id} style={{ marginBottom: spacing.sm }}>
-          <View style={styles.row}><Text style={styles.product}>{item.product_name_snapshot}</Text><Text style={styles.amount}>{centsToBs(item.subtotal_cents)}</Text></View>
-          <Text style={styles.meta}>{item.presentation_name_snapshot} · Cantidad: {item.quantity}</Text>
-        </Card>
-      ))}
+      {items.map((item) => {
+        const hasSelections = item.selections && item.selections.length > 0;
+        return (
+          <Card key={item.id} style={{ marginBottom: spacing.sm }}>
+            <View style={styles.row}>
+              <View style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Text style={styles.product}>{item.product_name_snapshot}</Text>
+                {hasSelections && (
+                  <View style={styles.comboBadge}>
+                    <Text style={styles.comboBadgeText}>🎁 Combo</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={styles.amount}>{centsToBs(item.subtotal_cents)}</Text>
+            </View>
+            <Text style={styles.meta}>{item.presentation_name_snapshot} · Cantidad: {item.quantity}</Text>
+            {hasSelections && (
+              <View style={styles.selectionsBox}>
+                <Text style={styles.selectionsTitle}>Opciones elegidas:</Text>
+                {item.selections.map((sel: any, sIdx: number) => (
+                  <Text key={sel.id || sIdx} style={styles.selectionItem}>
+                    • {sel.quantity} × {sel.product_name_snapshot} ({sel.presentation_name_snapshot})
+                  </Text>
+                ))}
+              </View>
+            )}
+          </Card>
+        );
+      })}
       <Card style={styles.totalCard}><Text style={styles.total}>Total: {centsToBs(order.total_cents)}</Text></Card>
       <View style={styles.actions}>
         <Button label="Editar" onPress={handleEdit} style={{ flex: 1 }} />
@@ -80,11 +103,43 @@ export function OrderDetailScreen() {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: colors.bg }, content: { padding: spacing.lg },
+  screen: { flex: 1, backgroundColor: colors.bg },
+  content: { padding: spacing.lg },
   client: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
   heading: { marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: "700", color: colors.textPrimary },
-  row: { flexDirection: "row", justifyContent: "space-between" }, product: { fontWeight: "600", color: colors.textPrimary },
-  amount: { fontWeight: "700", color: colors.emeraldDark }, meta: { marginTop: 4, fontSize: 12, color: colors.textSecondary },
-  totalCard: { marginTop: spacing.sm }, total: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
+  row: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  product: { fontWeight: "600", color: colors.textPrimary },
+  comboBadge: {
+    backgroundColor: "#ede9fe",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: radius.pill,
+  },
+  comboBadgeText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#6d28d9",
+  },
+  amount: { fontWeight: "700", color: colors.emeraldDark },
+  meta: { marginTop: 4, fontSize: 12, color: colors.textSecondary },
+  selectionsBox: {
+    backgroundColor: colors.surfaceAlt,
+    padding: spacing.xs,
+    borderRadius: radius.sm,
+    marginTop: spacing.xs,
+  },
+  selectionsTitle: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: colors.textPrimary,
+    marginBottom: 2,
+  },
+  selectionItem: {
+    fontSize: 11,
+    color: colors.textSecondary,
+    lineHeight: 15,
+  },
+  totalCard: { marginTop: spacing.sm },
+  total: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
   actions: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.lg },
 });

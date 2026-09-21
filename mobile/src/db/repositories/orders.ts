@@ -51,13 +51,14 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
     );
 
     for (const line of input.lines) {
+      const itemId = uuid();
       await db.runAsync(
         `INSERT INTO order_items
           (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
            presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot, quantity, subtotal_cents)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          uuid(),
+          itemId,
           orderId,
           line.productId,
           line.presentationId,
@@ -70,11 +71,28 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
           line.subtotalCents,
         ]
       );
-      // Descuento optimista de stock local (se reconcilia con el servidor al sincronizar)
-      await db.runAsync(
-        `UPDATE product_presentations SET quantity_available = quantity_available - ? WHERE id = ?`,
-        [line.quantity, line.presentationId]
-      );
+
+      if (line.selections && line.selections.length > 0) {
+        for (let sIdx = 0; sIdx < line.selections.length; sIdx++) {
+          const sel = line.selections[sIdx];
+          await db.runAsync(
+            `INSERT INTO order_item_selections
+              (id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
+               presentation_name_snapshot, quantity, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              uuid(),
+              itemId,
+              sel.selectedProductId,
+              sel.selectedPresentationId,
+              sel.productNameSnapshot,
+              sel.presentationNameSnapshot,
+              sel.quantity,
+              sel.sortOrder ?? sIdx,
+            ]
+          );
+        }
+      }
     }
 
     await db.runAsync(
@@ -115,7 +133,27 @@ export async function getOrderWithItems(orderId: string) {
   const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ? OR server_id = ?`, [orderId, orderId]);
   if (!order) return { order: null, items: [] };
   const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
-  return { order, items };
+  const itemIds = items.map((i) => i.id);
+  const selectionsByItem = new Map<string, any[]>();
+  if (itemIds.length > 0) {
+    const ph = itemIds.map(() => "?").join(",");
+    const selections = await db.getAllAsync<any>(
+      `SELECT * FROM order_item_selections WHERE order_item_id IN (${ph}) ORDER BY sort_order ASC`,
+      itemIds
+    );
+    for (const sel of selections) {
+      const list = selectionsByItem.get(sel.order_item_id) || [];
+      list.push(sel);
+      selectionsByItem.set(sel.order_item_id, list);
+    }
+  }
+
+  const itemsWithSelections = items.map((it) => ({
+    ...it,
+    selections: selectionsByItem.get(it.id) || [],
+  }));
+
+  return { order, items: itemsWithSelections };
 }
 
 export async function upsertOrderFromServer(serverOrder: any) {
@@ -186,7 +224,12 @@ export async function upsertOrderFromServer(serverOrder: any) {
       ]
     );
 
+    await db.runAsync(
+      `DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`,
+      [targetOrderId]
+    );
     await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [targetOrderId]);
+
     for (const it of serverOrder.items || []) {
       const localProd = await db.getFirstAsync<{ id: string }>(
         `SELECT id FROM products WHERE server_id = ? OR id = ?`,
@@ -197,6 +240,8 @@ export async function upsertOrderFromServer(serverOrder: any) {
         [it.presentation_id, it.presentation_id]
       );
 
+      const targetItemId = it.id || uuid();
+
       await db.runAsync(
         `INSERT INTO order_items
           (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
@@ -204,7 +249,7 @@ export async function upsertOrderFromServer(serverOrder: any) {
            quantity, subtotal_cents)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          it.id || uuid(),
+          targetItemId,
           targetOrderId,
           localProd ? localProd.id : it.product_id,
           localPres ? localPres.id : it.presentation_id,
@@ -217,13 +262,44 @@ export async function upsertOrderFromServer(serverOrder: any) {
           it.subtotal_cents ?? 0,
         ]
       );
+
+      if (it.selections && Array.isArray(it.selections)) {
+        for (let sIdx = 0; sIdx < it.selections.length; sIdx++) {
+          const sel = it.selections[sIdx];
+          const selLocalProd = await db.getFirstAsync<{ id: string }>(
+            `SELECT id FROM products WHERE server_id = ? OR id = ?`,
+            [sel.selected_product_id, sel.selected_product_id]
+          );
+          const selLocalPres = await db.getFirstAsync<{ id: string }>(
+            `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+            [sel.selected_presentation_id, sel.selected_presentation_id]
+          );
+
+          await db.runAsync(
+            `INSERT INTO order_item_selections
+              (id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
+               presentation_name_snapshot, quantity, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              sel.id || uuid(),
+              targetItemId,
+              selLocalProd ? selLocalProd.id : sel.selected_product_id,
+              selLocalPres ? selLocalPres.id : sel.selected_presentation_id,
+              sel.product_name_snapshot || "",
+              sel.presentation_name_snapshot || "",
+              sel.quantity ?? 1,
+              sel.sort_order ?? sIdx,
+            ]
+          );
+        }
+      }
     }
 
     await refreshWorkDayTotals(db, workDayLocalId);
   });
 }
 
-/** Reemplaza los artículos de una preventa abierta y devuelve/resta el stock correctamente. */
+/** Reemplaza los artículos de una preventa abierta. */
 export async function updateOrderLocal(orderId: string, lines: CartLine[], paymentCondition = "Contado 48h"): Promise<void> {
   const totals = calcOrderTotals(lines, 0);
   const db = await getDb();
@@ -232,18 +308,27 @@ export async function updateOrderLocal(orderId: string, lines: CartLine[], payme
   const ts = nowIso();
 
   await db.withTransactionAsync(async () => {
-    const oldItems = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [orderId]);
-    for (const item of oldItems) {
-      await db.runAsync(`UPDATE product_presentations SET quantity_available = quantity_available + ? WHERE id = ?`, [item.quantity, item.presentation_id]);
-    }
+    await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [orderId]);
     await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [orderId]);
+
     for (const line of lines) {
+      const itemId = uuid();
       await db.runAsync(
         `INSERT INTO order_items (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot, presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot, quantity, subtotal_cents)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [uuid(), orderId, line.productId, line.presentationId, line.productName, line.sku, line.presentationName, line.unitEquivalence, line.unitPriceCents, line.quantity, line.subtotalCents]
+        [itemId, orderId, line.productId, line.presentationId, line.productName, line.sku, line.presentationName, line.unitEquivalence, line.unitPriceCents, line.quantity, line.subtotalCents]
       );
-      await db.runAsync(`UPDATE product_presentations SET quantity_available = quantity_available - ? WHERE id = ?`, [line.quantity, line.presentationId]);
+
+      if (line.selections && line.selections.length > 0) {
+        for (let sIdx = 0; sIdx < line.selections.length; sIdx++) {
+          const sel = line.selections[sIdx];
+          await db.runAsync(
+            `INSERT INTO order_item_selections (id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot, presentation_name_snapshot, quantity, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [uuid(), itemId, sel.selectedProductId, sel.selectedPresentationId, sel.productNameSnapshot, sel.presentationNameSnapshot, sel.quantity, sel.sortOrder ?? sIdx]
+          );
+        }
+      }
     }
     await db.runAsync(
       `UPDATE orders SET payment_condition = ?, subtotal_cents = ?, tax_cents = ?, total_cents = ?, item_count = ?, sync_status = 'pending', sync_error = NULL, updated_at = ? WHERE id = ?`,
@@ -254,16 +339,13 @@ export async function updateOrderLocal(orderId: string, lines: CartLine[], payme
   await enqueue("order", orderId, 2, "update");
 }
 
-/** Cancelación lógica: conserva el historial y devuelve las unidades al inventario. */
+
+/** Cancelación lógica: conserva el historial. */
 export async function cancelOrderLocal(orderId: string): Promise<void> {
   const db = await getDb();
   const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ? AND status = 'active'`, [orderId]);
   if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
   await db.withTransactionAsync(async () => {
-    const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [orderId]);
-    for (const item of items) {
-      await db.runAsync(`UPDATE product_presentations SET quantity_available = quantity_available + ? WHERE id = ?`, [item.quantity, item.presentation_id]);
-    }
     await db.runAsync(`UPDATE orders SET status = 'cancelled', sync_status = 'pending', updated_at = ? WHERE id = ?`, [nowIso(), orderId]);
     await refreshWorkDayTotals(db, order.work_day_id);
     // Las altas/ediciones pendientes ya no deben enviarse después de cancelar.
@@ -318,4 +400,20 @@ export async function countUnsyncedOrders(workDayLocalId: string): Promise<numbe
     [workDayLocalId]
   );
   return row?.n ?? 0;
+}
+
+/** Devuelve los IDs de productos comprados recientemente por este cliente específico. */
+export async function listRecentProductIdsForClient(clientId: string, limit = 6): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ product_id: string }>(
+    `SELECT DISTINCT oi.product_id
+     FROM order_items oi
+     JOIN orders o ON oi.order_id = o.id OR oi.order_id = o.server_id
+     WHERE (o.client_id = ? OR o.client_id IN (SELECT server_id FROM clients WHERE id = ?))
+       AND o.status = 'active'
+     ORDER BY o.created_at DESC
+     LIMIT ?`,
+    [clientId, clientId, limit]
+  );
+  return rows.map((r) => r.product_id);
 }

@@ -6,7 +6,7 @@ export const syncRouter = Router();
 syncRouter.use(requireAuth);
 
 function client(row: any) { return { id: row.id, client_local_id: row.client_local_id ?? null, business_name: row.business_name, contact_name: row.contact_name ?? null, phone: row.phone ?? null, neighborhood_id: row.neighborhood_id ?? null, address: row.address ?? null, lat: row.lat ?? null, lng: row.lng ?? null, visit_status: row.visit_status ?? "pending", active: row.active === false ? 0 : 1, created_at: row.created_at, updated_at: row.updated_at }; }
-function product(row: any) { return { id: row.id, sku: row.sku, name: row.name, category_id: row.category_id ?? null, photo_url: row.photo_url ?? null, base_cost_cents: row.base_cost_cents ?? 0, base_unit_name: row.base_unit_name ?? "Unidad", active: row.active === false ? 0 : 1, created_at: row.created_at, updated_at: row.updated_at }; }
+function product(row: any) { return { id: row.id, sku: row.sku, name: row.name, category_id: row.category_id ?? null, photo_url: row.photo_url ?? null, base_cost_cents: row.base_cost_cents ?? 0, base_unit_name: row.base_unit_name ?? "Unidad", product_type: row.product_type || "standard", active: row.active === false ? 0 : 1, created_at: row.created_at, updated_at: row.updated_at }; }
 function presentation(row: any) {
   return {
     id: row.id,
@@ -39,6 +39,8 @@ type PullDomain = "all" | "clients" | "products" | "orders" | "workdays";
 const clientQueryCache = new Map<string, any[]>();
 const productQueryCache = new Map<string, any[]>();
 const presentationQueryCache = new Map<string, any[]>();
+const comboDefQueryCache = new Map<string, any[]>();
+const comboOptionQueryCache = new Map<string, any[]>();
 const categoryQueryCache = new Map<string, any[]>();
 const neighborhoodQueryCache = new Map<string, any[]>();
 const workdayQueryCache = new Map<string, any[]>();
@@ -67,6 +69,8 @@ export function invalidatePullCache(domain: PullDomain = "all") {
   if (domain === "all" || domain === "products") {
     productQueryCache.clear();
     presentationQueryCache.clear();
+    comboDefQueryCache.clear();
+    comboOptionQueryCache.clear();
     categoryQueryCache.clear();
     neighborhoodQueryCache.clear();
   }
@@ -76,6 +80,7 @@ export function invalidatePullCache(domain: PullDomain = "all") {
     orderItemQueryCache.clear();
   }
 }
+
 
 function simpleHash(str: string): string {
   let h = 0;
@@ -159,7 +164,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // lo activo; en un pull incremental, solo lo que cambió después de `since`,
     // usando los índices de updated_at ya creados en el esquema.
     const cursorKey = isInitial ? "__initial__" : since;
-    const [clientRows, productRows, categoryRows, neighborhoodRows, todayWorkDayRows] = await Promise.all([
+    const [clientRows, productRows, categoryRows, neighborhoodRows, todayWorkDayRows, comboDefRows, comboOptionRows] = await Promise.all([
       cachedRows("clients", clientQueryCache, cursorKey, async () =>
         isInitial
           ? (await pool.query("SELECT * FROM clients WHERE active = true")).rows
@@ -171,13 +176,23 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           : (await pool.query("SELECT * FROM products WHERE updated_at > $1", [since])).rows,
         force),
       cachedRows("categories", categoryQueryCache, cursorKey, async () =>
-        isInitial ? (await pool.query("SELECT * FROM categories WHERE active = true")).rows : [],
+        isInitial
+          ? (await pool.query("SELECT * FROM categories WHERE active = true ORDER BY name")).rows
+          : (await pool.query("SELECT * FROM categories WHERE updated_at > $1 ORDER BY name", [since])).rows,
         force),
       cachedRows("neighborhoods", neighborhoodQueryCache, cursorKey, async () =>
         isInitial ? (await pool.query("SELECT * FROM neighborhoods WHERE active = true")).rows : [],
         force),
       cachedRows("workdays", workdayQueryCache, todayDate, async () =>
         (await pool.query("SELECT * FROM work_days WHERE work_date = $1", [todayDate])).rows,
+        force),
+      cachedRows("combo_definitions", comboDefQueryCache, cursorKey, async () =>
+        isInitial
+          ? (await pool.query("SELECT * FROM combo_definitions WHERE active = true")).rows
+          : (await pool.query("SELECT * FROM combo_definitions WHERE updated_at > $1", [since])).rows,
+        force),
+      cachedRows("combo_options", comboOptionQueryCache, cursorKey, async () =>
+        (await pool.query("SELECT * FROM combo_options WHERE active = true ORDER BY sort_order")).rows,
         force),
     ]);
 
@@ -217,6 +232,30 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           [...new Set(activeOrders.map((row) => row.client_id))],
         ];
 
+        // Cargar selections para todos los items de órdenes
+        const allItemIds = itemsResults.flat().map((it: any) => it.id);
+        const selectionsByItem = new Map<string, any[]>();
+        if (allItemIds.length > 0) {
+          const { rows: allSelections } = await pool.query(
+            "SELECT * FROM order_item_selections WHERE order_item_id = ANY($1) ORDER BY sort_order",
+            [allItemIds]
+          );
+          for (const sel of allSelections) {
+            const list = selectionsByItem.get(sel.order_item_id) || [];
+            list.push({
+              id: sel.id,
+              order_item_id: sel.order_item_id,
+              selected_product_id: sel.selected_product_id,
+              selected_presentation_id: sel.selected_presentation_id,
+              product_name_snapshot: sel.product_name_snapshot,
+              presentation_name_snapshot: sel.presentation_name_snapshot,
+              quantity: sel.quantity,
+              sort_order: sel.sort_order,
+            });
+            selectionsByItem.set(sel.order_item_id, list);
+          }
+        }
+
         // 1 lectura por client único (batch), en vez de 1 por orden — y si el
         // cliente ya vino en el delta de `clientRows` de este mismo pull, ni
         // siquiera esa lectura hace falta: reusamos la fila ya traída.
@@ -252,7 +291,10 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           status: row.status || "active",
           created_at: row.created_at,
           updated_at: row.updated_at,
-          items: itemsResults[i],
+          items: itemsResults[i].map((it: any) => ({
+            ...it,
+            selections: selectionsByItem.get(it.id) || [],
+          })),
         }));
       }
     }
@@ -273,6 +315,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     const hasChanges = isInitial ||
       clientRows.length > 0 || productRows.length > 0 ||
       presentations.length > 0 || categoryRows.length > 0 ||
+      comboDefRows.length > 0 || comboOptionRows.length > 0 ||
       neighborhoodRows.length > 0 ||
       Boolean(todayWorkDayRow && String(todayWorkDayRow.updated_at || todayWorkDayRow.created_at || "") > since) ||
       orders.some((order) => String(order.updated_at || order.created_at || "") > since);
@@ -282,14 +325,28 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       serverTime: nowIsoStr,
       cursor: nowIsoStr,
       hasChanges,
-      // Diagnóstico: true si este pull pidió force=1 pero fue atendido como uno
-      // normal (con caché) porque el último force real fue hace menos de
-      // FORCE_TTL_MS. No afecta la data devuelta, solo informa el motivo.
       refreshThrottled: forceThrottled,
       workDay: workDayData,
       clients: clientRows.map((row: any) => client(row)),
       products: productRows.map((row: any) => product(row)),
       presentations,
+      comboDefinitions: comboDefRows.map((row: any) => ({
+        id: row.id,
+        product_id: row.product_id,
+        selection_min: row.selection_min,
+        selection_max: row.selection_max,
+        active: row.active === false ? 0 : 1,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      comboOptions: comboOptionRows.map((row: any) => ({
+        id: row.id,
+        combo_id: row.combo_id,
+        presentation_id: row.presentation_id,
+        max_quantity: row.max_quantity ?? null,
+        sort_order: row.sort_order ?? 0,
+        active: row.active === false ? 0 : 1,
+      })),
       inventory: presentations.map((p) => ({
         id: p.id,
         presentation_id: p.id,
@@ -297,9 +354,10 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         updated_at: p.updated_at,
       })),
       orders,
-      categories: categoryRows.map((row: any) => ({ ...row, active: 1 })),
+      categories: categoryRows.map((row: any) => ({ id: row.id, name: row.name, active: row.active === false ? 0 : 1, updated_at: row.updated_at })),
       neighborhoods: neighborhoodRows.map((row: any) => ({ ...row, active: 1 })),
     };
+
 
     // Guardar solo pulls incrementales. Limitar el mapa evita crecimiento sin
     // límite si se conectan muchas instalaciones con cursores distintos.

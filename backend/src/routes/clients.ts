@@ -18,9 +18,17 @@ function serializeClient(row: any) {
   };
 }
 
-const clientSchema = z.object({ clientLocalId: z.string().optional(), businessName: z.string().min(1, "El nombre del negocio es obligatorio"),
-  contactName: z.string().optional(), phone: z.string().optional(), neighborhoodId: z.string().optional(),
-  address: z.string().optional(), lat: z.number().optional(), lng: z.number().optional() });
+const optionalText = z.string().trim().max(250).optional();
+const clientSchema = z.object({
+  clientLocalId: z.string().uuid().optional(),
+  businessName: z.string().trim().min(1, "El nombre del negocio es obligatorio").max(250),
+  contactName: optionalText,
+  phone: z.string().trim().max(50).optional(),
+  neighborhoodId: z.string().uuid().optional(),
+  address: z.string().trim().max(500).optional(),
+  lat: z.number().finite().min(-90).max(90).optional(),
+  lng: z.number().finite().min(-180).max(180).optional(),
+}).strict();
 
 clientsRouter.get("/", async (_req, res) => {
   const { rows } = await pool.query(
@@ -87,14 +95,6 @@ clientsRouter.put("/:id", async (req, res) => {
   );
   invalidatePullCache("clients");
   res.json({ client: serializeClient(rows[0]) });
-});
-
-clientsRouter.patch("/:id/visit-status", async (req, res) => {
-  const { status } = req.body || {};
-  if (!["pending", "visited"].includes(status)) return res.status(400).json({ error: "Estado inválido." });
-  await pool.query("UPDATE clients SET visit_status = $2, updated_at = $3 WHERE id = $1", [req.params.id, status, nowIso()]);
-  invalidatePullCache("clients");
-  res.json({ ok: true });
 });
 
 clientsRouter.delete("/:id", async (req, res) => {

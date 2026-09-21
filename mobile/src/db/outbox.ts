@@ -1,8 +1,8 @@
 import { v4 as uuid } from "uuid";
 import { getDb, nowIso } from "./client";
 
-export type OutboxEntity = "client" | "product" | "order";
-export type OrderOperation = "create" | "update" | "cancel";
+export type OutboxEntity = "client" | "product" | "order" | "category";
+export type OrderOperation = "create" | "update" | "cancel" | "delete";
 
 export async function enqueue(entityType: OutboxEntity, localEntityId: string, priority = 2, operation: OrderOperation = "create") {
   const db = await getDb();

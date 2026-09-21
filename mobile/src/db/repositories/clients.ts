@@ -88,11 +88,6 @@ export async function deleteClientLocal(id: string): Promise<void> {
   await enqueue("client", id, 1);
 }
 
-export async function setVisitStatus(id: string, status: "pending" | "visited") {
-  const db = await getDb();
-  await db.runAsync(`UPDATE clients SET visit_status = ?, updated_at = ? WHERE id = ?`, [status, nowIso(), id]);
-}
-
 /** Usado por el motor de sync al hacer pull: inserta o actualiza clientes que vinieron del servidor. */
 export async function upsertFromServer(serverClient: any) {
   const db = await getDb();
