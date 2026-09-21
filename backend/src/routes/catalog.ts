@@ -12,13 +12,13 @@ const comboOptionInput = z.object({
   presentationId: z.string().min(1),
   maxQuantity: z.number().int().positive().nullable().optional(),
   sortOrder: z.number().int().nonnegative().optional().default(0),
-}).strict();
+}).passthrough();
 
 const comboDefinitionInput = z.object({
   selectionMin: z.number().int().positive(),
   selectionMax: z.number().int().positive(),
   options: z.array(comboOptionInput).min(1, "Configura al menos una opción para el combo."),
-}).strict();
+}).passthrough();
 
 const presentationInput = z.object({
   name: z.string().trim().min(1).max(100),
@@ -26,7 +26,7 @@ const presentationInput = z.object({
   priceCents: z.number().int().nonnegative().max(2_000_000_000),
   costCents: z.number().int().nonnegative().max(2_000_000_000).default(0),
   stock: z.number().int().nonnegative().max(2_000_000_000).default(0),
-}).strict();
+}).passthrough();
 
 const productSchema = z.object({
   sku: z.string().trim().min(1).max(100),
@@ -38,7 +38,7 @@ const productSchema = z.object({
   productType: z.enum(["standard", "combo"]).default("standard"),
   presentations: z.array(presentationInput).min(1, "Configura al menos una presentación.").max(100),
   comboDefinition: comboDefinitionInput.optional().nullable(),
-}).strict().refine((data) => {
+}).passthrough().refine((data) => {
   if (data.productType === "combo") {
     if (!data.comboDefinition) return false;
     if (data.comboDefinition.selectionMax < data.comboDefinition.selectionMin) return false;
@@ -49,6 +49,7 @@ const productSchema = z.object({
 });
 
 const productUpdateSchema = z.object({
+  sku: z.string().trim().min(1).max(100).optional(),
   name: z.string().trim().min(1).max(250),
   categoryId: z.string().min(1).optional().nullable(),
   photoUrl: z.string().url().max(2_000).optional().nullable(),
@@ -57,7 +58,7 @@ const productUpdateSchema = z.object({
   productType: z.enum(["standard", "combo"]).default("standard"),
   presentations: z.array(presentationInput).min(1, "Configura al menos una presentación.").max(100),
   comboDefinition: comboDefinitionInput.optional().nullable(),
-}).strict().refine((data) => {
+}).passthrough().refine((data) => {
   if (data.productType === "combo") {
     if (!data.comboDefinition) return false;
     if (data.comboDefinition.selectionMax < data.comboDefinition.selectionMin) return false;
