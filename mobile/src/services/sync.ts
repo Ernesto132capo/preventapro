@@ -19,9 +19,10 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
+  const catCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM categories WHERE active = 1`))?.n ?? 0;
 
   let since = (await getMeta("last_pull_at")) || "1970-01-01T00:00:00.000Z";
-  if (prodCount === 0 || clientCount === 0) {
+  if (prodCount === 0 || clientCount === 0 || catCount === 0) {
     since = "1970-01-01T00:00:00.000Z";
   }
 
@@ -357,8 +358,9 @@ async function pushProduct(row: OutboxRow) {
     serverProduct = res.product;
   }
 
-  await db.runAsync(`UPDATE products SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [
+  await db.runAsync(`UPDATE products SET server_id = ?, category_id = ?, sync_status = 'synced' WHERE id = ?`, [
     serverProduct.id,
+    serverProduct.category_id ?? product.category_id,
     product.id,
   ]);
   if (serverProduct.combo_definition) {

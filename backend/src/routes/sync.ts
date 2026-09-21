@@ -176,9 +176,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           : (await pool.query("SELECT * FROM products WHERE updated_at > $1", [since])).rows,
         force),
       cachedRows("categories", categoryQueryCache, cursorKey, async () =>
-        isInitial
-          ? (await pool.query("SELECT * FROM categories WHERE active = true ORDER BY name")).rows
-          : (await pool.query("SELECT * FROM categories WHERE updated_at > $1 ORDER BY name", [since])).rows,
+        (await pool.query("SELECT * FROM categories WHERE active = true ORDER BY name")).rows,
         force),
       cachedRows("neighborhoods", neighborhoodQueryCache, cursorKey, async () =>
         isInitial ? (await pool.query("SELECT * FROM neighborhoods WHERE active = true")).rows : [],
