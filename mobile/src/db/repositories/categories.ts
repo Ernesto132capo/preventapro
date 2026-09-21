@@ -101,12 +101,18 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
 
 export async function resolveServerCategoryId(localId: string): Promise<string | null> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ id: string; server_id: string | null; sync_status: string }>(
-    `SELECT id, server_id, sync_status FROM categories WHERE id = ? OR server_id = ?`,
+  const row = await db.getFirstAsync<{ id: string; server_id: string | null; name: string }>(
+    `SELECT id, server_id, name FROM categories WHERE id = ? OR server_id = ?`,
     [localId, localId]
   );
-  if (row) {
-    return row.server_id || row.id;
+  if (row?.server_id) return row.server_id;
+  if (row?.name) {
+    const match = await db.getFirstAsync<{ server_id: string | null }>(
+      `SELECT server_id FROM categories WHERE lower(name) = lower(?) AND server_id IS NOT NULL LIMIT 1`,
+      [row.name.trim()]
+    );
+    if (match?.server_id) return match.server_id;
+    return row.name.trim();
   }
-  return localId;
+  return row?.id || localId;
 }

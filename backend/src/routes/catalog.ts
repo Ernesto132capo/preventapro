@@ -165,10 +165,9 @@ catalogRouter.post("/categories", async (req, res) => {
     if (row.active === false) {
       // Reactivar categoría previa con el mismo nombre
       await pool.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [row.id, ts]);
-      invalidatePullCache("products");
-      return res.json({ category: { id: row.id, name, active: 1, created_at: ts, updated_at: ts } });
     }
-    return res.status(409).json({ error: "Esa categoría ya existe." });
+    invalidatePullCache("products");
+    return res.json({ category: { id: row.id, name, active: 1, created_at: ts, updated_at: ts } });
   }
   const id = uuid();
   await pool.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [id, name, ts]);
@@ -246,11 +245,19 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
       }
     }
 
+    let targetCategoryId: string | null = null;
+    if (d.categoryId) {
+      const catCheck = await client.query("SELECT id FROM categories WHERE (id = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
+      if (catCheck.rows.length > 0) {
+        targetCategoryId = catCheck.rows[0].id;
+      }
+    }
+
     const { rows } = await client.query(
       `INSERT INTO products (id, sku, name, category_id, photo_url, base_cost_cents, base_unit_name, product_type, active, created_by, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $10)
        RETURNING *`,
-      [id, d.sku, d.name, d.categoryId ?? null, d.photoUrl ?? null, d.baseCostCents, d.baseUnitName, d.productType, req.userId, ts]
+      [id, d.sku, d.name, targetCategoryId, d.photoUrl ?? null, d.baseCostCents, d.baseUnitName, d.productType, req.userId, ts]
     );
 
     for (let sortOrder = 0; sortOrder < d.presentations.length; sortOrder++) {
@@ -316,9 +323,17 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
       }
     }
 
+    let targetCategoryId: string | null = null;
+    if (d.categoryId) {
+      const catCheck = await client.query("SELECT id FROM categories WHERE (id = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
+      if (catCheck.rows.length > 0) {
+        targetCategoryId = catCheck.rows[0].id;
+      }
+    }
+
     await client.query(
       `UPDATE products SET name = $2, category_id = $3, base_cost_cents = $4, base_unit_name = $5, product_type = $6, updated_at = $7 WHERE id = $1`,
-      [req.params.id, d.name, d.categoryId !== undefined ? d.categoryId : (old.category_id ?? null), d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
+      [req.params.id, d.name, d.categoryId !== undefined ? targetCategoryId : (old.category_id ?? null), d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
     );
 
     const current = await client.query("SELECT * FROM product_presentations WHERE product_id = $1", [req.params.id]);
