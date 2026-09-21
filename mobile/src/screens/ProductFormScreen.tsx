@@ -87,8 +87,14 @@ export function ProductFormScreen() {
           if (product.combo_definition) {
             setSelectionMin(String(product.combo_definition.selection_min));
             setSelectionMax(String(product.combo_definition.selection_max));
+            const seenPres = new Set<string>();
+            const uniqueOpts = (product.combo_definition.options || []).filter((o) => {
+              if (seenPres.has(o.presentation_id)) return false;
+              seenPres.add(o.presentation_id);
+              return true;
+            });
             setComboOptions(
-              (product.combo_definition.options || []).map((o) => ({
+              uniqueOpts.map((o) => ({
                 presentationId: o.presentation_id,
                 productName: o.product_name || "Producto",
                 presentationName: o.presentation_name || "Unidad",

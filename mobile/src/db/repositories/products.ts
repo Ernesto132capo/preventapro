@@ -121,7 +121,19 @@ async function hydrateProducts(db: SQLiteDatabase, products: Product[]): Promise
         optionsByDef.set(opt.combo_id, list);
       }
       for (const def of defs) {
-        const opts = optionsByDef.get(def.id) || (def.server_id ? optionsByDef.get(def.server_id) : []) || [];
+        const rawOpts = [
+          ...(optionsByDef.get(def.id) || []),
+          ...(def.server_id && def.server_id !== def.id ? optionsByDef.get(def.server_id) || [] : []),
+        ];
+        const seenPres = new Set<string>();
+        const uniqueOpts: ComboOption[] = [];
+        for (const opt of rawOpts) {
+          const key = opt.presentation_id || opt.id;
+          if (!seenPres.has(key)) {
+            seenPres.add(key);
+            uniqueOpts.push(opt);
+          }
+        }
         const comboObj: ComboDefinition = {
           id: def.id,
           server_id: def.server_id,
@@ -129,7 +141,7 @@ async function hydrateProducts(db: SQLiteDatabase, products: Product[]): Promise
           selection_min: def.selection_min,
           selection_max: def.selection_max,
           active: def.active,
-          options: opts,
+          options: uniqueOpts,
         };
         comboDefsMap.set(def.product_id, comboObj);
         if (def.server_id) comboDefsMap.set(def.server_id, comboObj);

@@ -93,8 +93,8 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
       );
       const targetComboId = localDef ? localDef.id : co.combo_id;
       const existingOpt = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM combo_options WHERE server_id = ? OR id = ?`,
-        [co.id, co.id]
+        `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+        [co.id, co.id, targetComboId, targetPresId]
       );
       const targetOptId = existingOpt ? existingOpt.id : co.id;
       await db.runAsync(
