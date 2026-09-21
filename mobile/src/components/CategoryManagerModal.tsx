@@ -107,7 +107,12 @@ export function CategoryManagerModal({ visible, selectedCategoryId, onSelect, on
               </Pressable>
             }
             renderItem={({ item }) => {
-              const isSelected = selectedCategoryId === item.id || selectedCategoryId === item.server_id;
+              const isSelected = Boolean(
+                selectedCategoryId &&
+                  (selectedCategoryId === item.id ||
+                    (item.server_id && selectedCategoryId === item.server_id) ||
+                    selectedCategoryId.toLowerCase() === item.name.toLowerCase())
+              );
               return (
                 <Pressable
                   style={[styles.catItem, isSelected && styles.catItemActive]}

@@ -186,8 +186,10 @@ export async function listProducts(optionsOrSearch?: string | ListProductsOption
   }
 
   if (categoryId) {
-    conditions.push("(p.category_id = ? OR p.category_id IN (SELECT server_id FROM categories WHERE id = ?))");
-    params.push(categoryId, categoryId);
+    conditions.push(
+      "(p.category_id = ? OR p.category_id IN (SELECT server_id FROM categories WHERE id = ? OR server_id = ? OR lower(name) = lower(?)) OR p.category_id IN (SELECT id FROM categories WHERE id = ? OR server_id = ? OR lower(name) = lower(?)))"
+    );
+    params.push(categoryId, categoryId, categoryId, categoryId, categoryId, categoryId, categoryId);
   }
 
   if (onlyFavorites) {

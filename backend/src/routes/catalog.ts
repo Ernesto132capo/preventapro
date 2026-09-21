@@ -247,9 +247,13 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
 
     let targetCategoryId: string | null = null;
     if (d.categoryId) {
-      const catCheck = await client.query("SELECT id FROM categories WHERE (id = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
+      const catCheck = await client.query("SELECT id FROM categories WHERE (id::text = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
       if (catCheck.rows.length > 0) {
         targetCategoryId = catCheck.rows[0].id;
+      } else {
+        const newCatId = uuid();
+        await client.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [newCatId, d.categoryId, ts]);
+        targetCategoryId = newCatId;
       }
     }
 
@@ -325,9 +329,13 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
 
     let targetCategoryId: string | null = null;
     if (d.categoryId) {
-      const catCheck = await client.query("SELECT id FROM categories WHERE (id = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
+      const catCheck = await client.query("SELECT id FROM categories WHERE (id::text = $1 OR lower(name) = lower($1)) AND active = true LIMIT 1", [d.categoryId]);
       if (catCheck.rows.length > 0) {
         targetCategoryId = catCheck.rows[0].id;
+      } else {
+        const newCatId = uuid();
+        await client.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [newCatId, d.categoryId, ts]);
+        targetCategoryId = newCatId;
       }
     }
 

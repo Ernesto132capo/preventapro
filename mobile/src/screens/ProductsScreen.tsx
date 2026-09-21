@@ -45,8 +45,9 @@ export function ProductsScreen() {
   const categoryMap = useMemo(() => {
     const map = new Map<string, string>();
     categories.forEach((c) => {
-      map.set(c.id, c.name);
+      if (c.id) map.set(c.id, c.name);
       if (c.server_id) map.set(c.server_id, c.name);
+      if (c.name) map.set(c.name.toLowerCase(), c.name);
     });
     return map;
   }, [categories]);
@@ -57,10 +58,22 @@ export function ProductsScreen() {
       list = list.filter((p) => p.is_favorite);
     }
     if (selectedCategoryId) {
-      list = list.filter((p) => p.category_id === selectedCategoryId || (categoryMap.has(p.category_id || "") && selectedCategoryId === p.category_id));
+      const selectedCat = categories.find(
+        (c) => c.id === selectedCategoryId || (c.server_id && c.server_id === selectedCategoryId)
+      );
+      if (selectedCat) {
+        list = list.filter(
+          (p) =>
+            p.category_id === selectedCat.id ||
+            (selectedCat.server_id && p.category_id === selectedCat.server_id) ||
+            (p.category_id && selectedCat.name && p.category_id.toLowerCase() === selectedCat.name.toLowerCase())
+        );
+      } else {
+        list = list.filter((p) => p.category_id === selectedCategoryId);
+      }
     }
     return list;
-  }, [products, showOnlyFavorites, selectedCategoryId, categoryMap]);
+  }, [products, showOnlyFavorites, selectedCategoryId, categories]);
 
   const handleToggleFavorite = useCallback(async (productId: string) => {
     const nowFav = await toggleFavoriteLocal(productId);
@@ -91,7 +104,7 @@ export function ProductsScreen() {
     ({ item }: { item: ProductWithPresentations }) => (
       <ProductCardItem
         item={item}
-        categoryName={item.category_id ? categoryMap.get(item.category_id) || null : null}
+        categoryName={item.category_id ? (categoryMap.get(item.category_id) || categoryMap.get(item.category_id.toLowerCase()) || null) : null}
         onToggleFavorite={handleToggleFavorite}
         onEdit={() => navigation.navigate("NuevoProducto", { productId: item.id })}
         onDelete={() => confirmDelete(item)}

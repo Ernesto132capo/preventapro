@@ -70,10 +70,13 @@ export function ProductFormScreen() {
         if (product) {
           setName(product.name);
           setProductType(product.product_type || "standard");
-          setCategoryId(product.category_id ?? null);
           if (product.category_id) {
             const cat = await getCategory(product.category_id);
             setCategoryName(cat?.name ?? null);
+            setCategoryId(cat ? (cat.server_id || cat.id) : product.category_id);
+          } else {
+            setCategoryId(null);
+            setCategoryName(null);
           }
           setPresentations(
             product.presentations.map((p) => ({
@@ -129,7 +132,7 @@ export function ProductFormScreen() {
   }
 
   function handleSelectCategory(cat: Category | null) {
-    setCategoryId(cat ? cat.id : null);
+    setCategoryId(cat ? (cat.server_id || cat.id) : null);
     setCategoryName(cat ? cat.name : null);
   }
 

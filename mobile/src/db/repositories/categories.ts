@@ -10,7 +10,10 @@ export async function listCategories(): Promise<Category[]> {
 
 export async function getCategory(id: string): Promise<Category | null> {
   const db = await getDb();
-  return db.getFirstAsync<Category>(`SELECT * FROM categories WHERE id = ? OR server_id = ?`, [id, id]);
+  return db.getFirstAsync<Category>(
+    `SELECT * FROM categories WHERE id = ? OR server_id = ? OR lower(name) = lower(?)`,
+    [id, id, id]
+  );
 }
 
 export async function createCategoryLocal(name: string): Promise<Category> {
@@ -102,8 +105,8 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
 export async function resolveServerCategoryId(localId: string): Promise<string | null> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ id: string; server_id: string | null; name: string }>(
-    `SELECT id, server_id, name FROM categories WHERE id = ? OR server_id = ?`,
-    [localId, localId]
+    `SELECT id, server_id, name FROM categories WHERE id = ? OR server_id = ? OR lower(name) = lower(?)`,
+    [localId, localId, localId]
   );
   if (row?.server_id) return row.server_id;
   if (row?.name) {
