@@ -329,7 +329,7 @@ export function ProductFormScreen() {
           </Text>
 
           {comboOptions.map((opt, idx) => (
-            <View key={opt.presentationId} style={styles.optionCard}>
+            <View key={`${opt.presentationId}-${idx}`} style={styles.optionCard}>
               <View style={styles.rowBetween}>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.optionTitle}>{opt.productName}</Text>

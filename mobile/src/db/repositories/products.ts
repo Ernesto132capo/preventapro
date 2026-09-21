@@ -199,7 +199,13 @@ export async function listProducts(optionsOrSearch?: string | ListProductsOption
   }
 
   const products = await db.getAllAsync<Product>(sql, params);
-  return hydrateProducts(db, products);
+  const seenIds = new Set<string>();
+  const uniqueProducts = products.filter((p) => {
+    if (seenIds.has(p.id)) return false;
+    seenIds.add(p.id);
+    return true;
+  });
+  return hydrateProducts(db, uniqueProducts);
 }
 
 /** Devuelve los productos más frecuentes o vendidos en preventas */

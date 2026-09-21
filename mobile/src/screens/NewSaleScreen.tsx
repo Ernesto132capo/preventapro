@@ -520,7 +520,7 @@ export function NewSaleScreen() {
 
       <FlatList
         data={products}
-        keyExtractor={(p) => p.id}
+        keyExtractor={(p, idx) => `${p.id}-${idx}`}
         renderItem={renderProductItem}
         contentContainerStyle={{ padding: spacing.lg, paddingTop: spacing.xs }}
         initialNumToRender={6}

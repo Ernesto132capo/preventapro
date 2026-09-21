@@ -143,7 +143,7 @@ export function ComboSelectorModal({ visible, product, presentation, onAdd, onCl
 
           <FlatList
             data={filteredOptions}
-            keyExtractor={(o) => o.id || o.presentation_id}
+            keyExtractor={(o, idx) => `${o.id || o.presentation_id}-${idx}`}
             style={{ maxHeight: 320 }}
             renderItem={({ item }) => {
               const count = selectedCounts[item.presentation_id] || 0;

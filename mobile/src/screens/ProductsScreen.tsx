@@ -168,7 +168,7 @@ export function ProductsScreen() {
 
       <FlatList
         data={filteredProducts}
-        keyExtractor={(p) => p.id}
+        keyExtractor={(p, idx) => `${p.id}-${idx}`}
         renderItem={renderProductItem}
         contentContainerStyle={{ padding: spacing.lg, paddingTop: 0 }}
         ListEmptyComponent={<EmptyState message="No hay productos disponibles." />}
