@@ -318,7 +318,7 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
 
     await client.query(
       `UPDATE products SET name = $2, category_id = $3, base_cost_cents = $4, base_unit_name = $5, product_type = $6, updated_at = $7 WHERE id = $1`,
-      [req.params.id, d.name, d.categoryId ?? old.category_id ?? null, d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
+      [req.params.id, d.name, d.categoryId !== undefined ? d.categoryId : (old.category_id ?? null), d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
     );
 
     const current = await client.query("SELECT * FROM product_presentations WHERE product_id = $1", [req.params.id]);

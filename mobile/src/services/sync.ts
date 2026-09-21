@@ -284,10 +284,10 @@ async function pushProduct(row: OutboxRow) {
     return markDone(row.id);
   }
 
-  let categoryServerId: string | undefined = undefined;
+  let categoryServerId: string | null = null;
   if (product.category_id) {
     const resolvedCatId = await resolveServerCategoryId(product.category_id);
-    categoryServerId = resolvedCatId ?? undefined;
+    categoryServerId = resolvedCatId || product.category_id;
   }
 
   // Solo se envían las presentaciones activas; las borradas localmente se omiten (el servidor las desactiva por ausencia).

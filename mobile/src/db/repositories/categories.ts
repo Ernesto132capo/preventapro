@@ -106,8 +106,7 @@ export async function resolveServerCategoryId(localId: string): Promise<string |
     [localId, localId]
   );
   if (row) {
-    if (row.server_id) return row.server_id;
-    if (row.sync_status === "synced") return row.id;
+    return row.server_id || row.id;
   }
-  return null;
+  return localId;
 }
