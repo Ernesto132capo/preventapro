@@ -32,6 +32,7 @@ const schema = z.object({
   paymentCondition: z.string().trim().min(1).max(100).default("Contado 48h"),
   taxRatePermille: z.number().int().min(0).max(1_000).default(0),
   items: z.array(item).min(1).max(100),
+  createdAt: z.string().optional(),
 }).strict();
 
 class OrderValidationError extends Error {}
@@ -249,15 +250,28 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
       return res.status(404).json({ error: "Jornada no encontrada." });
     }
     if (wd.status === "closed") {
-      await client.query("ROLLBACK");
-      inTransaction = false;
-      return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
+      const orderCreatedAt = d.createdAt;
+      // Si la preventa se capturó offline antes del cierre de la jornada (o durante el día correspondiente),
+      // se admite legítimamente recalculando los totales de la jornada concluida.
+      const isLegitimateOfflineOrder = Boolean(
+        orderCreatedAt &&
+        (
+          !wd.closed_at ||
+          new Date(orderCreatedAt).getTime() <= new Date(wd.closed_at).getTime() + 15 * 60 * 1000
+        )
+      );
+
+      if (!isLegitimateOfflineOrder) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
+      }
     }
     const otherOpen = await client.query(
       "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2 LIMIT 1",
       [req.userId, wd.id]
     );
-    if (otherOpen.rows.length > 0) {
+    if (otherOpen.rows.length > 0 && wd.status !== "closed") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(409).json({ error: "Hay otra jornada abierta para este preventista. Resuelve esa jornada antes de registrar preventas." });
@@ -274,7 +288,8 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     const items = await make(client, d.items);
     const sub = items.reduce((n, x) => n + x.subtotal_cents, 0);
     const tax = calculateTaxCents(sub, d.taxRatePermille);
-    const id = uuid(), ts = nowIso();
+    const id = uuid();
+    const ts = d.createdAt && !isNaN(new Date(d.createdAt).getTime()) ? new Date(d.createdAt).toISOString() : nowIso();
     const itemCount = items.reduce((n, x) => n + x.quantity, 0);
 
     await client.query(

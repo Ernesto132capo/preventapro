@@ -27,7 +27,7 @@ async function recalc(id: string, db: PoolClient) {
 // Historial, que solo lista jornadas cerradas) — invisible para siempre con
 // todos sus pedidos adentro. Esta función la cierra automáticamente, con sus
 // totales reales, justo antes de abrir la jornada del nuevo día.
-async function closeStaleOpenWorkDays(currentDate: string, userId: string, db: PoolClient): Promise<boolean> {
+export async function closeStaleOpenWorkDays(currentDate: string, userId: string, db: PoolClient): Promise<boolean> {
   const ts = nowIso();
   // Tomar primero los locks de jornada evita calcular totales con un snapshot
   // anterior a un pedido que estuviera terminando de insertarse.

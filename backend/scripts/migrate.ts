@@ -292,6 +292,43 @@ export async function runMigrations(): Promise<void> {
   }
 }
 
+/** Ejecuta una migración individual registrándola de manera transaccional e idempotente en _migrations. */
+export async function runSpecificMigration(migrationId: string): Promise<void> {
+  const target = migrations.find((m) => m.id === migrationId);
+  if (!target) throw new Error(`Migración no encontrada: ${migrationId}`);
+
+  const setupClient = await pool.connect();
+  let alreadyApplied = false;
+  try {
+    await ensureMigrationsTable(setupClient);
+    const { rows } = await setupClient.query("SELECT name FROM _migrations WHERE name = $1", [target.id]);
+    alreadyApplied = rows.length > 0;
+  } finally {
+    setupClient.release();
+  }
+
+  if (alreadyApplied) {
+    console.log(`⏩ [omitida] ${target.id}: ${target.description} (ya registrada en _migrations)`);
+    return;
+  }
+
+  console.log(`⏳ [ejecutando] ${target.id}: ${target.description}...`);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await target.run(client);
+    await client.query("INSERT INTO _migrations (name, executed_at) VALUES ($1, now())", [target.id]);
+    await client.query("COMMIT");
+    console.log(`✅ [completada] ${target.id}: ${target.description}`);
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error(`❌ [error] Falló la migración ${target.id}:`, error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 if (require.main === module || process.argv[1]?.includes("migrate")) {
   runMigrations()
     .catch((error) => {

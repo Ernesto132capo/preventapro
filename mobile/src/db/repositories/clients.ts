@@ -38,13 +38,17 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
   const db = await getDb();
   const id = uuid();
   const ts = nowIso();
-  await db.runAsync(
-    `INSERT INTO clients
-      (id, business_name, contact_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'pending', ?, ?)`,
-    [id, input.businessName.trim(), input.contactName || null, input.phone || null, input.address || null, input.lat ?? null, input.lng ?? null, ts, ts]
-  );
-  await enqueue("client", id, 1);
+
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `INSERT INTO clients
+        (id, business_name, contact_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'pending', ?, ?)`,
+      [id, input.businessName.trim(), input.contactName || null, input.phone || null, input.address || null, input.lat ?? null, input.lng ?? null, ts, ts]
+    );
+    await enqueue("client", id, 1, "create");
+  });
+
   const client = await getClient(id);
   return client!;
 }
@@ -58,34 +62,39 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
   const existing = await getClient(id);
   if (!existing) throw new Error("Cliente no encontrado.");
 
-  await db.runAsync(
-    `UPDATE clients SET
-       business_name = ?, contact_name = ?, phone = ?, address = ?, lat = ?, lng = ?,
-       sync_status = 'pending', updated_at = ?
-     WHERE id = ?`,
-    [
-      input.businessName.trim(),
-      input.contactName || null,
-      input.phone || null,
-      input.address || null,
-      input.lat ?? null,
-      input.lng ?? null,
-      nowIso(),
-      id,
-    ]
-  );
-  await enqueue("client", id, 1);
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `UPDATE clients SET
+         business_name = ?, contact_name = ?, phone = ?, address = ?, lat = ?, lng = ?,
+         sync_status = 'pending', updated_at = ?
+       WHERE id = ?`,
+      [
+        input.businessName.trim(),
+        input.contactName || null,
+        input.phone || null,
+        input.address || null,
+        input.lat ?? null,
+        input.lng ?? null,
+        nowIso(),
+        id,
+      ]
+    );
+    await enqueue("client", id, 1, "update");
+  });
+
   return (await getClient(id))!;
 }
 
 /** Borrado (soft delete) de un cliente. Nunca se elimina físicamente para no perder historial de preventas. */
 export async function deleteClientLocal(id: string): Promise<void> {
   const db = await getDb();
-  await db.runAsync(
-    `UPDATE clients SET active = 0, sync_status = 'pending', updated_at = ? WHERE id = ?`,
-    [nowIso(), id]
-  );
-  await enqueue("client", id, 1);
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `UPDATE clients SET active = 0, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+      [nowIso(), id]
+    );
+    await enqueue("client", id, 1, "delete");
+  });
 }
 
 /** Usado por el motor de sync al hacer pull: inserta o actualiza clientes que vinieron del servidor. */

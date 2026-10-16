@@ -21,32 +21,38 @@ export async function createCategoryLocal(name: string): Promise<Category> {
   if (!trimmed) throw new Error("El nombre de la categoría es obligatorio.");
 
   const db = await getDb();
-  const existing = await db.getFirstAsync<Category>(
-    `SELECT * FROM categories WHERE lower(name) = lower(?)`,
-    [trimmed]
-  );
+  let targetId = "";
 
-  const ts = nowIso();
-  if (existing) {
-    if (existing.active === 0) {
-      await db.runAsync(
-        `UPDATE categories SET active = 1, sync_status = 'pending', updated_at = ? WHERE id = ?`,
-        [ts, existing.id]
-      );
-      await enqueue("category", existing.id, 1);
-      return (await getCategory(existing.id))!;
+  await db.withTransactionAsync(async () => {
+    const existing = await db.getFirstAsync<Category>(
+      `SELECT * FROM categories WHERE lower(name) = lower(?)`,
+      [trimmed]
+    );
+
+    const ts = nowIso();
+    if (existing) {
+      targetId = existing.id;
+      if (existing.active === 0) {
+        await db.runAsync(
+          `UPDATE categories SET active = 1, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+          [ts, existing.id]
+        );
+        await enqueue("category", existing.id, 1, "update");
+      }
+      return;
     }
-    return existing;
-  }
 
-  const id = uuid();
-  await db.runAsync(
-    `INSERT INTO categories (id, name, active, sync_status, updated_at) VALUES (?, ?, 1, 'pending', ?)`,
-    [id, trimmed, ts]
-  );
+    const id = uuid();
+    await db.runAsync(
+      `INSERT INTO categories (id, name, active, sync_status, updated_at) VALUES (?, ?, 1, 'pending', ?)`,
+      [id, trimmed, ts]
+    );
 
-  await enqueue("category", id, 1);
-  return (await getCategory(id))!;
+    await enqueue("category", id, 1, "create");
+    targetId = id;
+  });
+
+  return (await getCategory(targetId))!;
 }
 
 export async function updateCategoryLocal(id: string, name: string): Promise<Category> {
@@ -54,24 +60,57 @@ export async function updateCategoryLocal(id: string, name: string): Promise<Cat
   if (!trimmed) throw new Error("El nombre de la categoría es obligatorio.");
 
   const db = await getDb();
-  const ts = nowIso();
-  await db.runAsync(
-    `UPDATE categories SET name = ?, sync_status = 'pending', updated_at = ? WHERE id = ?`,
-    [trimmed, ts, id]
+  const existing = await db.getFirstAsync<Category>(
+    `SELECT id, server_id FROM categories WHERE id = ? OR server_id = ?`,
+    [id, id]
   );
+  if (!existing) throw new Error("Categoría no encontrada.");
+  const localId = existing.id;
 
-  await enqueue("category", id, 1, "update");
-  return (await getCategory(id))!;
+  const ts = nowIso();
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `UPDATE categories SET name = ?, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+      [trimmed, ts, localId]
+    );
+
+    await enqueue("category", localId, 1, "update");
+  });
+
+  return (await getCategory(localId))!;
 }
 
 export async function deleteCategoryLocal(id: string): Promise<void> {
   const db = await getDb();
   const ts = nowIso();
-  await db.runAsync(
-    `UPDATE categories SET active = 0, sync_status = 'pending', updated_at = ? WHERE id = ?`,
-    [ts, id]
-  );
-  await enqueue("category", id, 1, "delete");
+
+  await db.withTransactionAsync(async () => {
+    const existing = await db.getFirstAsync<Category>(
+      `SELECT id, server_id FROM categories WHERE id = ? OR server_id = ?`,
+      [id, id]
+    );
+    if (!existing) return;
+
+    await db.runAsync(
+      `UPDATE categories SET active = 0, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+      [ts, existing.id]
+    );
+
+    // Desasociar productos que apunten a esta categoría (tanto por id local como por server_id)
+    if (existing.server_id) {
+      await db.runAsync(
+        `UPDATE products SET category_id = NULL WHERE category_id = ? OR category_id = ?`,
+        [existing.id, existing.server_id]
+      );
+    } else {
+      await db.runAsync(
+        `UPDATE products SET category_id = NULL WHERE category_id = ?`,
+        [existing.id]
+      );
+    }
+
+    await enqueue("category", existing.id, 1, "delete");
+  });
 }
 
 export async function upsertCategoryFromServer(serverCat: any): Promise<void> {

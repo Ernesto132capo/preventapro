@@ -369,9 +369,10 @@ export async function createProductLocal(input: NewProductInput): Promise<Produc
         );
       }
     }
+
+    await enqueue("product", productId, 1, "create");
   });
 
-  await enqueue("product", productId, 1);
   return (await getProduct(productId))!;
 }
 
@@ -466,20 +467,29 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
         [localProdId, serverProdId]
       );
     }
+
+    await enqueue("product", localProdId, 1, "update");
   });
 
-  await enqueue("product", localProdId, 1, "update");
   return (await getProduct(localProdId))!;
 }
 
 /** Borrado (soft delete) de un producto. Nunca se elimina físicamente para no perder historial de preventas. */
 export async function deleteProductLocal(productId: string): Promise<void> {
   const db = await getDb();
-  await db.runAsync(`UPDATE products SET active = 0, sync_status = 'pending' WHERE id = ? OR server_id = ?`, [productId, productId]);
-  const product = await db.getFirstAsync<{ id: string }>(`SELECT id FROM products WHERE id = ? OR server_id = ?`, [productId, productId]);
-  if (product) {
+  await db.withTransactionAsync(async () => {
+    const product = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM products WHERE id = ? OR server_id = ?`,
+      [productId, productId]
+    );
+    if (!product) return;
+
+    await db.runAsync(
+      `UPDATE products SET active = 0, sync_status = 'pending' WHERE id = ?`,
+      [product.id]
+    );
     await enqueue("product", product.id, 1, "delete");
-  }
+  });
 }
 
 export async function upsertProductFromServer(serverProduct: any) {

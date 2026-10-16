@@ -94,7 +94,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       unauthorizedHandlingRef.current = false;
       return true;
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión. Verifica tu conexión.");
+      if (err instanceof ApiError && err.status === 0) {
+        setError("Sin conexión a internet. Para el primer inicio de sesión se requiere conexión a internet.");
+      } else {
+        setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión. Verifica tu conexión.");
+      }
       return false;
     }
   }, []);

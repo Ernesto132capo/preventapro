@@ -1,8 +1,13 @@
 import "dotenv/config";
 import { pool } from "../src/db/pg";
+import { runSpecificMigration } from "./migrate";
 
+/**
+ * Script legado para migración de autenticación.
+ * Delega en el runner unificado para registrar la migración en _migrations.
+ */
 async function main() {
-  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT");
+  await runSpecificMigration("002_auth");
   console.log("Columna password_hash lista. Asigna una contraseña a cada preventista con npm run user:set-password -- CODIGO.");
 }
 

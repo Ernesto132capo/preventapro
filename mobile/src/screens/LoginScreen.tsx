@@ -1,5 +1,6 @@
-import React, { useState } from "react";
-import { View, Text, TextInput, StyleSheet, KeyboardAvoidingView, Platform, Switch, Image } from "react-native";
+import React, { useState, useRef } from "react";
+import { View, Text, TextInput, StyleSheet, KeyboardAvoidingView, Platform, Switch } from "react-native";
+import NetInfo from "@react-native-community/netinfo";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "../components/Button";
 import { useAuth } from "../context/AuthContext";
@@ -11,16 +12,36 @@ export function LoginScreen() {
   const [remember, setRemember] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const isSubmittingRef = useRef(false);
 
   async function handleSubmit() {
+    if (isSubmittingRef.current || submitting) return;
     setLocalError(null);
-    if (!identifier.trim() || !password) {
+
+    const cleanId = identifier.trim();
+    if (!cleanId || !password) {
       setLocalError("Ingresa tu código y contraseña.");
       return;
     }
+
+    isSubmittingRef.current = true;
     setSubmitting(true);
-    await login(identifier.trim(), password, remember);
-    setSubmitting(false);
+
+    try {
+      // Verificación de conectividad previa para feedback inmediato y claro
+      const netState = await NetInfo.fetch();
+      if (netState.isConnected === false || netState.isInternetReachable === false) {
+        setLocalError("Sin conexión a internet. Para el primer inicio de sesión se requiere conexión a internet.");
+        return;
+      }
+
+      await login(cleanId, password, remember);
+    } catch (err: any) {
+      setLocalError(err?.message || "No se pudo iniciar sesión. Verifica tu conexión.");
+    } finally {
+      isSubmittingRef.current = false;
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -39,6 +60,7 @@ export function LoginScreen() {
           autoCapitalize="none"
           placeholder="PV001"
           placeholderTextColor={colors.textMuted}
+          editable={!submitting}
         />
 
         <Text style={styles.label}>Contraseña</Text>
@@ -49,16 +71,28 @@ export function LoginScreen() {
           secureTextEntry
           placeholder="••••••••"
           placeholderTextColor={colors.textMuted}
+          editable={!submitting}
         />
 
         <View style={styles.rememberRow}>
-          <Switch value={remember} onValueChange={setRemember} trackColor={{ true: colors.emerald }} />
+          <Switch
+            value={remember}
+            onValueChange={setRemember}
+            trackColor={{ true: colors.emerald }}
+            disabled={submitting}
+          />
           <Text style={styles.rememberLabel}>Recordar sesión</Text>
         </View>
 
         {(localError || error) && <Text style={styles.error}>{localError || error}</Text>}
 
-        <Button label="Iniciar Sesión" onPress={handleSubmit} loading={submitting} style={{ marginTop: spacing.lg }} />
+        <Button
+          label="Iniciar Sesión"
+          onPress={handleSubmit}
+          loading={submitting}
+          disabled={submitting}
+          style={{ marginTop: spacing.lg }}
+        />
       </View>
     </KeyboardAvoidingView>
   );
