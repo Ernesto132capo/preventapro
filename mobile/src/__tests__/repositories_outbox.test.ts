@@ -1,6 +1,14 @@
 import { createCategoryLocal, updateCategoryLocal, deleteCategoryLocal, getCategory } from "../db/repositories/categories";
 import { createClientLocal, updateClientLocal, deleteClientLocal, getClient } from "../db/repositories/clients";
-import { createProductLocal, updateProductLocal, deleteProductLocal, getProduct } from "../db/repositories/products";
+import {
+  createProductLocal,
+  updateProductLocal,
+  deleteProductLocal,
+  getProduct,
+  remapProductReferences,
+  remapCategoryReferences,
+} from "../db/repositories/products";
+import { normalizeOutboxErrors } from "../db/outbox";
 
 interface MockCategory {
   id: string;
@@ -147,6 +155,44 @@ const mockDb = {
         cat.updated_at = ts;
       }
       return { changes: 1 };
+    }
+
+    // OUTBOX: UPDATE status = 'failed' WHERE status = 'error'
+    if (cleanSql.includes("UPDATE outbox SET status = 'failed' WHERE status = 'error'")) {
+      let count = 0;
+      for (const row of state.outbox) {
+        if (row.status === "error") {
+          row.status = "failed";
+          count++;
+        }
+      }
+      return { changes: count };
+    }
+
+    // PRODUCTS: UPDATE category_id
+    if (cleanSql.startsWith("UPDATE products SET category_id = ? WHERE category_id = ?")) {
+      const [newCatId, oldCatId] = params;
+      let count = 0;
+      for (const p of state.products) {
+        if (p.category_id === oldCatId) {
+          p.category_id = newCatId;
+          count++;
+        }
+      }
+      return { changes: count };
+    }
+
+    // PRESENTATIONS: UPDATE product_id (remapProductReferences)
+    if (cleanSql.startsWith("UPDATE product_presentations SET product_id = ? WHERE product_id = ?")) {
+      const [newId, oldId] = params;
+      let count = 0;
+      for (const pres of state.presentations) {
+        if (pres.product_id === oldId) {
+          pres.product_id = newId;
+          count++;
+        }
+      }
+      return { changes: count };
     }
 
     // PRODUCTS: UPDATE category_id = NULL
@@ -523,5 +569,72 @@ describe("Repositories & Outbox Atomicity", () => {
       const outboxRow = state.outbox.find((o) => o.local_entity_id === product.id && o.operation === "delete");
       expect(outboxRow).toBeDefined();
     });
+
+    it("crea producto combo reconociendo combo_items y opciones alternativas", async () => {
+      const combo = await createProductLocal({
+        name: "Super Pack Escolar",
+        productType: "combo",
+        presentations: [{ name: "Pack", unitEquivalence: 1, priceCents: 5000, costCents: 3500 }],
+        combo_items: [
+          { presentationId: "pres-1", maxQuantity: 2, sortOrder: 0 },
+          { presentationId: "pres-2", maxQuantity: 1, sortOrder: 1 },
+        ],
+        selection_min: 1,
+        selection_max: 2,
+      });
+
+      expect(combo.name).toBe("Super Pack Escolar");
+      expect(combo.product_type).toBe("combo");
+      const outboxRow = state.outbox.find((o) => o.local_entity_id === combo.id);
+      expect(outboxRow).toBeDefined();
+      expect(outboxRow?.operation).toBe("create");
+    });
+
+    it("remapCategoryReferences actualiza en cascada el category_id de los productos locales", async () => {
+      const prod = await createProductLocal({
+        name: "Galletas",
+        categoryId: "cat-local-1",
+        presentations: [{ name: "Paquete", unitEquivalence: 1, priceCents: 300, costCents: 200 }],
+      });
+
+      expect(prod.category_id).toBe("cat-local-1");
+      await remapCategoryReferences("cat-local-1", "cat-srv-canonical-999");
+
+      const localProd = state.products.find((p) => p.id === prod.id);
+      expect(localProd?.category_id).toBe("cat-srv-canonical-999");
+    });
+
+    it("remapProductReferences actualiza en cascada el product_id en presentaciones locales", async () => {
+      const prod = await createProductLocal({
+        name: "Refresco",
+        presentations: [{ name: "Botella 2L", unitEquivalence: 1, priceCents: 800, costCents: 500 }],
+      });
+
+      await remapProductReferences(prod.id, "prod-srv-canonical-888", false);
+      const localPres = state.presentations.find((p) => p.product_id === "prod-srv-canonical-888");
+      expect(localPres).toBeDefined();
+    });
+  });
+
+  describe("Outbox Normalization (C-08)", () => {
+    it("normalizeOutboxErrors convierte filas con status='error' a 'failed' para rescate", async () => {
+      state.outbox.push({
+        id: "out-err-1",
+        entity_type: "order",
+        local_entity_id: "order-123",
+        operation: "create",
+        priority: 3,
+        status: "error",
+        attempts: 1,
+        last_error: "Jornada no disponible",
+        created_at: new Date().toISOString(),
+      });
+
+      const updated = await normalizeOutboxErrors();
+      expect(updated).toBe(1);
+      const row = state.outbox.find((o) => o.id === "out-err-1");
+      expect(row?.status).toBe("failed");
+    });
   });
 });
+

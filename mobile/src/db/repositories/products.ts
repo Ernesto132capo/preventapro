@@ -280,6 +280,11 @@ export interface NewProductInput {
   productType?: "standard" | "combo";
   presentations: NewPresentationInput[];
   comboDefinition?: ComboDefinitionInput;
+  combo_definition?: ComboDefinitionInput;
+  combo_items?: ComboOptionInput[];
+  options?: ComboOptionInput[];
+  selection_min?: number;
+  selection_max?: number;
 }
 
 export interface EditPresentationInput extends NewPresentationInput {
@@ -293,6 +298,32 @@ export interface UpdateProductInput {
   productType?: "standard" | "combo";
   presentations: EditPresentationInput[];
   comboDefinition?: ComboDefinitionInput;
+  combo_definition?: ComboDefinitionInput;
+  combo_items?: ComboOptionInput[];
+  options?: ComboOptionInput[];
+  selection_min?: number;
+  selection_max?: number;
+}
+
+export function resolveComboDefinition(input: {
+  comboDefinition?: ComboDefinitionInput;
+  combo_definition?: ComboDefinitionInput;
+  combo_items?: ComboOptionInput[];
+  options?: ComboOptionInput[];
+  selection_min?: number;
+  selection_max?: number;
+}): ComboDefinitionInput | undefined {
+  if (input.comboDefinition) return input.comboDefinition;
+  if (input.combo_definition) return input.combo_definition;
+  const opts = input.combo_items || input.options;
+  if (opts && Array.isArray(opts) && opts.length > 0) {
+    return {
+      selectionMin: input.selection_min ?? 1,
+      selectionMax: input.selection_max ?? opts.length,
+      options: opts,
+    };
+  }
+  return undefined;
 }
 
 /** Valida reglas comunes a crear/editar: nombres de presentación no vacíos y únicos. */
@@ -326,9 +357,10 @@ export async function createProductLocal(input: NewProductInput): Promise<Produc
   if (!input.name.trim()) throw new Error("El nombre del producto es obligatorio.");
   validatePresentations(input.presentations);
 
-  const productType = input.productType || "standard";
+  const comboDef = resolveComboDefinition(input);
+  const productType = input.productType || (comboDef ? "combo" : "standard");
   if (productType === "combo") {
-    validateComboDefinition(input.comboDefinition);
+    validateComboDefinition(comboDef);
   }
 
   const db = await getDb();
@@ -352,16 +384,16 @@ export async function createProductLocal(input: NewProductInput): Promise<Produc
       );
     }
 
-    if (productType === "combo" && input.comboDefinition) {
+    if (productType === "combo" && comboDef) {
       const comboDefId = uuid();
       await db.runAsync(
         `INSERT INTO combo_definitions (id, product_id, selection_min, selection_max, active, sync_status)
          VALUES (?, ?, ?, ?, 1, 'pending')`,
-        [comboDefId, productId, input.comboDefinition.selectionMin, input.comboDefinition.selectionMax]
+        [comboDefId, productId, comboDef.selectionMin, comboDef.selectionMax]
       );
 
-      for (let i = 0; i < input.comboDefinition.options.length; i++) {
-        const opt = input.comboDefinition.options[i];
+      for (let i = 0; i < comboDef.options.length; i++) {
+        const opt = comboDef.options[i];
         await db.runAsync(
           `INSERT INTO combo_options (id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
            VALUES (?, ?, ?, ?, ?, 1, 'pending')`,
@@ -381,9 +413,10 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
   if (!input.name.trim()) throw new Error("El nombre del producto es obligatorio.");
   validatePresentations(input.presentations);
 
-  const productType = input.productType || "standard";
+  const comboDef = resolveComboDefinition(input);
+  const productType = input.productType || (comboDef ? "combo" : "standard");
   if (productType === "combo") {
-    validateComboDefinition(input.comboDefinition);
+    validateComboDefinition(comboDef);
   }
 
   const db = await getDb();
@@ -431,7 +464,7 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
       }
     }
 
-    if (productType === "combo" && input.comboDefinition) {
+    if (productType === "combo" && comboDef) {
       const existingDef = await db.getFirstAsync<{ id: string }>(
         `SELECT id FROM combo_definitions WHERE product_id = ? OR (product_id = ? AND product_id IS NOT NULL)`,
         [localProdId, serverProdId]
@@ -441,20 +474,20 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
         comboDefId = existingDef.id;
         await db.runAsync(
           `UPDATE combo_definitions SET product_id = ?, selection_min = ?, selection_max = ?, active = 1, sync_status = 'pending' WHERE id = ?`,
-          [localProdId, input.comboDefinition.selectionMin, input.comboDefinition.selectionMax, comboDefId]
+          [localProdId, comboDef.selectionMin, comboDef.selectionMax, comboDefId]
         );
       } else {
         comboDefId = uuid();
         await db.runAsync(
           `INSERT INTO combo_definitions (id, product_id, selection_min, selection_max, active, sync_status)
            VALUES (?, ?, ?, ?, 1, 'pending')`,
-          [comboDefId, localProdId, input.comboDefinition.selectionMin, input.comboDefinition.selectionMax]
+          [comboDefId, localProdId, comboDef.selectionMin, comboDef.selectionMax]
         );
       }
 
       await db.runAsync(`DELETE FROM combo_options WHERE combo_id = ?`, [comboDefId]);
-      for (let i = 0; i < input.comboDefinition.options.length; i++) {
-        const opt = input.comboDefinition.options[i];
+      for (let i = 0; i < comboDef.options.length; i++) {
+        const opt = comboDef.options[i];
         await db.runAsync(
           `INSERT INTO combo_options (id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
            VALUES (?, ?, ?, ?, ?, 1, 'pending')`,
@@ -492,6 +525,48 @@ export async function deleteProductLocal(productId: string): Promise<void> {
   });
 }
 
+/**
+ * Actualiza en cascada todas las referencias a un producto o presentación local
+ * cuando se le asigna o resuelve su ID canónico del servidor (C-06).
+ */
+export async function remapProductReferences(
+  oldId: string,
+  canonicalId: string,
+  isPresentation = false
+): Promise<void> {
+  if (!oldId || !canonicalId || oldId === canonicalId) return;
+  const db = await getDb();
+
+  if (isPresentation) {
+    // 1. order_items.presentation_id
+    await db.runAsync(`UPDATE order_items SET presentation_id = ? WHERE presentation_id = ?`, [canonicalId, oldId]);
+    // 2. order_item_selections.selected_presentation_id
+    await db.runAsync(`UPDATE order_item_selections SET selected_presentation_id = ? WHERE selected_presentation_id = ?`, [canonicalId, oldId]);
+    // 3. combo_options.presentation_id
+    await db.runAsync(`UPDATE combo_options SET presentation_id = ? WHERE presentation_id = ?`, [canonicalId, oldId]);
+  } else {
+    // 1. product_presentations.product_id
+    await db.runAsync(`UPDATE product_presentations SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+    // 2. combo_definitions.product_id
+    await db.runAsync(`UPDATE combo_definitions SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+    // 3. order_items.product_id
+    await db.runAsync(`UPDATE order_items SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+    // 4. order_item_selections.selected_product_id
+    await db.runAsync(`UPDATE order_item_selections SET selected_product_id = ? WHERE selected_product_id = ?`, [canonicalId, oldId]);
+    // 5. product_favorites.product_id
+    await db.runAsync(`UPDATE product_favorites SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+  }
+}
+
+/**
+ * Actualiza en cascada las referencias a una categoría cuando se remapea a su ID canónico del servidor.
+ */
+export async function remapCategoryReferences(oldCategoryId: string, canonicalCategoryId: string): Promise<void> {
+  if (!oldCategoryId || !canonicalCategoryId || oldCategoryId === canonicalCategoryId) return;
+  const db = await getDb();
+  await db.runAsync(`UPDATE products SET category_id = ? WHERE category_id = ?`, [canonicalCategoryId, oldCategoryId]);
+}
+
 export async function upsertProductFromServer(serverProduct: any) {
   const db = await getDb();
   let localMatch = await db.getFirstAsync<{ id: string; sync_status: string }>(
@@ -505,6 +580,9 @@ export async function upsertProductFromServer(serverProduct: any) {
   }
 
   const targetId = localMatch ? localMatch.id : serverProduct.id;
+  if (localMatch && localMatch.id !== serverProduct.id) {
+    await remapProductReferences(localMatch.id, serverProduct.id, false);
+  }
 
   await db.runAsync(
     `INSERT INTO products (id, server_id, sku, name, category_id, base_cost_cents, base_unit_name, product_type, active, promo_active, sync_status)
@@ -568,10 +646,7 @@ export async function upsertProductFromServer(serverProduct: any) {
 
     // Si la presentación local tenía otro ID pero coincide con la del servidor, actualizar ítems de preventas locales
     if (match && match.id !== pres.id) {
-      await db.runAsync(
-        `UPDATE order_items SET presentation_id = ? WHERE presentation_id = ?`,
-        [match.id, pres.id]
-      );
+      await remapProductReferences(match.id, pres.id, true);
     }
   }
 
@@ -580,6 +655,49 @@ export async function upsertProductFromServer(serverProduct: any) {
     const epNameKey = (ep.name || "").trim().toLowerCase();
     if (!serverPresNames.has(epNameKey) && !serverPresList.some((p: any) => p.id === ep.server_id)) {
       await db.runAsync(`UPDATE product_presentations SET active = 0 WHERE id = ?`, [ep.id]);
+    }
+  }
+
+  // Si el producto incluye definición de combo, sincronizarla localmente
+  if (serverProduct.combo_definition) {
+    const cd = serverProduct.combo_definition;
+    const existingDef = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ?`,
+      [cd.id, targetId]
+    );
+    const targetDefId = existingDef ? existingDef.id : cd.id;
+    await db.runAsync(
+      `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
+       VALUES (?, ?, ?, ?, ?, ?, 'synced')
+       ON CONFLICT(id) DO UPDATE SET
+         server_id = excluded.server_id, product_id = excluded.product_id,
+         selection_min = excluded.selection_min, selection_max = excluded.selection_max,
+         active = excluded.active, sync_status = 'synced'`,
+      [targetDefId, cd.id, targetId, cd.selection_min, cd.selection_max, cd.active ?? 1]
+    );
+
+    if (Array.isArray(cd.options)) {
+      for (const co of cd.options) {
+        const localPres = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+          [co.presentation_id, co.presentation_id]
+        );
+        const targetPresId = localPres ? localPres.id : co.presentation_id;
+        const existingOpt = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+          [co.id, co.id, targetDefId, targetPresId]
+        );
+        const targetOptId = existingOpt ? existingOpt.id : co.id;
+        await db.runAsync(
+          `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
+           ON CONFLICT(id) DO UPDATE SET
+             server_id = excluded.server_id, combo_id = excluded.combo_id,
+             presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
+             sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
+          [targetOptId, co.id, targetDefId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
+        );
+      }
     }
   }
 }

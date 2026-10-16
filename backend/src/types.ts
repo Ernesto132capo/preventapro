@@ -66,6 +66,7 @@ export interface ComboDefinition {
 
 export interface Product {
   id: string;
+  server_id?: string | null;
   sku: string;
   name: string;
   category_id: string | null;

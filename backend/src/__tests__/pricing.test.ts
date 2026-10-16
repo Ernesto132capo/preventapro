@@ -136,4 +136,40 @@ describe("pricing", () => {
     expect(result.unit_price_cents_snapshot).toBe(750);
     expect(result.subtotal_cents).toBe(3750);
   });
+
+  it("permite asociar presentación cuando presentation.product_id coincide con product.server_id", () => {
+    const productWithServerId: Product = {
+      ...product,
+      id: "local-uuid-123",
+      server_id: "server-uuid-456",
+    };
+    const lookupServerId: LookupFn = (productId, presentationId) => {
+      if (productId !== "local-uuid-123" || presentationId !== "pr-srv") return null;
+      return {
+        product: productWithServerId,
+        presentation: {
+          id: "pr-srv",
+          product_id: "server-uuid-456",
+          name: "Unidad Server",
+          sort_order: 1,
+          unit_equivalence: 1,
+          price_cents: 1000,
+          cost_cents: 800,
+          active: 1,
+        },
+      };
+    };
+    const snapshot = buildOrderItemSnapshot(
+      { product_id: "local-uuid-123", presentation_id: "pr-srv", quantity: 2 },
+      lookupServerId
+    );
+    expect(snapshot.subtotal_cents).toBe(2000);
+  });
+
+  it("exporta centsToBs con el mismo formato que centsToDisplay", async () => {
+    const { centsToBs } = await import("../services/pricing");
+    expect(centsToBs(15600)).toBe("Bs. 156.00");
+    expect(centsToBs(750)).toBe("Bs. 7.50");
+  });
 });
+

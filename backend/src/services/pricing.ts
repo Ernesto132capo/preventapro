@@ -51,7 +51,10 @@ export function buildOrderItemSnapshot(
     throw new PricingError("Producto o presentación no encontrados o inactivos.");
   }
   const { product, presentation } = found;
-  if (presentation.product_id !== product.id) {
+  const matches =
+    presentation.product_id === product.id ||
+    (product.server_id != null && presentation.product_id === product.server_id);
+  if (!matches) {
     throw new PricingError("La presentación no pertenece a este producto.");
   }
 
@@ -101,3 +104,5 @@ export class PricingError extends Error {
 export function centsToDisplay(cents: number): string {
   return "Bs. " + (cents / 100).toFixed(2);
 }
+
+export const centsToBs = centsToDisplay;

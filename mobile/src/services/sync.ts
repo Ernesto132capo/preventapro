@@ -8,11 +8,18 @@ import {
   markPermanentError,
   deferForDependency,
   deferForRetry,
+  normalizeOutboxErrors,
   OutboxRow,
 } from "../db/outbox";
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
 import { upsertCategoryFromServer, resolveServerCategoryId } from "../db/repositories/categories";
-import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
+import {
+  upsertProductFromServer,
+  resolveServerPresentationId,
+  resolveServerProductId,
+  remapProductReferences,
+  remapCategoryReferences,
+} from "../db/repositories/products";
 import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay, markWorkDayClosed } from "../db/repositories/workdays";
 
@@ -219,9 +226,11 @@ async function pushCategory(row: OutboxRow) {
   if (category.server_id) {
     const res = await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "PUT", body });
     await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
+    await remapCategoryReferences(category.id, res.category.id);
   } else {
     const res = await apiFetch<any>(`/catalog/categories`, { method: "POST", body });
     await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
+    await remapCategoryReferences(category.id, res.category.id);
   }
   await markDone(row.id);
 }
@@ -359,6 +368,7 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
     serverProduct.category_id ?? product.category_id,
     product.id,
   ]);
+  await remapProductReferences(product.id, serverProduct.id, false);
   if (serverProduct.combo_definition) {
     await db.runAsync(
       `UPDATE combo_definitions SET server_id = ?, sync_status = 'synced' WHERE product_id = ? OR (product_id = ? AND product_id IS NOT NULL)`,
@@ -371,6 +381,7 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
     const serverPres = serverProduct.presentations.find((sp: any) => sp.name === localPres.name);
     if (serverPres) {
       await db.runAsync(`UPDATE product_presentations SET server_id = ? WHERE id = ?`, [serverPres.id, localPres.id]);
+      await remapProductReferences(localPres.id, serverPres.id, true);
     }
   }
   await markDone(row.id);
@@ -754,6 +765,13 @@ async function rescueLocalConflict(userId: string) {
     );
   } catch (e) {
     console.warn("[rescueLocalConflict] Error limpiando outbox trabado:", e);
+  }
+
+  // Rescatar filas que hayan quedado en 'error' para que vuelvan a intentar sincronizarse
+  try {
+    await normalizeOutboxErrors();
+  } catch (e) {
+    console.warn("[rescueLocalConflict] Error normalizando outbox:", e);
   }
 }
 

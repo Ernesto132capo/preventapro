@@ -120,3 +120,14 @@ export async function discardFailed(): Promise<number> {
   const result = await db.runAsync(`UPDATE outbox SET status = 'done', last_error = NULL WHERE status IN ('failed', 'error')`);
   return result.changes ?? 0;
 }
+
+/**
+ * Normaliza filas que hayan quedado en estado 'error' a 'failed'
+ * para que sean recuperadas y reintentadas en la sincronización.
+ */
+export async function normalizeOutboxErrors(): Promise<number> {
+  const db = await getDb();
+  const res = await db.runAsync(`UPDATE outbox SET status = 'failed' WHERE status = 'error'`);
+  return res.changes ?? 0;
+}
+
