@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, StyleSheet, ScrollView } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -23,6 +23,7 @@ export function ClientFormScreen() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(isEditing);
+  const isSubmittingRef = useRef(false);
 
   useEffect(() => {
     navigation.setOptions({ title: isEditing ? "Editar Cliente" : "Alta Rápida de Cliente" });
@@ -40,33 +41,47 @@ export function ClientFormScreen() {
   }, [clientId]);
 
   async function handleSave() {
+    if (isSubmittingRef.current || saving) return;
     setError(null);
-    if (!businessName.trim()) {
+    const trimmedBusinessName = businessName.trim();
+    if (!trimmedBusinessName) {
       setError("El nombre del negocio es obligatorio.");
       return;
     }
+    isSubmittingRef.current = true;
     setSaving(true);
     try {
       const client = isEditing
-        ? await updateClientLocal(clientId!, { businessName, contactName, phone, address })
-        : await createClientLocal({ businessName, contactName, phone, address });
+        ? await updateClientLocal(clientId!, {
+            businessName: trimmedBusinessName,
+            contactName: contactName.trim() || undefined,
+            phone: phone.trim() || undefined,
+            address: address.trim() || undefined,
+          })
+        : await createClientLocal({
+            businessName: trimmedBusinessName,
+            contactName: contactName.trim() || undefined,
+            phone: phone.trim() || undefined,
+            address: address.trim() || undefined,
+          });
       await pushSync();
-      setSaving(false);
       if (returnToPreventa && !isEditing) {
         navigation.navigate("Tabs", { screen: "Preventa", params: { preselectedClientId: client.id } });
       } else {
         navigation.goBack();
       }
     } catch (err: any) {
-      setSaving(false);
       setError(err.message || "No se pudo guardar el cliente.");
+    } finally {
+      isSubmittingRef.current = false;
+      setSaving(false);
     }
   }
 
   if (loading) return null;
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }}>
+    <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
       <Field label="Nombre del negocio *" value={businessName} onChangeText={setBusinessName} placeholder="Tienda Doña Rosa" />
       <Field label="Propietario o contacto" value={contactName} onChangeText={setContactName} placeholder="Rosa Mamani" />
       <Field label="Teléfono / WhatsApp" value={phone} onChangeText={setPhone} placeholder="77712345" keyboardType="phone-pad" />
@@ -82,6 +97,7 @@ export function ClientFormScreen() {
         label={isEditing ? "Guardar Cambios" : "Guardar Cliente"}
         onPress={handleSave}
         loading={saving}
+        disabled={saving}
         style={{ marginTop: spacing.lg }}
       />
     </ScrollView>

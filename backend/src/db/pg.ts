@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Pool, types } from "pg";
 
 // ─── IMPORTANTE: columnas de fecha son TIMESTAMPTZ, no TEXT ────────────────

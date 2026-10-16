@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, StyleSheet, ScrollView, Pressable, Alert, Modal, FlatList } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
@@ -58,6 +58,7 @@ export function ProductFormScreen() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(isEditing);
+  const isSubmittingRef = useRef(false);
 
   useEffect(() => {
     navigation.setOptions({ title: isEditing ? "Editar Producto" : "Registrar Producto" });
@@ -118,7 +119,7 @@ export function ProductFormScreen() {
         if (i !== idx) return p;
         if (field === "name") return { ...p, name: value };
         const num = Math.round(parseFloat(value || "0") * (field === "priceCents" || field === "costCents" ? 100 : 1));
-        return { ...p, [field]: isNaN(num) ? 0 : num };
+        return { ...p, [field]: isNaN(num) || num < 0 ? 0 : num };
       })
     );
   }
@@ -165,41 +166,143 @@ export function ProductFormScreen() {
   }
 
   async function handleSave() {
+    if (isSubmittingRef.current || saving) return;
     setError(null);
-    setSaving(true);
-    try {
+
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("El nombre del producto es obligatorio.");
+      Alert.alert("Dato requerido", "El nombre del producto es obligatorio.");
+      return;
+    }
+
+    let comboDefPayload: { selectionMin: number; selectionMax: number; options: ComboOptionInput[] } | undefined;
+    let presToSave: EditPresentationInput[] = presentations;
+
+    if (productType === "combo") {
       const min = parseInt(selectionMin, 10);
       const max = parseInt(selectionMax, 10);
 
-      const comboDefPayload =
-        productType === "combo"
-          ? {
-              selectionMin: isNaN(min) ? 1 : min,
-              selectionMax: isNaN(max) ? 1 : max,
-              options: comboOptions.map((o, i) => ({
-                presentationId: o.presentationId,
-                maxQuantity: o.maxQuantity ? parseInt(o.maxQuantity, 10) : null,
-                sortOrder: i,
-              })),
-            }
-          : undefined;
+      if (!Number.isSafeInteger(min) || min <= 0) {
+        setError("La cantidad mínima del combo debe ser un entero mayor a 0.");
+        Alert.alert("Configuración de combo inválida", "La cantidad mínima debe ser un número entero mayor a 0.");
+        return;
+      }
+      if (!Number.isSafeInteger(max) || max <= 0) {
+        setError("La cantidad máxima del combo debe ser un entero mayor a 0.");
+        Alert.alert("Configuración de combo inválida", "La cantidad máxima debe ser un número entero mayor a 0.");
+        return;
+      }
+      if (max < min) {
+        setError("La cantidad máxima no puede ser menor al mínimo.");
+        Alert.alert("Configuración de combo inválida", "La cantidad máxima no puede ser menor a la cantidad mínima.");
+        return;
+      }
+      if (comboOptions.length === 0) {
+        setError("Agrega al menos una opción para el combo.");
+        Alert.alert("Opciones requeridas", "Debes configurar al menos una opción para el combo.");
+        return;
+      }
 
-      const presToSave =
-        productType === "combo"
-          ? [
-              {
-                ...(presentations[0] || { priceCents: 0, costCents: 0 }),
-                name: (presentations[0]?.name || "").trim() || "Pack",
-                unitEquivalence: presentations[0]?.unitEquivalence || 1,
-                priceCents: presentations[0]?.priceCents || 0,
-                costCents: presentations[0]?.costCents || 0,
-              },
-            ]
-          : presentations;
+      for (const opt of comboOptions) {
+        if (opt.maxQuantity && opt.maxQuantity.trim() !== "") {
+          const parsedMax = parseInt(opt.maxQuantity.trim(), 10);
+          if (!Number.isSafeInteger(parsedMax) || parsedMax <= 0) {
+            setError(`La cantidad máxima para "${opt.productName}" debe ser un entero mayor a 0.`);
+            Alert.alert("Opción inválida", `La cantidad máxima para "${opt.productName} (${opt.presentationName})" debe ser un número entero mayor a 0.`);
+            return;
+          }
+        }
+      }
 
+      const firstPres = presentations[0] || { priceCents: 0, costCents: 0, name: "Pack", unitEquivalence: 1 };
+      const priceCents = firstPres.priceCents ?? 0;
+      if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
+        setError("El precio de venta del combo no puede ser negativo.");
+        Alert.alert("Precio inválido", "El precio de venta del combo debe ser un monto válido mayor o igual a 0.");
+        return;
+      }
+      const costCents = firstPres.costCents ?? 0;
+      if (!Number.isSafeInteger(costCents) || costCents < 0) {
+        setError("El costo del combo no puede ser negativo.");
+        Alert.alert("Costo inválido", "El costo del combo debe ser un monto válido mayor o igual a 0.");
+        return;
+      }
+
+      comboDefPayload = {
+        selectionMin: min,
+        selectionMax: max,
+        options: comboOptions.map((o, i) => ({
+          presentationId: o.presentationId,
+          maxQuantity: o.maxQuantity && o.maxQuantity.trim() !== "" ? parseInt(o.maxQuantity.trim(), 10) : null,
+          sortOrder: i,
+        })),
+      };
+
+      presToSave = [
+        {
+          ...firstPres,
+          name: (firstPres.name || "").trim() || "Pack",
+          unitEquivalence: 1,
+          priceCents,
+          costCents,
+        },
+      ];
+    } else {
+      if (presentations.length === 0) {
+        setError("Configura al menos una presentación.");
+        Alert.alert("Presentaciones requeridas", "Debes configurar al menos una presentación para el producto.");
+        return;
+      }
+
+      const seenNames = new Set<string>();
+      for (let i = 0; i < presentations.length; i++) {
+        const p = presentations[i];
+        const pName = (p.name || "").trim();
+        if (!pName) {
+          setError(`La presentación #${i + 1} requiere un nombre.`);
+          Alert.alert("Nombre requerido", `Ingresa un nombre para la presentación #${i + 1} (ej. Unidad, Caja).`);
+          return;
+        }
+        const pKey = pName.toLowerCase();
+        if (seenNames.has(pKey)) {
+          setError(`Ya existe una presentación con el nombre "${pName}".`);
+          Alert.alert("Presentación duplicada", `No puedes tener dos presentaciones llamadas "${pName}".`);
+          return;
+        }
+        seenNames.add(pKey);
+
+        if (!Number.isSafeInteger(p.unitEquivalence) || p.unitEquivalence <= 0) {
+          setError(`La equivalencia de "${pName}" debe ser un número entero mayor a 0.`);
+          Alert.alert("Equivalencia inválida", `La equivalencia en unidades para "${pName}" debe ser al menos 1.`);
+          return;
+        }
+
+        if (!Number.isSafeInteger(p.priceCents) || p.priceCents < 0) {
+          setError(`El precio de "${pName}" no puede ser negativo.`);
+          Alert.alert("Precio inválido", `El precio de venta para "${pName}" debe ser un monto válido mayor o igual a 0.`);
+          return;
+        }
+
+        if (p.costCents !== undefined && (!Number.isSafeInteger(p.costCents) || p.costCents < 0)) {
+          setError(`El costo de "${pName}" no puede ser negativo.`);
+          Alert.alert("Costo inválido", `El costo para "${pName}" debe ser mayor o igual a 0.`);
+          return;
+        }
+      }
+
+      presToSave = presentations.map((p) => ({
+        ...p,
+        name: p.name.trim(),
+      }));
+    }
+
+    isSubmittingRef.current = true;
+    setSaving(true);
+    try {
       if (isEditing) {
         await updateProductLocal(productId!, {
-          name: name.trim(),
+          name: trimmedName,
           categoryId: categoryId || undefined,
           productType,
           presentations: presToSave,
@@ -207,7 +310,7 @@ export function ProductFormScreen() {
         });
       } else {
         await createProductLocal({
-          name: name.trim(),
+          name: trimmedName,
           categoryId: categoryId || undefined,
           productType,
           presentations: presToSave,
@@ -215,24 +318,37 @@ export function ProductFormScreen() {
         });
       }
       await pushSync();
-      setSaving(false);
       navigation.goBack();
     } catch (err: any) {
-      setSaving(false);
       setError(err.message || "No se pudo guardar el producto.");
       Alert.alert("Error al guardar", err.message || "No se pudo guardar el producto.");
+    } finally {
+      isSubmittingRef.current = false;
+      setSaving(false);
     }
   }
 
   function handleDelete() {
+    if (isSubmittingRef.current || saving) return;
     Alert.alert("Eliminar producto", `¿Seguro que quieres eliminar "${name}"? Esta acción no se puede deshacer.`, [
       { text: "Cancelar", style: "cancel" },
       {
         text: "Eliminar",
         style: "destructive",
         onPress: async () => {
-          await deleteProductLocal(productId!);
-          navigation.goBack();
+          if (isSubmittingRef.current || saving) return;
+          isSubmittingRef.current = true;
+          setSaving(true);
+          try {
+            await deleteProductLocal(productId!);
+            await pushSync();
+            navigation.goBack();
+          } catch (err: any) {
+            Alert.alert("Error", err.message || "No se pudo eliminar el producto.");
+          } finally {
+            isSubmittingRef.current = false;
+            setSaving(false);
+          }
         },
       },
     ]);
@@ -241,7 +357,7 @@ export function ProductFormScreen() {
   if (loading) return null;
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }}>
+    <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
       <Field label="Nombre del producto *" value={name} onChangeText={setName} placeholder="ej. Cereal Chocolate o Combo Cereales x4" />
 
       {/* Selector de Categoría */}
@@ -401,10 +517,23 @@ export function ProductFormScreen() {
 
       {error && <Text style={styles.error}>{error}</Text>}
 
-      <Button label={isEditing ? "Guardar Cambios" : "Guardar Producto"} onPress={handleSave} loading={saving} style={{ marginTop: spacing.lg }} />
+      <Button
+        label={isEditing ? "Guardar Cambios" : "Guardar Producto"}
+        onPress={handleSave}
+        loading={saving}
+        disabled={saving}
+        style={{ marginTop: spacing.lg }}
+      />
 
       {isEditing && (
-        <Button label="Eliminar Producto" onPress={handleDelete} variant="danger" style={{ marginTop: spacing.md }} />
+        <Button
+          label="Eliminar Producto"
+          onPress={handleDelete}
+          variant="danger"
+          disabled={saving}
+          loading={saving}
+          style={{ marginTop: spacing.md }}
+        />
       )}
 
       {/* Modal de categorías */}

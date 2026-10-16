@@ -171,29 +171,37 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   }
 });
 
-workdaysRouter.get("/history", async (req: AuthedRequest, res) => {
-  const { rows } = await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND status = 'closed' ORDER BY work_date DESC", [req.userId]);
-  res.json({ workDays: rows.map(serial) });
+workdaysRouter.get("/history", async (req: AuthedRequest, res, next) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND status = 'closed' ORDER BY work_date DESC", [req.userId]);
+    res.json({ workDays: rows.map(serial) });
+  } catch (err) {
+    next(err);
+  }
 });
 
-workdaysRouter.get("/:id/orders", async (req: AuthedRequest, res) => {
-  const workDay = await pool.query("SELECT id FROM work_days WHERE id = $1 AND user_id = $2", [req.params.id, req.userId]);
-  if (workDay.rows.length === 0) return res.status(404).json({ error: "Jornada no encontrada." });
-  const { rows } = await pool.query(
-    `SELECT o.*, c.business_name, c.neighborhood_id AS client_neighborhood_id
-     FROM orders o
-     JOIN clients c ON c.id = o.client_id
-     WHERE o.work_day_id = $1 AND o.status = 'active'`,
-    [req.params.id]
-  );
-  const orders = rows.map((row) => ({
-    ...row,
-    client_id: row.client_id,
-    work_day_id: row.work_day_id,
-    business_name: row.business_name ?? "",
-    neighborhood_id: row.client_neighborhood_id ?? null,
-  }));
-  res.json({ orders });
+workdaysRouter.get("/:id/orders", async (req: AuthedRequest, res, next) => {
+  try {
+    const workDay = await pool.query("SELECT id FROM work_days WHERE id = $1 AND user_id = $2", [req.params.id, req.userId]);
+    if (workDay.rows.length === 0) return res.status(404).json({ error: "Jornada no encontrada." });
+    const { rows } = await pool.query(
+      `SELECT o.*, c.business_name, c.neighborhood_id AS client_neighborhood_id
+       FROM orders o
+       JOIN clients c ON c.id = o.client_id
+       WHERE o.work_day_id = $1 AND o.status = 'active'`,
+      [req.params.id]
+    );
+    const orders = rows.map((row) => ({
+      ...row,
+      client_id: row.client_id,
+      work_day_id: row.work_day_id,
+      business_name: row.business_name ?? "",
+      neighborhood_id: row.client_neighborhood_id ?? null,
+    }));
+    res.json({ orders });
+  } catch (err) {
+    next(err);
+  }
 });
 
 workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {

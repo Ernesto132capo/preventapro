@@ -11,6 +11,8 @@ import { Client } from "../domain/types";
 import { useSync } from "../context/SyncContext";
 import { useDebounce } from "../utils/useDebounce";
 
+const clientKeyExtractor = (c: Client) => c.id;
+
 export function ClientsScreen() {
   const navigation = useNavigation<any>();
   const { syncTick } = useSync();
@@ -75,14 +77,22 @@ export function ClientsScreen() {
         placeholderTextColor={colors.textMuted}
         value={search}
         onChangeText={setSearch}
+        autoCapitalize="none"
+        autoCorrect={false}
+        clearButtonMode="while-editing"
       />
 
       <FlatList
         data={clients}
-        keyExtractor={(c) => c.id}
+        keyExtractor={clientKeyExtractor}
+        keyboardShouldPersistTaps="handled"
         renderItem={renderClientItem}
         contentContainerStyle={{ padding: spacing.lg, paddingTop: 0 }}
-        ListEmptyComponent={<EmptyState message="No tienes clientes registrados." />}
+        ListEmptyComponent={
+          <EmptyState
+            message={debouncedSearch ? "No se encontraron clientes para tu búsqueda." : "No tienes clientes registrados."}
+          />
+        }
         initialNumToRender={10}
         maxToRenderPerBatch={10}
         windowSize={5}

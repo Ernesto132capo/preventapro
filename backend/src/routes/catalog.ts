@@ -147,72 +147,96 @@ async function serialProduct(row: any) {
 
 // ─── Categorías CRUD ──────────────────────────────────────────────────────────
 
-catalogRouter.get("/categories", async (_req, res) => {
-  const { rows } = await pool.query("SELECT * FROM categories WHERE active = true ORDER BY name");
-  res.json({ categories: rows.map((r) => ({ ...r, active: r.active === false ? 0 : 1 })) });
-});
-
-catalogRouter.post("/categories", async (req, res) => {
-  const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-  const { name } = parsed.data;
-  const existing = await pool.query("SELECT id, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [name]);
-  const ts = nowIso();
-  if (existing.rows.length > 0) {
-    const row = existing.rows[0];
-    if (row.active === false) {
-      // Reactivar categoría previa con el mismo nombre
-      await pool.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [row.id, ts]);
-    }
-    invalidatePullCache("products");
-    return res.json({ category: { id: row.id, name, active: 1, created_at: ts, updated_at: ts } });
+catalogRouter.get("/categories", async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM categories WHERE active = true ORDER BY name");
+    res.json({ categories: rows.map((r) => ({ ...r, active: r.active === false ? 0 : 1 })) });
+  } catch (err) {
+    next(err);
   }
-  const id = uuid();
-  await pool.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [id, name, ts]);
-  invalidatePullCache("products");
-  res.status(201).json({ category: { id, name, active: 1, created_at: ts, updated_at: ts } });
 });
 
-catalogRouter.put("/categories/:id", async (req, res) => {
-  const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-  const { name } = parsed.data;
-  const ts = nowIso();
-  const { rows } = await pool.query(
-    "UPDATE categories SET name = $2, updated_at = $3 WHERE id = $1 RETURNING *",
-    [req.params.id, name, ts]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: "Categoría no encontrada." });
-  invalidatePullCache("products");
-  res.json({ category: { ...rows[0], active: rows[0].active === false ? 0 : 1 } });
+catalogRouter.post("/categories", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+    const { name } = parsed.data;
+    const existing = await pool.query("SELECT id, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [name]);
+    const ts = nowIso();
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      if (row.active === false) {
+        // Reactivar categoría previa con el mismo nombre
+        await pool.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [row.id, ts]);
+      }
+      invalidatePullCache("products");
+      return res.json({ category: { id: row.id, name, active: 1, created_at: ts, updated_at: ts } });
+    }
+    const id = uuid();
+    await pool.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [id, name, ts]);
+    invalidatePullCache("products");
+    res.status(201).json({ category: { id, name, active: 1, created_at: ts, updated_at: ts } });
+  } catch (err) {
+    next(err);
+  }
 });
 
-catalogRouter.delete("/categories/:id", async (req, res) => {
-  const ts = nowIso();
-  const { rowCount } = await pool.query("UPDATE categories SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, ts]);
-  if (rowCount === 0) return res.status(404).json({ error: "Categoría no encontrada." });
-  invalidatePullCache("products");
-  res.json({ ok: true });
+catalogRouter.put("/categories/:id", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+    const { name } = parsed.data;
+    const ts = nowIso();
+    const { rows } = await pool.query(
+      "UPDATE categories SET name = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+      [req.params.id, name, ts]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Categoría no encontrada." });
+    invalidatePullCache("products");
+    res.json({ category: { ...rows[0], active: rows[0].active === false ? 0 : 1 } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+catalogRouter.delete("/categories/:id", async (req: AuthedRequest, res, next) => {
+  try {
+    const ts = nowIso();
+    const { rowCount } = await pool.query("UPDATE categories SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, ts]);
+    if (rowCount === 0) return res.status(404).json({ error: "Categoría no encontrada." });
+    invalidatePullCache("products");
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ─── Productos CRUD ───────────────────────────────────────────────────────────
 
-catalogRouter.get("/products", async (req, res) => {
-  const { q, categoryId } = req.query as { q?: string; categoryId?: string };
-  const conditions: string[] = ["active = true"];
-  const params: any[] = [];
-  if (categoryId) { params.push(categoryId); conditions.push(`category_id = $${params.length}`); }
-  if (q) { params.push(`%${q.toLowerCase()}%`); conditions.push(`(lower(name) || ' ' || lower(sku)) LIKE $${params.length}`); }
-  const { rows } = await pool.query(`SELECT * FROM products WHERE ${conditions.join(" AND ")} ORDER BY name`, params);
-  const products = await Promise.all(rows.map(serialProduct));
-  res.json({ products });
+catalogRouter.get("/products", async (req, res, next) => {
+  try {
+    const { q, categoryId } = req.query as { q?: string; categoryId?: string };
+    const conditions: string[] = ["active = true"];
+    const params: any[] = [];
+    if (categoryId) { params.push(categoryId); conditions.push(`category_id = $${params.length}`); }
+    if (q) { params.push(`%${q.toLowerCase()}%`); conditions.push(`(lower(name) || ' ' || lower(sku)) LIKE $${params.length}`); }
+    const { rows } = await pool.query(`SELECT * FROM products WHERE ${conditions.join(" AND ")} ORDER BY name`, params);
+    const products = await Promise.all(rows.map(serialProduct));
+    res.json({ products });
+  } catch (err) {
+    next(err);
+  }
 });
 
-catalogRouter.get("/products/:id", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM products WHERE id = $1", [req.params.id]);
-  const row = rows[0];
-  if (!row || row.active === false) return res.status(404).json({ error: "Producto no encontrado." });
-  res.json({ product: await serialProduct(row) });
+catalogRouter.get("/products/:id", async (req, res, next) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products WHERE id = $1", [req.params.id]);
+    const row = rows[0];
+    if (!row || row.active === false) return res.status(404).json({ error: "Producto no encontrado." });
+    res.json({ product: await serialProduct(row) });
+  } catch (err) {
+    next(err);
+  }
 });
 
 catalogRouter.post("/products", async (req: AuthedRequest, res) => {
@@ -292,7 +316,7 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
     invalidatePullCache("products");
     res.status(201).json({ product: await serialProduct(rows[0]) });
   } catch (err: any) {
-    await client.query("ROLLBACK");
+    try { await client.query("ROLLBACK"); } catch { /* connection lost */ }
     res.status(400).json({ error: err.message || "Error al registrar el producto." });
   } finally {
     client.release();
@@ -407,16 +431,21 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
     invalidatePullCache("products");
     res.json({ product: await serialProduct(refreshed[0]) });
   } catch (err: any) {
-    await client.query("ROLLBACK");
+    try { await client.query("ROLLBACK"); } catch { /* connection lost */ }
     res.status(400).json({ error: err.message || "Error al actualizar el producto." });
   } finally {
     client.release();
   }
 });
 
-catalogRouter.delete("/products/:id", async (req, res) => {
-  await pool.query("UPDATE products SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
-  invalidatePullCache("products");
-  res.json({ ok: true });
+catalogRouter.delete("/products/:id", async (req: AuthedRequest, res, next) => {
+  try {
+    const { rowCount } = await pool.query("UPDATE products SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
+    if (rowCount === 0) return res.status(404).json({ error: "Producto no encontrado." });
+    invalidatePullCache("products");
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 });
 

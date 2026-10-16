@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "vitest run",
+    "migrate": "tsx scripts/migrate.ts",
     "migrate:combos": "tsx scripts/migrate-combos.ts",
     "migrate:auth": "tsx scripts/migrate-auth.ts",
     "migrate:remove-stock": "tsx scripts/migrate-remove-stock.ts",

@@ -327,10 +327,14 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
   }
 });
 
-ordersRouter.get("/:id", async (req: AuthedRequest, res) => {
-  const o = await full(req.params.id);
-  if (!o || o.user_id !== req.userId) return res.status(404).json({ error: "Preventa no encontrada." });
-  res.json({ order: o });
+ordersRouter.get("/:id", async (req: AuthedRequest, res, next) => {
+  try {
+    const o = await full(req.params.id);
+    if (!o || o.user_id !== req.userId) return res.status(404).json({ error: "Preventa no encontrada." });
+    res.json({ order: o });
+  } catch (err) {
+    next(err);
+  }
 });
 
 ordersRouter.put("/:id", async (req: AuthedRequest, res) => {

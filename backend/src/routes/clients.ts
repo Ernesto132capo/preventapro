@@ -38,15 +38,19 @@ function isConstraintViolation(error: unknown): boolean {
   );
 }
 
-clientsRouter.get("/", async (_req, res) => {
-  const { rows } = await pool.query(
-    `SELECT c.*, n.name AS neighborhood_name
-     FROM clients c
-     LEFT JOIN neighborhoods n ON n.id = c.neighborhood_id
-     WHERE c.active = true
-     ORDER BY c.business_name`
-  );
-  res.json({ clients: rows.map(serializeClient) });
+clientsRouter.get("/", async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.*, n.name AS neighborhood_name
+       FROM clients c
+       LEFT JOIN neighborhoods n ON n.id = c.neighborhood_id
+       WHERE c.active = true
+       ORDER BY c.business_name`
+    );
+    res.json({ clients: rows.map(serializeClient) });
+  } catch (err) {
+    next(err);
+  }
 });
 
 clientsRouter.post("/", async (req: AuthedRequest, res) => {
