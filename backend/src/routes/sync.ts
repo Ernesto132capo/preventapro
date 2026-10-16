@@ -120,6 +120,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   let forcedKey: string | undefined;
   try {
     const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
+    const pullKey = `${req.userId}:${since}`;
     const isInitial = !req.query.since || since.startsWith("1970");
     const requestedForce = req.query.force === "1";
 
@@ -139,7 +140,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // `force` omite el payload compuesto, pero conserva las cachés por dominio.
     // Las mutaciones ya invalidan solamente su dominio; así un refresh no vuelve
     // a descargar productos/clientes que no cambiaron.
-    const cached = !force && !isInitial ? pullCache.get(since) : undefined;
+    const cached = !force && !isInitial ? pullCache.get(pullKey) : undefined;
     if (cached) {
       const clientEtag = req.headers["if-none-match"];
       if (clientEtag === cached.etag) {
@@ -152,13 +153,13 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // Varias pantallas/dispositivos pueden disparar refresh al mismo tiempo.
     // El primero consulta Postgres; los demás esperan exactamente ese resultado.
     if (force) {
-      const inFlight = forcedPullsInFlight.get(since);
+      const inFlight = forcedPullsInFlight.get(pullKey);
       if (inFlight) {
         const shared = await inFlight;
         res.setHeader("ETag", shared.etag);
         return res.json(JSON.parse(shared.payload));
       }
-      forcedKey = since;
+      forcedKey = pullKey;
       const resolvableTask = new Promise<PullCache>((resolve, reject) => {
         resolveForcedPull = resolve;
         rejectForcedPull = reject;
@@ -192,8 +193,8 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       cachedRows("neighborhoods", neighborhoodQueryCache, cursorKey, async () =>
         isInitial ? (await pool.query("SELECT * FROM neighborhoods WHERE active = true")).rows : [],
         force),
-      cachedRows("workdays", workdayQueryCache, todayDate, async () =>
-        (await pool.query("SELECT * FROM work_days WHERE work_date = $1", [todayDate])).rows,
+      cachedRows("workdays", workdayQueryCache, `${req.userId}:${todayDate}`, async () =>
+        (await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2", [req.userId, todayDate])).rows,
         force),
       cachedRows("combo_definitions", comboDefQueryCache, cursorKey, async () =>
         isInitial
@@ -230,7 +231,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       const orderRows = await cachedRows("orders", orderQueryCache, todayWorkDayRow.id, async () =>
         (await pool.query("SELECT * FROM orders WHERE work_day_id = $1", [todayWorkDayRow.id])).rows,
         force);
-      const activeOrders = orderRows.filter((row) => row.status !== "cancelled");
+      const activeOrders = orderRows.filter((row) => row.status === "active");
 
       if (activeOrders.length > 0) {
         // Batch de items en paralelo (en vez de await secuencial)
@@ -372,7 +373,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       res.setHeader("ETag", etag);
     } else if (!isInitial) {
       if (pullCache.size >= MAX_PULL_CACHE_ENTRIES) pullCache.delete(pullCache.keys().next().value!);
-      pullCache.set(since, { etag, payload });
+      pullCache.set(pullKey, { etag, payload });
       res.setHeader("ETag", etag);
     }
 

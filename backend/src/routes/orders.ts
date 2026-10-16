@@ -198,7 +198,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
 
 async function totals(client: PoolClient, workDayId: string) {
   const { rows } = await client.query(
-    "SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders WHERE work_day_id = $1 AND status != 'cancelled'",
+    "SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders WHERE work_day_id = $1 AND status = 'active'",
     [workDayId]
   );
   await client.query("UPDATE work_days SET order_count = $2, total_cents = $3, updated_at = $4 WHERE id = $1", [workDayId, rows[0].count, rows[0].total, nowIso()]);
@@ -219,11 +219,20 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     await client.query("BEGIN");
     inTransaction = true;
 
+    // Comparte el lock del ciclo de vida de jornadas para serializar ventas
+    // con aperturas/cierres del mismo preventista.
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
+
     // El lock transaccional serializa reintentos simultáneos con la misma clave,
     // incluso en instalaciones que aún no tengan un índice UNIQUE para ella.
     await client.query("SELECT pg_advisory_xact_lock(1002, hashtext($1))", [d.idempotencyKey]);
-    const existing = await client.query("SELECT id FROM orders WHERE idempotency_key = $1 LIMIT 1", [d.idempotencyKey]);
+    const existing = await client.query("SELECT id, user_id FROM orders WHERE idempotency_key = $1 LIMIT 1", [d.idempotencyKey]);
     if (existing.rows.length > 0) {
+      if (existing.rows[0].user_id !== req.userId) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        return res.status(404).json({ error: "Preventa no encontrada." });
+      }
       const existingOrder = await full(existing.rows[0].id, client);
       await client.query("COMMIT");
       inTransaction = false;
@@ -234,7 +243,7 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     // anteriores a esta preventa o la cierre entre validación e inserción.
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [d.workDayId]);
     const wd = wdRows[0];
-    if (!wd) {
+    if (!wd || wd.user_id !== req.userId) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
@@ -243,6 +252,15 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
+    }
+    const otherOpen = await client.query(
+      "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2 LIMIT 1",
+      [req.userId, wd.id]
+    );
+    if (otherOpen.rows.length > 0) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(409).json({ error: "Hay otra jornada abierta para este preventista. Resuelve esa jornada antes de registrar preventas." });
     }
 
     const { rows: clRows } = await client.query("SELECT * FROM clients WHERE id = $1 FOR SHARE", [d.clientId]);
@@ -309,13 +327,13 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
   }
 });
 
-ordersRouter.get("/:id", async (req, res) => {
+ordersRouter.get("/:id", async (req: AuthedRequest, res) => {
   const o = await full(req.params.id);
-  if (!o) return res.status(404).json({ error: "Preventa no encontrada." });
+  if (!o || o.user_id !== req.userId) return res.status(404).json({ error: "Preventa no encontrada." });
   res.json({ order: o });
 });
 
-ordersRouter.put("/:id", async (req, res) => {
+ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
   const parsed = schema.omit({ idempotencyKey: true, workDayId: true, clientId: true }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   const client = await pool.connect();
@@ -330,10 +348,26 @@ ordersRouter.put("/:id", async (req, res) => {
       inTransaction = false;
       return res.status(404).json({ error: "Preventa no encontrada." });
     }
+    if (order.user_id !== req.userId) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Preventa no encontrada." });
+    }
+    if (order.status !== "active") {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "Solo se pueden editar preventas activas." });
+    }
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
 
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
-    if (wd && wd.status === "closed") {
+    if (!wd || wd.user_id !== req.userId) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Jornada no encontrada." });
+    }
+    if (wd.status === "closed") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "La jornada está concluida. Para editar preventas debes reabrir la jornada." });
@@ -395,7 +429,7 @@ ordersRouter.put("/:id", async (req, res) => {
   }
 });
 
-ordersRouter.post("/:id/cancel", async (req, res) => {
+ordersRouter.post("/:id/cancel", async (req: AuthedRequest, res) => {
   const client = await pool.connect();
   let inTransaction = false;
   try {
@@ -408,9 +442,25 @@ ordersRouter.post("/:id/cancel", async (req, res) => {
       inTransaction = false;
       return res.status(404).json({ error: "Preventa no encontrada." });
     }
+    if (order.user_id !== req.userId) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Preventa no encontrada." });
+    }
+    if (order.status !== "active") {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "Solo se pueden cancelar preventas activas." });
+    }
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
-    if (wd && wd.status === "closed") {
+    if (!wd || wd.user_id !== req.userId) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Jornada no encontrada." });
+    }
+    if (wd.status === "closed") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "La jornada está concluida. Para eliminar preventas debes reabrir la jornada." });

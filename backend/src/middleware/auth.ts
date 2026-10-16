@@ -1,5 +1,5 @@
 import { NextFunction, Request, Response } from "express";
-import { verifyAccessToken } from "../services/auth";
+import { verifyAccessToken, verifyReportDownloadToken } from "../services/auth";
 import { pool } from "../db/pg";
 
 export interface AuthedRequest extends Request {
@@ -25,5 +25,17 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
     next();
   } catch (err) {
     return res.status(401).json({ error: "Sesión inválida o expirada." });
+  }
+}
+
+/** Autoriza enlaces de descarga firmados, breves y limitados a una jornada. */
+export function requireReportDownloadAuth(req: Request, res: Response, next: NextFunction) {
+  const token = typeof req.query.download_token === "string" ? req.query.download_token : null;
+  if (!token) return res.status(401).json({ error: "Enlace de descarga faltante o vencido." });
+  try {
+    verifyReportDownloadToken(token, req.params.workDayId);
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Enlace de descarga inválido o vencido." });
   }
 }

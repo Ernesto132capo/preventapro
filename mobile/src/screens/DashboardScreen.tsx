@@ -13,6 +13,7 @@ import { mergeDuplicateClients } from "../db/repositories/clients";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
 import { apiFetch } from "../services/api";
+import { countUnresolvedOutboxItems } from "../db/outbox";
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
@@ -44,6 +45,29 @@ export function DashboardScreen() {
   function openUserModal() {
     setShowUserModal(true);
     loadStats();
+  }
+
+  async function handleLogout() {
+    try {
+      const unresolvedCount = await countUnresolvedOutboxItems();
+      const message = unresolvedCount > 0
+        ? `Hay ${unresolvedCount} registro${unresolvedCount === 1 ? "" : "s"} local${unresolvedCount === 1 ? "" : "es"} que aún no se sincronizó${unresolvedCount === 1 ? "" : "n"}. Al cerrar sesión se conservarán en este teléfono y podrás sincronizarlos al volver a iniciar sesión. ¿Deseas continuar?`
+        : "¿Deseas cerrar la sesión actual? Tus datos locales se conservarán en este teléfono.";
+      Alert.alert("Cerrar sesión", message, [
+        { text: "Cancelar", style: "cancel" },
+        { text: "Salir", style: "destructive", onPress: () => { void logout(); } },
+      ]);
+    } catch {
+      // Si SQLite no permite comprobar la cola, avisamos antes de continuar de todos modos.
+      Alert.alert(
+        "No se pudo revisar la sincronización",
+        "No fue posible comprobar si hay registros pendientes. Cerrar sesión no borrará los datos locales. ¿Deseas continuar?",
+        [
+          { text: "Cancelar", style: "cancel" },
+          { text: "Salir", style: "destructive", onPress: () => { void logout(); } },
+        ]
+      );
+    }
   }
 
   function handleSaveCounter() {
@@ -104,8 +128,10 @@ export function DashboardScreen() {
     const orders = await listOrdersForWorkDay(wd.id);
     setRecentOrders(orders);
 
-    const totalCents = orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
-    const orderCount = orders.length;
+    const totalCents = wd.status === "closed"
+      ? wd.total_cents
+      : orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+    const orderCount = wd.status === "closed" ? wd.order_count : orders.length;
     setWorkDay({
       ...wd,
       total_cents: totalCents,
@@ -211,10 +237,7 @@ export function DashboardScreen() {
           <Button
             label="Salir"
             variant="outline"
-            onPress={() => Alert.alert("Cerrar sesión", "¿Deseas cerrar la sesión actual?", [
-              { text: "Cancelar", style: "cancel" },
-              { text: "Salir", style: "destructive", onPress: logout },
-            ])}
+            onPress={() => { void handleLogout(); }}
             style={styles.logoutButton}
           />
         </View>

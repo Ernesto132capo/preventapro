@@ -4,6 +4,7 @@ import { enqueue } from "../outbox";
 import { CartLine, LocalOrder } from "../../domain/types";
 import { calcOrderTotals, PricingError } from "../../domain/pricing";
 import { getClient } from "./clients";
+import { withUserWorkDayLock } from "./workdays";
 
 export interface CreateOrderInput {
   workDayLocalId: string;
@@ -20,6 +21,13 @@ export interface CreateOrderInput {
  */
 export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOrder> {
   if (!input.clientId) throw new PricingError("Debes seleccionar un cliente.");
+  const db = await getDb();
+  const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [input.workDayLocalId]);
+  if (!workDay) throw new PricingError("No hay una jornada abierta para registrar la preventa.");
+  return withUserWorkDayLock(workDay.user_id, () => createOrderLocalLocked(input, workDay.user_id));
+}
+
+async function createOrderLocalLocked(input: CreateOrderInput, userId: string): Promise<LocalOrder> {
   const totals = calcOrderTotals(input.lines, input.taxRatePermille ?? 0);
 
   const client = await getClient(input.clientId);
@@ -30,6 +38,17 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
   const ts = nowIso();
 
   await db.withTransactionAsync(async () => {
+    const currentWorkDay = await db.getFirstAsync<{ user_id: string; status: string }>(
+      `SELECT user_id, status FROM work_days WHERE id = ?`,
+      [input.workDayLocalId]
+    );
+    if (!currentWorkDay || currentWorkDay.user_id !== userId) {
+      throw new PricingError("No hay una jornada válida para registrar la preventa.");
+    }
+    if (currentWorkDay.status !== "open") {
+      throw new PricingError("La jornada está cerrada. Reábrela antes de registrar nuevas preventas.");
+    }
+
     await db.runAsync(
       `INSERT INTO orders
         (id, work_day_id, client_id, client_name, payment_condition, subtotal_cents, tax_cents, total_cents,
@@ -112,14 +131,14 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
 
 export async function listOrdersForWorkDay(workDayLocalId: string): Promise<LocalOrder[]> {
   const db = await getDb();
-  const wd = await db.getFirstAsync<{ id: string; server_id: string | null }>(
-    `SELECT id, server_id FROM work_days WHERE id = ?`,
+  const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
+    `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
     [workDayLocalId]
   );
   if (wd?.server_id) {
     return db.getAllAsync<LocalOrder>(
-      `SELECT * FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active' ORDER BY created_at DESC`,
-      [workDayLocalId, wd.server_id, wd.server_id]
+      `SELECT * FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active' ORDER BY created_at DESC`,
+      [workDayLocalId, wd.server_id, wd.server_id, wd.user_id]
     );
   }
   return db.getAllAsync<LocalOrder>(
@@ -159,14 +178,22 @@ export async function getOrderWithItems(orderId: string) {
 export async function upsertOrderFromServer(serverOrder: any) {
   const db = await getDb();
 
-  let localWorkDay = await db.getFirstAsync<{ id: string }>(
-    `SELECT id FROM work_days WHERE server_id = ? OR id = ?`,
-    [serverOrder.work_day_id, serverOrder.work_day_id]
-  );
+  let localWorkDay = serverOrder.user_id
+    ? await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM work_days WHERE user_id = ? AND (server_id = ? OR id = ?) LIMIT 1`,
+        [serverOrder.user_id, serverOrder.work_day_id, serverOrder.work_day_id]
+      )
+    : await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
+        [serverOrder.work_day_id, serverOrder.work_day_id]
+      );
   if (!localWorkDay) {
-    localWorkDay = await db.getFirstAsync<{ id: string }>(
-      `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
-    );
+    localWorkDay = serverOrder.user_id
+      ? await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM work_days WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1`,
+          [serverOrder.user_id]
+        )
+      : null;
   }
   const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
 
@@ -301,13 +328,33 @@ export async function upsertOrderFromServer(serverOrder: any) {
 
 /** Reemplaza los artículos de una preventa abierta. */
 export async function updateOrderLocal(orderId: string, lines: CartLine[], paymentCondition = "Contado 48h"): Promise<void> {
+  const db = await getDb();
+  const order = await db.getFirstAsync<LocalOrder & { work_day_id: string }>(`SELECT * FROM orders WHERE id = ? AND status = 'active'`, [orderId]);
+  if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
+  const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [order.work_day_id]);
+  if (!workDay) throw new PricingError("No se encontró la jornada de esta preventa.");
+  return withUserWorkDayLock(workDay.user_id, () => updateOrderLocalLocked(orderId, lines, paymentCondition, workDay.user_id));
+}
+
+async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymentCondition: string, userId: string): Promise<void> {
   const totals = calcOrderTotals(lines, 0);
   const db = await getDb();
-  const order = await db.getFirstAsync<LocalOrder>(`SELECT * FROM orders WHERE id = ? AND status = 'active'`, [orderId]);
+  const order = await db.getFirstAsync<LocalOrder & { work_day_id: string }>(`SELECT * FROM orders WHERE id = ? AND status = 'active'`, [orderId]);
   if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
   const ts = nowIso();
 
   await db.withTransactionAsync(async () => {
+    const workDay = await db.getFirstAsync<{ user_id: string; status: string }>(
+      `SELECT user_id, status FROM work_days WHERE id = ?`,
+      [order.work_day_id]
+    );
+    if (!workDay || workDay.user_id !== userId) {
+      throw new PricingError("No se encontró la jornada de esta preventa.");
+    }
+    if (workDay.status !== "open") {
+      throw new PricingError("La jornada está cerrada. Reábrela antes de editar esta preventa.");
+    }
+
     await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [orderId]);
     await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [orderId]);
 
@@ -345,27 +392,41 @@ export async function cancelOrderLocal(orderId: string): Promise<void> {
   const db = await getDb();
   const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ? AND status = 'active'`, [orderId]);
   if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
-  await db.withTransactionAsync(async () => {
-    await db.runAsync(`UPDATE orders SET status = 'cancelled', sync_status = 'pending', updated_at = ? WHERE id = ?`, [nowIso(), orderId]);
-    await refreshWorkDayTotals(db, order.work_day_id);
-    // Las altas/ediciones pendientes ya no deben enviarse después de cancelar.
-    await db.runAsync(`UPDATE outbox SET status = 'done' WHERE entity_type = 'order' AND local_entity_id = ? AND status IN ('pending', 'failed')`, [orderId]);
+  const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [order.work_day_id]);
+  if (!workDay) throw new PricingError("No se encontró la jornada de esta preventa.");
+  await withUserWorkDayLock(workDay.user_id, async () => {
+    await db.withTransactionAsync(async () => {
+      const current = await db.getFirstAsync<{ user_id: string; status: string }>(
+        `SELECT wd.user_id, wd.status FROM work_days wd WHERE wd.id = ?`,
+        [order.work_day_id]
+      );
+      if (!current || current.user_id !== workDay.user_id) {
+        throw new PricingError("No se encontró la jornada de esta preventa.");
+      }
+      if (current.status !== "open") {
+        throw new PricingError("La jornada está cerrada. Reábrela antes de cancelar esta preventa.");
+      }
+      await db.runAsync(`UPDATE orders SET status = 'cancelled', sync_status = 'pending', updated_at = ? WHERE id = ?`, [nowIso(), orderId]);
+      await refreshWorkDayTotals(db, order.work_day_id);
+      // Las altas/ediciones pendientes ya no deben enviarse después de cancelar.
+      await db.runAsync(`UPDATE outbox SET status = 'done' WHERE entity_type = 'order' AND local_entity_id = ? AND status IN ('pending', 'failed')`, [orderId]);
+    });
+    await enqueue("order", orderId, 2, "cancel");
   });
-  await enqueue("order", orderId, 2, "cancel");
 }
 
 async function refreshWorkDayTotals(db: any, workDayId: string) {
   const wd: any = await db.getFirstAsync(
-    `SELECT id, server_id FROM work_days WHERE id = ?`,
+    `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
     [workDayId]
   );
   if (wd?.server_id) {
     await db.runAsync(
       `UPDATE work_days SET
-         order_count = (SELECT COUNT(*) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active'),
-         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active')
+         order_count = (SELECT COUNT(*) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active'),
+         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active')
        WHERE id = ?`,
-      [workDayId, wd.server_id, wd.server_id, workDayId, wd.server_id, wd.server_id, workDayId]
+      [workDayId, wd.server_id, wd.server_id, wd.user_id, workDayId, wd.server_id, wd.server_id, wd.user_id, workDayId]
     );
   } else {
     await db.runAsync(
@@ -394,9 +455,9 @@ export async function markOrderFailed(localId: string, error: string) {
 export async function countUnsyncedOrders(workDayLocalId: string): Promise<number> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ n: number }>(
-    // Una preventa cancelada ya no bloquea el cierre; su cancelación se envía
-    // en la outbox, pero no forma parte de la jornada activa.
-    `SELECT COUNT(*) as n FROM orders WHERE work_day_id = ? AND status = 'active' AND sync_status IN ('pending','syncing','failed')`,
+    // También hay que confirmar las cancelaciones: si siguen pendientes,
+    // el servidor todavía las cuenta como preventas activas al cerrar.
+    `SELECT COUNT(*) as n FROM orders WHERE work_day_id = ? AND sync_status IN ('pending','syncing','failed')`,
     [workDayLocalId]
   );
   return row?.n ?? 0;

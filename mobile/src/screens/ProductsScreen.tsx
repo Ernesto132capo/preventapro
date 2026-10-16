@@ -13,6 +13,8 @@ import { centsToBs } from "../domain/pricing";
 import { useSync } from "../context/SyncContext";
 import { useDebounce } from "../utils/useDebounce";
 
+const productKeyExtractor = (product: ProductWithPresentations) => product.id;
+
 export function ProductsScreen() {
   const navigation = useNavigation<any>();
   const { syncTick } = useSync();
@@ -75,6 +77,23 @@ export function ProductsScreen() {
     return list;
   }, [products, showOnlyFavorites, selectedCategoryId, categories]);
 
+  const categoryCounts = useMemo(() => {
+    const categoryIdsByAlias = new Map<string, string>();
+    for (const category of categories) {
+      categoryIdsByAlias.set(category.id, category.id);
+      if (category.server_id) categoryIdsByAlias.set(category.server_id, category.id);
+      if (category.name) categoryIdsByAlias.set(category.name.toLowerCase(), category.id);
+    }
+
+    const counts = new Map<string, number>();
+    for (const product of products) {
+      if (!product.category_id) continue;
+      const categoryId = categoryIdsByAlias.get(product.category_id) || categoryIdsByAlias.get(product.category_id.toLowerCase());
+      if (categoryId) counts.set(categoryId, (counts.get(categoryId) || 0) + 1);
+    }
+    return counts;
+  }, [categories, products]);
+
   const handleToggleFavorite = useCallback(async (productId: string) => {
     const nowFav = await toggleFavoriteLocal(productId);
     setProducts((prev) =>
@@ -100,17 +119,21 @@ export function ProductsScreen() {
     );
   }, [load]);
 
+  const handleEditProduct = useCallback((productId: string) => {
+    navigation.navigate("NuevoProducto", { productId });
+  }, [navigation]);
+
   const renderProductItem = useCallback(
     ({ item }: { item: ProductWithPresentations }) => (
       <ProductCardItem
         item={item}
         categoryName={item.category_id ? (categoryMap.get(item.category_id) || categoryMap.get(item.category_id.toLowerCase()) || null) : null}
         onToggleFavorite={handleToggleFavorite}
-        onEdit={() => navigation.navigate("NuevoProducto", { productId: item.id })}
-        onDelete={() => confirmDelete(item)}
+        onEdit={handleEditProduct}
+        onDelete={confirmDelete}
       />
     ),
-    [categoryMap, handleToggleFavorite, navigation, confirmDelete]
+    [categoryMap, handleToggleFavorite, handleEditProduct, confirmDelete]
   );
 
   const favoriteCount = useMemo(() => products.filter((p) => p.is_favorite).length, [products]);
@@ -160,7 +183,7 @@ export function ProductsScreen() {
         </Pressable>
 
         {categories.map((cat) => {
-          const count = products.filter((p) => p.category_id === cat.id || (cat.server_id && p.category_id === cat.server_id)).length;
+          const count = categoryCounts.get(cat.id) || 0;
           const active = selectedCategoryId === cat.id && !showOnlyFavorites;
           return (
             <Pressable
@@ -181,7 +204,8 @@ export function ProductsScreen() {
 
       <FlatList
         data={filteredProducts}
-        keyExtractor={(p, idx) => `${p.id}-${idx}`}
+        keyExtractor={productKeyExtractor}
+        keyboardShouldPersistTaps="handled"
         renderItem={renderProductItem}
         contentContainerStyle={{ padding: spacing.lg, paddingTop: 0 }}
         ListEmptyComponent={<EmptyState message="No hay productos disponibles." />}
@@ -204,8 +228,8 @@ const ProductCardItem = React.memo(function ProductCardItem({
   item: ProductWithPresentations;
   categoryName: string | null;
   onToggleFavorite: (id: string) => void;
-  onEdit: () => void;
-  onDelete: () => void;
+  onEdit: (productId: string) => void;
+  onDelete: (product: ProductWithPresentations) => void;
 }) {
   const isCombo = item.product_type === "combo";
   const comboDef = item.combo_definition;
@@ -264,10 +288,10 @@ const ProductCardItem = React.memo(function ProductCardItem({
       </View>
 
       <View style={styles.actionsRow}>
-        <Pressable style={styles.actionBtn} onPress={onEdit}>
+        <Pressable style={styles.actionBtn} onPress={() => onEdit(item.id)}>
           <Text style={styles.actionText}>✏️ Editar</Text>
         </Pressable>
-        <Pressable style={[styles.actionBtn, styles.actionBtnDanger]} onPress={onDelete}>
+        <Pressable style={[styles.actionBtn, styles.actionBtnDanger]} onPress={() => onDelete(item)}>
           <Text style={[styles.actionText, { color: colors.errorText }]}>🗑️ Eliminar</Text>
         </Pressable>
       </View>

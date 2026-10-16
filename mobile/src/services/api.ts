@@ -4,6 +4,26 @@ import { API_BASE_URL } from "./config";
 const ACCESS_TOKEN_KEY = "preventapro_access_token";
 let accessToken: string | null = null;
 let tokenLoaded = false;
+type UnauthorizedListener = (rejectedToken: string | null) => void;
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+/** Notifica 401 de rutas privadas para que la sesión local pueda pedir reautenticación. */
+export function subscribeToUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+function notifyUnauthorized(rejectedToken: string | null): void {
+  for (const listener of unauthorizedListeners) {
+    try {
+      listener(rejectedToken);
+    } catch {
+      // Un listener de sesión no debe alterar el error HTTP de la petición original.
+    }
+  }
+}
 
 export class ApiError extends Error {
   status: number;
@@ -80,6 +100,9 @@ export async function apiFetch<T = any>(path: string, opts: RequestOptions = {})
   }
 
   if (!res.ok) {
+    if (res.status === 401 && authRequired) {
+      notifyUnauthorized(token);
+    }
     let message = data?.error || "Error del servidor.";
     if ([502, 503, 504].includes(res.status)) {
       message = "El servidor no está disponible. Tus datos locales no se perderán; vuelve a intentar cuando haya conexión.";

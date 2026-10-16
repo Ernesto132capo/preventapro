@@ -1,8 +1,8 @@
 import { Router } from "express";
 import path from "path";
 import fs from "fs";
-import { requireAuth } from "../middleware/auth";
-import { createReportDownloadToken, verifyReportDownloadToken } from "../services/auth";
+import { requireAuth, requireReportDownloadAuth } from "../middleware/auth";
+import { createReportDownloadToken } from "../services/auth";
 import { generateClientReceiptsExcel, generateClientSummaryExcel, generateProductListExcel } from "../services/excel";
 import { generateClientReceiptsPdf } from "../services/receipts-pdf";
 
@@ -67,16 +67,7 @@ reportsRouter.post("/:workDayId/download-token", requireAuth, (req, res) => {
   res.json({ downloadToken: createReportDownloadToken(req.params.workDayId) });
 });
 
-reportsRouter.get("/:workDayId/:fileName", (req, res, next) => {
-  const token = typeof req.query.download_token === "string" ? req.query.download_token : null;
-  if (!token) return res.status(401).json({ error: "Enlace de descarga faltante o vencido." });
-  try {
-    verifyReportDownloadToken(token, req.params.workDayId);
-    next();
-  } catch {
-    return res.status(401).json({ error: "Enlace de descarga inválido o vencido." });
-  }
-}, async (req, res, next) => {
+reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req, res, next) => {
   const { workDayId, fileName } = req.params;
   // Rechazar segmentos de ruta antes de combinarlos con el directorio de reportes.
   const safeWorkDayId = path.basename(workDayId);

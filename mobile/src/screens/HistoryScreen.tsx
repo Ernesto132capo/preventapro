@@ -23,6 +23,7 @@ export function HistoryScreen() {
   const [loadingOrders, setLoadingOrders] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!user) return;
     try {
       const res = await apiFetch<{ workDays: any[] }>("/workdays/history");
       if (res?.workDays) {
@@ -32,8 +33,8 @@ export function HistoryScreen() {
     } catch {
       // Fallback offline
     }
-    setWorkDays(await listClosedWorkDays());
-  }, []);
+    setWorkDays(await listClosedWorkDays(user.id));
+  }, [user]);
 
   const toggleExpand = async (item: WorkDay) => {
     if (expandedWorkDayId === item.id) {

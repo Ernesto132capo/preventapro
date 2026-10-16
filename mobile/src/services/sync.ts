@@ -24,7 +24,7 @@ export interface SyncResult {
 }
 
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
-async function pullCatalog(force = false): Promise<{ clients: number; products: number }> {
+async function pullCatalog(userId: string, force = false): Promise<{ clients: number; products: number }> {
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
@@ -113,16 +113,16 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
     }
   }
 
-  // Descargar e integrar preventas compartidas del equipo
+  // Descargar e integrar preventas de la jornada del preventista autenticado.
   if (data.orders && Array.isArray(data.orders)) {
     for (const o of data.orders) {
       await upsertOrderFromServer(o);
     }
   }
 
-  // Actualizar estado de la jornada compartida de hoy si vino en el pull
+  // Actualizar la jornada local de este preventista si vino en el pull.
   if (data.workDay) {
-    const todayLocal = await getTodayWorkDay("team");
+    const todayLocal = await getTodayWorkDay(userId);
     await upsertServerWorkDay(todayLocal.id, data.workDay);
 
     // Limpiar órdenes locales viejas o fantasmas que ya no pertenecen a la jornada de hoy
@@ -211,8 +211,8 @@ async function resolveTodayWorkDay(userId: string) {
   await upsertServerWorkDay(local.id, res.workDay);
   const db = await getDb();
   const allTodayDays = await db.getAllAsync<{ id: string }>(
-    `SELECT id FROM work_days WHERE work_date = ?`,
-    [local.work_date]
+    `SELECT id FROM work_days WHERE user_id = ? AND work_date = ?`,
+    [userId, local.work_date]
   );
   for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
@@ -456,6 +456,10 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   if (row.operation === "cancel" || order.status === "cancelled") {
     // Si nunca llegó al servidor, basta con descartar sus operaciones locales.
     if (order.server_id) await apiFetch<any>(`/orders/${order.server_id}/cancel`, { method: "POST" });
+    await db.runAsync(
+      `UPDATE orders SET sync_status = 'synced', sync_error = NULL WHERE id = ?`,
+      [order.id]
+    );
     await markDone(row.id);
     return "done";
   }
@@ -713,8 +717,8 @@ async function rescueLocalConflict(userId: string) {
       const local = await getTodayWorkDay(userId);
       await upsertServerWorkDay(local.id, res.workDay);
       const allTodayDays = await db.getAllAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE work_date = ?`,
-        [local.work_date]
+        `SELECT id FROM work_days WHERE user_id = ? AND work_date = ?`,
+        [userId, local.work_date]
       );
       for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 
@@ -779,7 +783,7 @@ async function performRunSync(
 
     let pulled = { clients: 0, products: 0 };
     if (!skipPull) {
-      pulled = await pullCatalog(options.forcePull);
+      pulled = await pullCatalog(userId, options.forcePull);
       lastFullPullAt = Date.now();
     }
 

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { View, Text, TextInput, Modal, StyleSheet, FlatList, Pressable, Alert } from "react-native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "./Button";
@@ -16,18 +16,32 @@ interface Props {
   onClose: () => void;
 }
 
-export function ComboSelectorModal({ visible, product, presentation, onAdd, onClose }: Props) {
+const emptyComboOptions: ComboOption[] = [];
+const comboOptionKeyExtractor = (option: ComboOption) => option.id;
+
+export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visible, product, presentation, onAdd, onClose }: Props) {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 200);
   const [selectedCounts, setSelectedCounts] = useState<Record<string, number>>({});
   const [comboQty, setComboQty] = useState(1);
 
+  const options = product?.combo_definition?.options ?? emptyComboOptions;
+  const totalSelectedUnits = useMemo(
+    () => Object.values(selectedCounts).reduce((a, b) => a + b, 0),
+    [selectedCounts]
+  );
+  const filteredOptions = useMemo(() => {
+    const term = debouncedSearch.trim().toLowerCase();
+    if (!term) return options;
+    return options.filter((option) =>
+      (option.product_name || "").toLowerCase().includes(term) ||
+      (option.presentation_name || "").toLowerCase().includes(term)
+    );
+  }, [options, debouncedSearch]);
+
   if (!product || !presentation || !product.combo_definition) return null;
 
   const comboDef = product.combo_definition;
-  const options = comboDef.options || [];
-
-  const totalSelectedUnits = Object.values(selectedCounts).reduce((a, b) => a + b, 0);
   const minRequired = comboDef.selection_min;
   const maxAllowed = comboDef.selection_max;
 
@@ -97,14 +111,6 @@ export function ComboSelectorModal({ visible, product, presentation, onAdd, onCl
     onClose();
   }
 
-  const filteredOptions = options.filter((o) => {
-    const term = debouncedSearch.toLowerCase();
-    return (
-      (o.product_name || "").toLowerCase().includes(term) ||
-      (o.presentation_name || "").toLowerCase().includes(term)
-    );
-  });
-
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
       <View style={styles.overlay}>
@@ -143,7 +149,8 @@ export function ComboSelectorModal({ visible, product, presentation, onAdd, onCl
 
           <FlatList
             data={filteredOptions}
-            keyExtractor={(o, idx) => `${o.id || o.presentation_id}-${idx}`}
+            keyExtractor={comboOptionKeyExtractor}
+            keyboardShouldPersistTaps="handled"
             style={{ maxHeight: 320 }}
             renderItem={({ item }) => {
               const count = selectedCounts[item.presentation_id] || 0;
@@ -212,7 +219,7 @@ export function ComboSelectorModal({ visible, product, presentation, onAdd, onCl
       </View>
     </Modal>
   );
-}
+});
 
 const styles = StyleSheet.create({
   overlay: {

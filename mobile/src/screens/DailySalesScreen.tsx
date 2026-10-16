@@ -32,8 +32,10 @@ export function DailySalesScreen() {
     const wd = await getOrCreateOpenWorkDay(user.id);
     const ords = await listOrdersForWorkDay(wd.id);
     setOrders(ords);
-    const totalCents = ords.reduce((sum, o) => sum + (o.total_cents || 0), 0);
-    const orderCount = ords.length;
+    const totalCents = wd.status === "closed"
+      ? wd.total_cents
+      : ords.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+    const orderCount = wd.status === "closed" ? wd.order_count : ords.length;
     setWorkDay({
       ...wd,
       total_cents: totalCents,
@@ -62,40 +64,47 @@ export function DailySalesScreen() {
     if (!workDay) return;
 
     setClosing(true);
-    // Comprobar y sincronizar cambios pendientes antes de cerrar (Fase 27)
-    await forceSync();
-    const pending = await countUnsyncedOrders(workDay.id);
-    if (pending > 0) {
-      setClosing(false);
-      setError(`Aún hay ${pending} preventa(s) sin sincronizar. Verifica tu conexión e intenta de nuevo.`);
-      return;
-    }
-
-    const serverId = await resolveServerWorkDayId(workDay.id);
-    if (!serverId) {
-      setClosing(false);
-      setError("No se pudo confirmar la jornada con el servidor. Verifica tu conexión.");
-      return;
-    }
-
     try {
+      // Confirmar que altas, ediciones y cancelaciones llegaron al servidor
+      // antes de consolidar los totales de cierre.
+      await forceSync();
+      const pending = await countUnsyncedOrders(workDay.id);
+      if (pending > 0) {
+        setError(`Aún hay ${pending} preventa(s) sin sincronizar. Verifica tu conexión e intenta de nuevo.`);
+        return;
+      }
+
+      const serverId = await resolveServerWorkDayId(workDay.id);
+      if (!serverId) {
+        setError("No se pudo confirmar la jornada con el servidor. Verifica tu conexión.");
+        return;
+      }
+
       const res = await apiFetch<any>(`/workdays/${serverId}/close`, {
         method: "POST",
         body: { confirmation: confirmText },
       });
       await markWorkDayClosed(workDay.id, res.workDay.order_count, res.workDay.total_cents);
       await upsertServerWorkDay(workDay.id, res.workDay);
-      setClosing(false);
+      setWorkDay((current) => current ? {
+        ...current,
+        status: "closed",
+        order_count: res.workDay.order_count,
+        total_cents: res.workDay.total_cents,
+      } : current);
       setShowCloseForm(false);
       Alert.alert(
         "Jornada concluida",
         `Total final del día: ${centsToBs(res.workDay.total_cents)}. Preventas concluidas: ${res.workDay.order_count}.`
       );
-      await forceSync();
-      await load();
+      // El cierre ya está confirmado; un fallo de refresco no debe reportarlo
+      // como si el servidor hubiera rechazado el cierre.
+      try { await forceSync(); } catch { /* cierre confirmado */ }
+      try { await load(); } catch { /* se conserva el total confirmado arriba */ }
     } catch (err) {
-      setClosing(false);
       setError(err instanceof ApiError ? err.message : "No se pudo cerrar la jornada.");
+    } finally {
+      setClosing(false);
     }
   }
 

@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert } from "react-native";
-import { useFocusEffect, useNavigation, useRoute } from "@react-navigation/native";
+import { useFocusEffect, useIsFocused, useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
@@ -22,15 +22,18 @@ import { centsToBs } from "../domain/pricing";
 import { CartLine, CartLineSelection, Category, Client, Presentation, Product, WorkDay } from "../domain/types";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { apiFetch } from "../services/api";
+import { apiFetch, ApiError } from "../services/api";
 import { useDebounce } from "../utils/useDebounce";
 
 type Step = "client" | "products";
 type ProductFilterMode = "all" | "favorites" | "recent" | "frequent" | "category";
+const clientKeyExtractor = (client: Client) => client.id;
+const productKeyExtractor = (product: ProductWithPresentations) => product.id;
 
 export function NewSaleScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
+  const isFocused = useIsFocused();
   const { user } = useAuth();
   const { forceSync, pushSync } = useSync();
 
@@ -54,6 +57,7 @@ export function NewSaleScreen() {
   const [cart, setCart] = useState<CartLine[]>([]);
   const [paymentCondition] = useState("Contado 48h");
   const [saving, setSaving] = useState(false);
+  const saveInFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const editingOrderId = route.params?.orderId as string | undefined;
 
@@ -72,6 +76,10 @@ export function NewSaleScreen() {
     setClients(await listActiveClients(debouncedClientSearch));
   }, [debouncedClientSearch]);
 
+  const productSearchForMode = filterMode === "recent" || filterMode === "frequent"
+    ? ""
+    : debouncedProductSearch;
+
   const loadProducts = useCallback(async () => {
     if (filterMode === "recent" && selectedClient) {
       const recents = await listRecentProductsForClient(selectedClient.id);
@@ -86,7 +94,7 @@ export function NewSaleScreen() {
 
     const [prods, cats] = await Promise.all([
       listProducts({
-        search: debouncedProductSearch,
+        search: productSearchForMode,
         categoryId: filterMode === "category" ? selectedCategoryId : undefined,
         onlyFavorites: filterMode === "favorites" ? true : undefined,
       }),
@@ -94,7 +102,7 @@ export function NewSaleScreen() {
     ]);
     setProducts(prods);
     setCategories(cats);
-  }, [debouncedProductSearch, filterMode, selectedCategoryId, selectedClient]);
+  }, [productSearchForMode, filterMode, selectedCategoryId, selectedClient]);
 
   // Cargar contador de compras recientes del cliente seleccionado
   useEffect(() => {
@@ -109,11 +117,17 @@ export function NewSaleScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      checkWorkDay();
-      loadClients();
-      loadProducts();
-    }, [checkWorkDay, loadClients, loadProducts])
+      void checkWorkDay();
+    }, [checkWorkDay])
   );
+
+  useEffect(() => {
+    if (isFocused) void loadClients();
+  }, [isFocused, loadClients]);
+
+  useEffect(() => {
+    if (isFocused) void loadProducts();
+  }, [isFocused, loadProducts]);
 
   async function handleReopen() {
     if (!workDay) return;
@@ -226,6 +240,12 @@ export function NewSaleScreen() {
     []
   );
 
+  const handleCloseComboModal = useCallback(() => {
+    setComboModalVisible(false);
+    setComboModalProduct(null);
+    setComboModalPresentation(null);
+  }, []);
+
   const changeLineQuantity = useCallback((index: number, delta: number) => {
     setCart((prev) =>
       prev
@@ -245,8 +265,13 @@ export function NewSaleScreen() {
     );
   }, []);
 
+  const handleSelectClient = useCallback((client: Client) => {
+    setSelectedClient(client);
+    setStep("products");
+  }, []);
+
   async function handleSaveOrder() {
-    if (saving) return;
+    if (saveInFlightRef.current) return;
     setError(null);
     if (!selectedClient) {
       setError("Selecciona un cliente antes de guardar.");
@@ -256,6 +281,7 @@ export function NewSaleScreen() {
       setError("Agrega al menos un producto.");
       return;
     }
+    saveInFlightRef.current = true;
     setSaving(true);
     try {
       let currentWd = await getTodayWorkDay(user!.id);
@@ -268,11 +294,13 @@ export function NewSaleScreen() {
           setWorkDay(currentWd);
         }
       } catch (netErr) {
+        if (netErr instanceof ApiError && netErr.status >= 400 && netErr.status < 500) {
+          throw netErr;
+        }
         console.warn("No se pudo verificar estado online de jornada, usando local:", netErr);
       }
 
       if (currentWd.status === "closed") {
-        setSaving(false);
         setError("La jornada de hoy ya fue concluida. Debes reabrir la jornada para registrar preventas.");
         Alert.alert(
           "Jornada Concluida",
@@ -296,7 +324,6 @@ export function NewSaleScreen() {
         });
       }
       await pushSync();
-      setSaving(false);
       setCart([]);
       setSelectedClient(null);
       setStep("client");
@@ -304,8 +331,10 @@ export function NewSaleScreen() {
       if (editingOrderId) navigation.goBack();
       else navigation.navigate("Registros");
     } catch (err: any) {
-      setSaving(false);
       setError(err.message || "No se pudo guardar la preventa.");
+    } finally {
+      saveInFlightRef.current = false;
+      setSaving(false);
     }
   }
 
@@ -325,19 +354,9 @@ export function NewSaleScreen() {
 
   const renderClientItem = useCallback(
     ({ item }: { item: Client }) => (
-      <Pressable
-        onPress={() => {
-          setSelectedClient(item);
-          setStep("products");
-        }}
-      >
-        <Card style={{ marginBottom: spacing.sm }}>
-          <Text style={styles.clientName}>{item.business_name}</Text>
-          {!!item.contact_name && <Text style={styles.clientSub}>{item.contact_name}</Text>}
-        </Card>
-      </Pressable>
+      <ClientPickerItem client={item} onSelect={handleSelectClient} />
     ),
-    []
+    [handleSelectClient]
   );
 
   if (workDay?.status === "closed") {
@@ -392,7 +411,8 @@ export function NewSaleScreen() {
 
         <FlatList
           data={clients}
-          keyExtractor={(c) => c.id}
+          keyExtractor={clientKeyExtractor}
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingTop: 0 }}
           ListEmptyComponent={<EmptyState message="No se encontraron clientes." />}
           renderItem={renderClientItem}
@@ -516,7 +536,8 @@ export function NewSaleScreen() {
 
       <FlatList
         data={products}
-        keyExtractor={(p, idx) => `${p.id}-${idx}`}
+        keyExtractor={productKeyExtractor}
+        keyboardShouldPersistTaps="handled"
         renderItem={renderProductItem}
         contentContainerStyle={{ padding: spacing.lg, paddingTop: spacing.xs }}
         initialNumToRender={6}
@@ -547,6 +568,7 @@ export function NewSaleScreen() {
                 label={editingOrderId ? "GUARDAR CAMBIOS" : "GUARDAR PREVENTA"}
                 onPress={handleSaveOrder}
                 loading={saving}
+                disabled={saving}
                 style={{ marginTop: spacing.md }}
               />
             </Card>
@@ -559,15 +581,28 @@ export function NewSaleScreen() {
         product={comboModalProduct}
         presentation={comboModalPresentation}
         onAdd={handleAddComboToCart}
-        onClose={() => {
-          setComboModalVisible(false);
-          setComboModalProduct(null);
-          setComboModalPresentation(null);
-        }}
+        onClose={handleCloseComboModal}
       />
     </View>
   );
 }
+
+const ClientPickerItem = React.memo(function ClientPickerItem({
+  client,
+  onSelect,
+}: {
+  client: Client;
+  onSelect: (client: Client) => void;
+}) {
+  return (
+    <Pressable onPress={() => onSelect(client)}>
+      <Card style={{ marginBottom: spacing.sm }}>
+        <Text style={styles.clientName}>{client.business_name}</Text>
+        {!!client.contact_name && <Text style={styles.clientSub}>{client.contact_name}</Text>}
+      </Card>
+    </Pressable>
+  );
+});
 
 const CartLineItemRow = React.memo(function CartLineItemRow({
   line,

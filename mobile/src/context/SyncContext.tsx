@@ -179,6 +179,14 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // La autenticación puede restaurarse desde AsyncStorage después del montaje inicial,
+  // o el usuario puede volver a entrar tras un 401/logout. Retomar la cola al tener sesión.
+  useEffect(() => {
+    if (user && isConnectedRef.current) {
+      runForceSyncRef.current();
+    }
+  }, [user?.id]);
+
   return (
     <SyncContext.Provider
       value={{ connection, isSyncing: connection === "syncing", pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, resetLocalData }}

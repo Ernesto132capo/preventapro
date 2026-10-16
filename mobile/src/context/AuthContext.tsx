@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
+import { Alert } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError } from "../services/api";
+import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError, subscribeToUnauthorized } from "../services/api";
 
 export interface AuthUser {
   id: string;
@@ -24,6 +25,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const unauthorizedHandlingRef = useRef(false);
+  const userRef = useRef(user);
+  userRef.current = user;
 
   useEffect(() => {
     (async () => {
@@ -48,6 +52,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  useEffect(() => subscribeToUnauthorized((rejectedToken) => {
+    if (!userRef.current || unauthorizedHandlingRef.current) return;
+    unauthorizedHandlingRef.current = true;
+
+    void (async () => {
+      const currentToken = await getAccessToken().catch(() => null);
+      // Ignora respuestas tardías de una sesión anterior si el usuario ya volvió a entrar.
+      if (currentToken !== rejectedToken) {
+        unauthorizedHandlingRef.current = false;
+        return;
+      }
+
+      // La expiración de sesión solo elimina credenciales; nunca reinicia SQLite ni el outbox.
+      await clearTokens().catch(() => undefined);
+      await AsyncStorage.removeItem(USER_KEY).catch(() => undefined);
+      setError(null);
+      setUser(null);
+      Alert.alert(
+        "Sesión vencida",
+        "Inicia sesión nuevamente para continuar. Tus datos locales y preventas pendientes se conservaron."
+      );
+    })();
+  }), []);
+
   const login = useCallback(async (identifier: string, password: string, rememberSession: boolean) => {
     setError(null);
     try {
@@ -63,6 +91,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await AsyncStorage.removeItem(USER_KEY);
       }
       setUser(res.user);
+      unauthorizedHandlingRef.current = false;
       return true;
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión. Verifica tu conexión.");

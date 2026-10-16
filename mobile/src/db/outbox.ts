@@ -95,6 +95,15 @@ export async function countPending(): Promise<number> {
   return row?.n ?? 0;
 }
 
+/** Cuenta todas las operaciones aún no resueltas, incluidas las que requieren corrección. */
+export async function countUnresolvedOutboxItems(): Promise<number> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ n: number }>(
+    `SELECT COUNT(*) as n FROM outbox WHERE status <> 'done'`
+  );
+  return row?.n ?? 0;
+}
+
 // Trae los mensajes de error guardados en filas fallidas o con error permanente,
 // para poder mostrárselos al usuario en vez de que la sincronización parezca "exitosa".
 export async function getFailedErrors(): Promise<{ entity_type: OutboxEntity; last_error: string | null }[]> {
