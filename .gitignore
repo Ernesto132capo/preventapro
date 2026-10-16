@@ -3,11 +3,14 @@ node_modules/
 *.db-shm
 *.db-wal
 dist/
-reports/*/
 .expo/
+# Configuración de entorno local: versionar únicamente las plantillas.
 .env
 .env.*
 !.env.example
+
+# Reportes generados por el backend (PDF/XLSX organizados por jornada).
+/backend/reports/
 
 # Logs generados localmente por el backend.
 /backend/sync-debug.log
