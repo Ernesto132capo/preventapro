@@ -1,6 +1,15 @@
 import { getDb, getMeta, setMeta } from "../db/client";
 import { apiFetch, ApiError } from "./api";
-import { enqueue, listPending, markDone, markFailed, markSyncing, deferForDependency, OutboxRow } from "../db/outbox";
+import {
+  enqueue,
+  listPending,
+  markDone,
+  markSyncing,
+  markPermanentError,
+  deferForDependency,
+  deferForRetry,
+  OutboxRow,
+} from "../db/outbox";
 import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
 import { upsertCategoryFromServer, resolveServerCategoryId } from "../db/repositories/categories";
 import { upsertProductFromServer, resolveServerPresentationId, resolveServerProductId } from "../db/repositories/products";
@@ -266,17 +275,21 @@ async function pushClient(row: OutboxRow) {
   await markDone(row.id);
 }
 
-async function pushProduct(row: OutboxRow) {
+async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
   const db = await getDb();
   const product = await db.getFirstAsync<any>(`SELECT * FROM products WHERE id = ?`, [row.local_entity_id]);
-  if (!product) return markDone(row.id);
+  if (!product) {
+    await markDone(row.id);
+    return "done";
+  }
 
   // Producto borrado localmente: si ya existía en el servidor, propagar el borrado; si no, nada que subir.
   if (product.active === 0) {
     if (product.server_id) {
       await apiFetch<any>(`/catalog/products/${product.server_id}`, { method: "DELETE" });
     }
-    return markDone(row.id);
+    await markDone(row.id);
+    return "done";
   }
 
   let categoryServerId: string | null = null;
@@ -311,7 +324,8 @@ async function pushProduct(row: OutboxRow) {
         if (!presServerId) {
           // La presentación de la opción todavía no ha sincronizado; diferir
           console.warn(`[pushProduct] Deferring combo product ${product.id}: option presentation not synced`);
-          return deferForDependency(row.id);
+          await deferForDependency(row.id);
+          return "deferred";
         }
         resolvedOptions.push({
           presentationId: presServerId,
@@ -374,9 +388,63 @@ async function pushProduct(row: OutboxRow) {
     }
   }
   await markDone(row.id);
+  return "done";
 }
 
 type PushOutcome = "done" | "deferred" | "failed";
+
+function isRetryablePushError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  return err.status === 0 || err.status >= 500 || [401, 403, 408, 425, 429].includes(err.status);
+}
+
+function shouldPauseQueue(err: unknown): boolean {
+  // Evita disparar una petición por cada fila si la conexión, sesión o servicio está caído.
+  return isRetryablePushError(err);
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof ApiError || err instanceof Error) return err.message;
+  return "Error desconocido al sincronizar el registro.";
+}
+
+async function markPermanentOutboxFailure(row: OutboxRow, message: string): Promise<PushOutcome> {
+  const db = await getDb();
+  await markPermanentError(row.id, message);
+  if (row.entity_type === "order") {
+    await markOrderFailed(row.local_entity_id, message);
+  } else {
+    const tableByEntity = { client: "clients", product: "products", category: "categories" } as const;
+    const table = tableByEntity[row.entity_type];
+    await db.runAsync(`UPDATE ${table} SET sync_status = 'failed' WHERE id = ?`, [row.local_entity_id]);
+  }
+  return "failed";
+}
+
+async function recordPushError(row: OutboxRow, err: unknown): Promise<PushOutcome> {
+  const message = errorMessage(err);
+  if (isRetryablePushError(err)) {
+    await deferForRetry(row.id, message);
+    return "deferred";
+  }
+  return markPermanentOutboxFailure(row, message);
+}
+
+async function getPermanentDependencyError(entityType: OutboxRow["entity_type"], localId: string) {
+  const db = await getDb();
+  return db.getFirstAsync<{ last_error: string | null }>(
+    `SELECT last_error FROM outbox
+     WHERE entity_type = ? AND local_entity_id = ? AND status = 'error'
+     ORDER BY created_at DESC LIMIT 1`,
+    [entityType, localId]
+  );
+}
+
+function dependencyRank(row: OutboxRow): number {
+  // Categoría y cliente/producto son padres; las preventas siempre van después,
+  // aunque alguna fila haya sido creada con una prioridad incorrecta.
+  return row.entity_type === "order" ? 3 : row.entity_type === "product" ? 2 : row.entity_type === "client" ? 1 : 0;
+}
 
 async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   const db = await getDb();
@@ -405,6 +473,15 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
 
   const clientServerId = await resolveServerClientId(order.client_id);
   if (!workDayServerId || !clientServerId) {
+    if (!clientServerId) {
+      const failedClient = await getPermanentDependencyError("client", order.client_id);
+      if (failedClient) {
+        return markPermanentOutboxFailure(
+          row,
+          `El cliente asociado no pudo sincronizarse: ${failedClient.last_error || "error permanente"}`
+        );
+      }
+    }
     console.warn(`[pushOrder] Deferring order ${order.id}: workDayServerId=${workDayServerId}, clientServerId=${clientServerId}`);
     await deferForDependency(row.id);
     return "deferred";
@@ -416,6 +493,13 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     const productServerId = await resolveServerProductId(item.product_id);
     const presentationServerId = await resolveServerPresentationId(item.presentation_id);
     if (!productServerId || !presentationServerId) {
+      const failedProduct = await getPermanentDependencyError("product", item.product_id);
+      if (failedProduct) {
+        return markPermanentOutboxFailure(
+          row,
+          `El producto asociado no pudo sincronizarse: ${failedProduct.last_error || "error permanente"}`
+        );
+      }
       console.warn(`[pushOrder] Deferring order ${order.id}: item ${item.id} missing productServerId=${productServerId}, presentationServerId=${presentationServerId}`);
       await deferForDependency(row.id);
       return "deferred"; // el producto creado offline todavía no sincronizó
@@ -432,6 +516,13 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
         const selProdServerId = await resolveServerProductId(sel.selected_product_id);
         const selPresServerId = await resolveServerPresentationId(sel.selected_presentation_id);
         if (!selProdServerId || !selPresServerId) {
+          const failedProduct = await getPermanentDependencyError("product", sel.selected_product_id);
+          if (failedProduct) {
+            return markPermanentOutboxFailure(
+              row,
+              `Un producto de la selección no pudo sincronizarse: ${failedProduct.last_error || "error permanente"}`
+            );
+          }
           console.warn(`[pushOrder] Deferring order ${order.id}: selection missing server id`);
           await deferForDependency(row.id);
           return "deferred";
@@ -468,12 +559,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     await markDone(row.id);
     return "done";
   } catch (err) {
-    const message = err instanceof ApiError ? err.message : "Error de sincronización";
-    if (err instanceof ApiError && err.status === 0) {
-      // Error de red real (no de validación) — reintentar sin marcar como fallo definitivo.
-      await deferForDependency(row.id);
-      return "deferred";
-    }
+    const message = errorMessage(err);
 
     // Blindaje de jornada concluida / cerrada: evitar bucle infinito de reintentos
     const isClosedWorkdayError =
@@ -488,21 +574,23 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
         `UPDATE orders SET status = 'cancelled', sync_status = 'failed', sync_error = ? WHERE id = ?`,
         [message, order.id]
       );
-      // Descartar la orden del outbox para NO entrar en bucle infinito
-      await markDone(row.id);
+      // El estado terminal conserva el error para informar al usuario sin reintentarla.
+      await markPermanentError(row.id, message);
       return "failed";
     }
-
-    await markOrderFailed(order.id, message);
-    await markFailed(row.id, message);
-    return "failed";
+    throw err;
   }
 }
 
-/** PUSH: procesa la cola de salida en orden de prioridad (clientes/productos antes que preventas). */
+/** PUSH: sincroniza primero las entidades padre y después las preventas que dependen de ellas. */
 async function pushOutbox(userId: string): Promise<{ done: number; deferred: number; failed: number }> {
-  const rows = await listPending();
+  const rows = (await listPending()).sort((a, b) =>
+    dependencyRank(a) - dependencyRank(b) ||
+    a.priority - b.priority ||
+    a.created_at.localeCompare(b.created_at)
+  );
   const outcomes = new Map<string, PushOutcome>();
+  let pauseQueue = false;
 
   for (const row of rows) {
     try {
@@ -514,39 +602,32 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
         await pushClient(row);
         outcomes.set(row.id, "done");
       } else if (row.entity_type === "product") {
-        await pushProduct(row);
-        outcomes.set(row.id, "done");
+        outcomes.set(row.id, await pushProduct(row));
       } else if (row.entity_type === "order") {
         outcomes.set(row.id, await pushOrder(row, userId));
       }
     } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Error desconocido";
-      if (err instanceof ApiError && err.status === 0) {
-        await deferForDependency(row.id);
-        outcomes.set(row.id, "deferred");
-      } else {
-        await markFailed(row.id, message);
-        outcomes.set(row.id, "failed");
+      outcomes.set(row.id, await recordPushError(row, err));
+      if (shouldPauseQueue(err)) {
+        pauseQueue = true;
+        break;
       }
-      continue;
     }
   }
 
   // Segunda pasada corta para resolver dependencias que ya se destrabaron en esta misma sincronización
-  const remaining = await listPending();
-  for (const row of remaining) {
-    if (row.entity_type !== "order") continue;
-    try {
-      await markSyncing(row.id);
-      outcomes.set(row.id, await pushOrder(row, userId));
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Error desconocido";
-      if (err instanceof ApiError && err.status === 0) {
-        await deferForDependency(row.id);
-        outcomes.set(row.id, "deferred");
-      } else {
-        await markFailed(row.id, message);
-        outcomes.set(row.id, "failed");
+  if (!pauseQueue) {
+    const remaining = await listPending();
+    for (const row of remaining) {
+      if (row.entity_type !== "order") continue;
+      try {
+        await markSyncing(row.id);
+        outcomes.set(row.id, await pushOrder(row, userId));
+      } catch (err) {
+        outcomes.set(row.id, await recordPushError(row, err));
+        if (shouldPauseQueue(err)) {
+          break;
+        }
       }
     }
   }
@@ -566,7 +647,7 @@ const MIN_PULL_INTERVAL_MS = 60_000; // el timer ya es de 60 s; evita pulls dupl
  * Usar después de mutaciones locales (crear cliente, producto, preventa).
  * Mucho más liviano que el sync completo.
  */
-export async function pushOnlySync(userId: string): Promise<SyncResult> {
+async function performPushOnlySync(userId: string): Promise<SyncResult> {
   try {
     await resolveTodayWorkDay(userId);
     const pushed = await pushOutbox(userId);
@@ -575,6 +656,46 @@ export async function pushOnlySync(userId: string): Promise<SyncResult> {
     const message = err instanceof ApiError ? err.message : err?.message || "No se pudo sincronizar.";
     return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
   }
+}
+
+type SyncMode = "full" | "push";
+interface SyncFlight {
+  userId: string;
+  mode: SyncMode;
+  promise: Promise<SyncResult>;
+}
+
+// Mutex compartido por todos los callers del servicio. Llamadas compatibles
+// comparten la promesa activa; un sync completo solicitado durante un push se
+// encola para ejecutarse después, sin solapar escrituras al mismo outbox.
+let syncQueue: Promise<void> = Promise.resolve();
+const syncFlights: SyncFlight[] = [];
+
+function runSerializedSync(userId: string, mode: SyncMode, task: () => Promise<SyncResult>): Promise<SyncResult> {
+  const existing = syncFlights.find(
+    (flight) => flight.userId === userId && (flight.mode === "full" || flight.mode === mode)
+  );
+  if (existing) return existing.promise;
+
+  const promise = syncQueue.then(task, task);
+  const flight: SyncFlight = { userId, mode, promise };
+  syncFlights.push(flight);
+  syncQueue = promise.then(() => undefined, () => undefined);
+  void promise.then(
+    () => {
+      const index = syncFlights.indexOf(flight);
+      if (index >= 0) syncFlights.splice(index, 1);
+    },
+    () => {
+      const index = syncFlights.indexOf(flight);
+      if (index >= 0) syncFlights.splice(index, 1);
+    }
+  );
+  return promise;
+}
+
+export function pushOnlySync(userId: string): Promise<SyncResult> {
+  return runSerializedSync(userId, "push", () => performPushOnlySync(userId));
 }
 
 /**
@@ -609,7 +730,9 @@ async function rescueLocalConflict(userId: string) {
             [uo.id]
           );
           await db.runAsync(
-            `UPDATE outbox SET status = 'done' WHERE entity_type = 'order' AND local_entity_id = ?`,
+            `UPDATE outbox SET status = 'error', attempts = attempts + 1,
+               last_error = 'Cancelado: la jornada fue concluida por otro usuario'
+             WHERE entity_type = 'order' AND local_entity_id = ?`,
             [uo.id]
           );
         }
@@ -625,8 +748,7 @@ async function rescueLocalConflict(userId: string) {
       `UPDATE outbox SET status = 'done' WHERE status = 'failed' AND (
         last_error LIKE '%jornada%' OR 
         last_error LIKE '%concluida%' OR 
-        last_error LIKE '%cerrada%' OR 
-        attempts >= 3
+        last_error LIKE '%cerrada%'
       )`
     );
   } catch (e) {
@@ -639,18 +761,21 @@ async function rescueLocalConflict(userId: string) {
  * Usar en el timer periódico para recoger cambios de otros dispositivos.
  * Respeta un cooldown mínimo para no disparar pulls duplicados.
  */
-export async function runSync(userId: string, options: { forcePull?: boolean } = {}): Promise<SyncResult> {
+async function performRunSync(
+  userId: string,
+  options: { forcePull?: boolean } = {},
+  skipOutboxPush = false
+): Promise<SyncResult> {
   try {
     const now = Date.now();
     // El refresh manual siempre hace pull; sólo los triggers automáticos
     // respetan el cooldown para no duplicar lecturas.
     const skipPull = !options.forcePull && now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
 
-    if (options.forcePull) {
-      await rescueLocalConflict(userId);
-    } else {
-      await resolveTodayWorkDay(userId);
-    }
+    if (options.forcePull) await rescueLocalConflict(userId);
+    // También corre después del rescate forzado: las preventas no salen sin
+    // haber intentado resolver primero su jornada padre.
+    await resolveTodayWorkDay(userId);
 
     let pulled = { clients: 0, products: 0 };
     if (!skipPull) {
@@ -658,11 +783,20 @@ export async function runSync(userId: string, options: { forcePull?: boolean } =
       lastFullPullAt = Date.now();
     }
 
-    const pushed = await pushOutbox(userId);
+    // Si un push-only ya corrió para este usuario en esta ventana concurrente,
+    // la llamada completa hace el pull pendiente sin reenviar sus filas.
+    const pushed = skipOutboxPush
+      ? { done: 0, deferred: 0, failed: 0 }
+      : await pushOutbox(userId);
     return { ok: true, pulled, pushed };
   } catch (err: any) {
     console.warn("Error detallado en runSync:", err);
     const message = err instanceof ApiError ? err.message : err?.message || "No se pudo sincronizar.";
     return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
   }
+}
+
+export function runSync(userId: string, options: { forcePull?: boolean } = {}): Promise<SyncResult> {
+  const pushAlreadyInFlight = syncFlights.some((flight) => flight.userId === userId && flight.mode === "push");
+  return runSerializedSync(userId, "full", () => performRunSync(userId, options, pushAlreadyInFlight));
 }

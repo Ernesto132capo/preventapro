@@ -19,7 +19,7 @@ export interface OutboxRow {
   local_entity_id: string;
   operation: OrderOperation;
   priority: number;
-  status: "pending" | "syncing" | "failed" | "done";
+  status: "pending" | "syncing" | "failed" | "error" | "done";
   attempts: number;
   last_error: string | null;
   created_at: string;
@@ -36,13 +36,32 @@ export async function listPending(): Promise<OutboxRow[]> {
 
 export async function markDone(id: string) {
   const db = await getDb();
-  await db.runAsync(`UPDATE outbox SET status = 'done' WHERE id = ?`, [id]);
+  // El handler envía el estado local actual, así que una operación exitosa también
+  // resuelve errores antiguos de la misma entidad que ya quedaron obsoletos.
+  await db.runAsync(
+    `UPDATE outbox SET status = 'done', last_error = NULL
+     WHERE id = ? OR (
+       status IN ('failed', 'error')
+       AND entity_type = (SELECT entity_type FROM outbox WHERE id = ?)
+       AND local_entity_id = (SELECT local_entity_id FROM outbox WHERE id = ?)
+     )`,
+    [id, id, id]
+  );
 }
 
 export async function markFailed(id: string, error: string) {
   const db = await getDb();
   await db.runAsync(
     `UPDATE outbox SET status = 'failed', attempts = attempts + 1, last_error = ? WHERE id = ?`,
+    [error, id]
+  );
+}
+
+/** Marca un error permanente (por ejemplo, una validación 4xx) para que no se reintente en cada sync. */
+export async function markPermanentError(id: string, error: string) {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE outbox SET status = 'error', attempts = attempts + 1, last_error = ? WHERE id = ?`,
     [error, id]
   );
 }
@@ -59,6 +78,15 @@ export async function deferForDependency(id: string) {
   await db.runAsync(`UPDATE outbox SET status = 'pending' WHERE id = ?`, [id]);
 }
 
+/** Conserva la fila pendiente para reintentarla más tarde y registra el último error temporal. */
+export async function deferForRetry(id: string, error: string) {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE outbox SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE id = ?`,
+    [error, id]
+  );
+}
+
 export async function countPending(): Promise<number> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ n: number }>(
@@ -67,12 +95,12 @@ export async function countPending(): Promise<number> {
   return row?.n ?? 0;
 }
 
-// Trae los mensajes de error reales guardados en filas que quedaron en 'failed',
+// Trae los mensajes de error guardados en filas fallidas o con error permanente,
 // para poder mostrárselos al usuario en vez de que la sincronización parezca "exitosa".
 export async function getFailedErrors(): Promise<{ entity_type: OutboxEntity; last_error: string | null }[]> {
   const db = await getDb();
   return db.getAllAsync<{ entity_type: OutboxEntity; last_error: string | null }>(
-    `SELECT entity_type, last_error FROM outbox WHERE status = 'failed' ORDER BY created_at DESC LIMIT 5`
+    `SELECT entity_type, last_error FROM outbox WHERE status IN ('failed', 'error') ORDER BY created_at DESC LIMIT 5`
   );
 }
 // Descarta (marca como 'done', sin subir) los ítems que quedaron trabados con error de
@@ -80,6 +108,6 @@ export async function getFailedErrors(): Promise<{ entity_type: OutboxEntity; la
 // todavía, así que esta es la forma de "destrabar" la cola sin tener que reinstalar la app.
 export async function discardFailed(): Promise<number> {
   const db = await getDb();
-  const result = await db.runAsync(`UPDATE outbox SET status = 'done' WHERE status = 'failed'`);
+  const result = await db.runAsync(`UPDATE outbox SET status = 'done', last_error = NULL WHERE status IN ('failed', 'error')`);
   return result.changes ?? 0;
 }

@@ -1,4 +1,5 @@
-// Tipos centrales del dominio. Dinero SIEMPRE en centavos (integer) — nunca float.
+// Tipos centrales del dominio. Los conceptos y campos monetarios reflejan mobile/src/domain/types.ts;
+// el servidor conserva sus formas de PostgreSQL/API. Dinero SIEMPRE en centavos enteros — nunca float.
 
 export type SyncStatus = "synced" | "pending" | "syncing" | "failed";
 

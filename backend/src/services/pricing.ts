@@ -1,3 +1,5 @@
+// REGLA COMPARTIDA: mantener las fórmulas y redondeos idénticos a mobile/src/domain/pricing.ts.
+// Cualquier cambio en precios, descuentos, combos o impuestos debe replicarse en su contraparte.
 import { OrderItemInput, OrderItemSnapshot, PricedOrder, Product, ProductPresentation } from "../types";
 
 /**
@@ -17,12 +19,32 @@ export interface PresentationLookup {
 
 export type LookupFn = (productId: string, presentationId: string) => PresentationLookup | null;
 
+const TAX_RATE_DENOMINATOR = 1_000;
+
+export function calculateLineSubtotalCents(unitPriceCents: number, quantity: number): number {
+  if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0) {
+    throw new PricingError("El precio debe expresarse en centavos enteros.");
+  }
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
+  }
+  const subtotalCents = unitPriceCents * quantity;
+  if (!Number.isSafeInteger(subtotalCents)) {
+    throw new PricingError("El subtotal excede el monto seguro en centavos.");
+  }
+  return subtotalCents;
+}
+
+export function calculateTaxCents(subtotalCents: number, taxRatePermille: number): number {
+  return Math.round((subtotalCents * taxRatePermille) / TAX_RATE_DENOMINATOR);
+}
+
 export function buildOrderItemSnapshot(
   input: OrderItemInput,
   lookup: LookupFn
 ): OrderItemSnapshot {
-  if (input.quantity <= 0) {
-    throw new PricingError("La cantidad debe ser mayor a 0.");
+  if (!Number.isSafeInteger(input.quantity) || input.quantity <= 0) {
+    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
   }
   const found = lookup(input.product_id, input.presentation_id);
   if (!found) {
@@ -38,7 +60,7 @@ export function buildOrderItemSnapshot(
   // arquitectura soporta promo_active/promo_price_cents pero no inventamos reglas de
   // descuento complejas sin necesidad).
   const unitPriceCents = presentation.price_cents;
-  const subtotalCents = unitPriceCents * input.quantity;
+  const subtotalCents = calculateLineSubtotalCents(unitPriceCents, input.quantity);
 
   return {
     product_id: product.id,
@@ -63,7 +85,7 @@ export function priceOrder(
   }
   const items = inputs.map((i) => buildOrderItemSnapshot(i, lookup));
   const subtotal_cents = items.reduce((acc, i) => acc + i.subtotal_cents, 0);
-  const tax_cents = Math.round((subtotal_cents * taxRatePermille) / 1000);
+  const tax_cents = calculateTaxCents(subtotal_cents, taxRatePermille);
   const total_cents = subtotal_cents + tax_cents;
   const item_count = items.reduce((acc, i) => acc + i.quantity, 0);
   return { items, subtotal_cents, tax_cents, total_cents, item_count };

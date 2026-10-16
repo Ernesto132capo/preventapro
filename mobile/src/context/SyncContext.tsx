@@ -51,7 +51,11 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
     const failedRows = await getFailedErrors();
     if (result.ok && failedRows.length === 0) {
       setLastSyncedAt(new Date().toISOString());
-      setLastError(null);
+      setLastError(
+        result.pushed.deferred > 0
+          ? `${result.pushed.deferred} elemento(s) quedaron pendientes por conexión, sesión o dependencias; se reintentará en la próxima sincronización.`
+          : null
+      );
       setConnection("online");
       setSyncTick((t) => t + 1);
     } else if (result.ok) {

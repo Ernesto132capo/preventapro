@@ -217,15 +217,7 @@ export function NewSaleScreen() {
       selections: CartLineSelection[]
     ) => {
       const line: CartLine = {
-        productId: product.id,
-        presentationId: presentation.id,
-        productName: product.name,
-        sku: product.sku,
-        presentationName: presentation.name,
-        unitEquivalence: presentation.unit_equivalence,
-        unitPriceCents: presentation.price_cents,
-        quantity,
-        subtotalCents: presentation.price_cents * quantity,
+        ...buildCartLine(product, presentation, quantity),
         isCombo: true,
         selections,
       };
@@ -237,8 +229,12 @@ export function NewSaleScreen() {
   const changeLineQuantity = useCallback((index: number, delta: number) => {
     setCart((prev) =>
       prev
-        .map((l, i) => (i === index ? { ...l, quantity: l.quantity + delta, subtotalCents: l.unitPriceCents * (l.quantity + delta) } : l))
-        .filter((l) => l.quantity > 0)
+        .map((line, i) => {
+          if (i !== index) return line;
+          const quantity = line.quantity + delta;
+          return quantity > 0 ? recalcLineQuantity(line, quantity) : null;
+        })
+        .filter((line): line is CartLine => line !== null)
     );
   }, []);
 

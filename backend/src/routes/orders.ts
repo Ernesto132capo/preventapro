@@ -4,6 +4,7 @@ import { z } from "zod";
 import { PoolClient } from "pg";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
+import { calculateLineSubtotalCents, calculateTaxCents } from "../services/pricing";
 import { invalidatePullCache } from "./sync";
 import { invalidateWorkdayCache } from "./workdays";
 
@@ -32,6 +33,16 @@ const schema = z.object({
   taxRatePermille: z.number().int().min(0).max(1_000).default(0),
   items: z.array(item).min(1).max(100),
 }).strict();
+
+class OrderValidationError extends Error {}
+
+function isConstraintViolation(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && "code" in error &&
+    typeof (error as { code?: unknown }).code === "string" &&
+    (error as { code: string }).code.startsWith("23")
+  );
+}
 
 function serial(row: any, items: any[]) {
   return {
@@ -101,19 +112,19 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       [x.presentationId]
     );
     const p = pRows[0], q = qRows[0];
-    if (!p || p.active === false || !q || q.active === false) throw Error("Producto o presentación no encontrados o inactivos.");
-    if (q.product_id !== x.productId) throw Error("La presentación no pertenece a este producto.");
+    if (!p || p.active === false || !q || q.active === false) throw new OrderValidationError("Producto o presentación no encontrados o inactivos.");
+    if (q.product_id !== x.productId) throw new OrderValidationError("La presentación no pertenece a este producto.");
 
     const selectionsSnapshot: any[] = [];
     if (p.product_type === "combo") {
       if (!x.selections || x.selections.length === 0) {
-        throw Error(`El producto combo "${p.name}" requiere selecciones de opciones.`);
+        throw new OrderValidationError(`El producto combo "${p.name}" requiere selecciones de opciones.`);
       }
       const { rows: comboDefs } = await client.query(
         "SELECT * FROM combo_definitions WHERE product_id = $1 AND active = true LIMIT 1",
         [x.productId]
       );
-      if (comboDefs.length === 0) throw Error(`El producto combo "${p.name}" no tiene una definición de combo activa.`);
+      if (comboDefs.length === 0) throw new OrderValidationError(`El producto combo "${p.name}" no tiene una definición de combo activa.`);
       const comboDef = comboDefs[0];
 
       const { rows: comboOpts } = await client.query(
@@ -127,7 +138,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       const expectedMax = comboDef.selection_max;
 
       if (totalSelectedUnits < expectedMin || totalSelectedUnits > expectedMax) {
-        throw Error(
+        throw new OrderValidationError(
           `La selección para el combo "${p.name}" debe ser entre ${expectedMin} y ${expectedMax} unidades (seleccionadas: ${totalSelectedUnits}).`
         );
       }
@@ -136,10 +147,10 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
         const s = x.selections[sIdx];
         const opt = optMap.get(s.selectedPresentationId);
         if (!opt) {
-          throw Error(`La opción seleccionada no pertenece a este combo.`);
+          throw new OrderValidationError(`La opción seleccionada no pertenece a este combo.`);
         }
         if (opt.max_quantity != null && s.quantity > opt.max_quantity) {
-          throw Error(`La cantidad seleccionada para una de las opciones excede el máximo permitido de ${opt.max_quantity}.`);
+          throw new OrderValidationError(`La cantidad seleccionada para una de las opciones excede el máximo permitido de ${opt.max_quantity}.`);
         }
 
         const { rows: selPresRows } = await client.query(
@@ -149,7 +160,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
            WHERE pp.id = $1 AND pp.active = true AND p.active = true`,
           [s.selectedPresentationId]
         );
-        if (selPresRows.length === 0) throw Error("Opción seleccionada no disponible o inactiva.");
+        if (selPresRows.length === 0) throw new OrderValidationError("Opción seleccionada no disponible o inactiva.");
         const selRow = selPresRows[0];
 
         selectionsSnapshot.push({
@@ -164,7 +175,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       }
     } else {
       if (x.selections && x.selections.length > 0) {
-        throw Error(`El producto estándar "${p.name}" no admite selecciones de combo.`);
+        throw new OrderValidationError(`El producto estándar "${p.name}" no admite selecciones de combo.`);
       }
     }
 
@@ -178,7 +189,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       unit_equivalence_snapshot: q.unit_equivalence,
       unit_price_cents_snapshot: q.price_cents,
       quantity: x.quantity,
-      subtotal_cents: q.price_cents * x.quantity,
+      subtotal_cents: calculateLineSubtotalCents(q.price_cents, x.quantity),
       selections: selectionsSnapshot,
     });
   }
@@ -202,25 +213,49 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
   const r = schema.safeParse(req.body);
   if (!r.success) return res.status(400).json({ error: "Datos inválidos", details: r.error.flatten() });
   const d = r.data;
-
-  const existing = await pool.query("SELECT id FROM orders WHERE idempotency_key = $1 LIMIT 1", [d.idempotencyKey]);
-  if (existing.rows.length > 0) return res.json({ order: await full(existing.rows[0].id), deduped: true });
-
-  const { rows: wdRows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [d.workDayId]);
-  const wd = wdRows[0];
-  if (!wd) return res.status(404).json({ error: "Jornada no encontrada." });
-  if (wd.status === "closed") return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
-
-  const { rows: clRows } = await pool.query("SELECT * FROM clients WHERE id = $1", [d.clientId]);
-  const cl = clRows[0];
-  if (!cl || cl.active === false) return res.status(400).json({ error: "Cliente inválido o inactivo." });
-
   const client = await pool.connect();
+  let inTransaction = false;
   try {
     await client.query("BEGIN");
+    inTransaction = true;
+
+    // El lock transaccional serializa reintentos simultáneos con la misma clave,
+    // incluso en instalaciones que aún no tengan un índice UNIQUE para ella.
+    await client.query("SELECT pg_advisory_xact_lock(1002, hashtext($1))", [d.idempotencyKey]);
+    const existing = await client.query("SELECT id FROM orders WHERE idempotency_key = $1 LIMIT 1", [d.idempotencyKey]);
+    if (existing.rows.length > 0) {
+      const existingOrder = await full(existing.rows[0].id, client);
+      await client.query("COMMIT");
+      inTransaction = false;
+      return res.json({ order: existingOrder, deduped: true });
+    }
+
+    // Bloquear la jornada impide que un cierre concurrente guarde totales
+    // anteriores a esta preventa o la cierre entre validación e inserción.
+    const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [d.workDayId]);
+    const wd = wdRows[0];
+    if (!wd) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Jornada no encontrada." });
+    }
+    if (wd.status === "closed") {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
+    }
+
+    const { rows: clRows } = await client.query("SELECT * FROM clients WHERE id = $1 FOR SHARE", [d.clientId]);
+    const cl = clRows[0];
+    if (!cl || cl.active === false) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "Cliente inválido o inactivo." });
+    }
+
     const items = await make(client, d.items);
     const sub = items.reduce((n, x) => n + x.subtotal_cents, 0);
-    const tax = Math.round((sub * d.taxRatePermille) / 1000);
+    const tax = calculateTaxCents(sub, d.taxRatePermille);
     const id = uuid(), ts = nowIso();
     const itemCount = items.reduce((n, x) => n + x.quantity, 0);
 
@@ -255,12 +290,20 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     }
 
     await totals(client, d.workDayId);
+    const createdOrder = await full(id, client);
     await client.query("COMMIT");
+    inTransaction = false;
     invalidateReadCaches();
-    res.status(201).json({ order: await full(id) });
-  } catch (e: any) {
-    await client.query("ROLLBACK");
-    res.status(400).json({ error: e.message });
+    res.status(201).json({ order: createdOrder });
+  } catch (e: unknown) {
+    if (inTransaction) {
+      try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
+    }
+    if (e instanceof OrderValidationError || isConstraintViolation(e)) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Datos de preventa no válidos." });
+    }
+    console.error("Error al registrar preventa:", e);
+    res.status(500).json({ error: "No se pudo registrar la preventa." });
   } finally {
     client.release();
   }
@@ -275,22 +318,31 @@ ordersRouter.get("/:id", async (req, res) => {
 ordersRouter.put("/:id", async (req, res) => {
   const parsed = schema.omit({ idempotencyKey: true, workDayId: true, clientId: true }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-
-  const { rows: oldRows } = await pool.query("SELECT * FROM orders WHERE id = $1", [req.params.id]);
-  const order = oldRows[0];
-  if (!order) return res.status(404).json({ error: "Preventa no encontrada." });
-
-  const { rows: wdRows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [order.work_day_id]);
-  const wd = wdRows[0];
-  if (wd && wd.status === "closed") return res.status(400).json({ error: "La jornada está concluida. Para editar preventas debes reabrir la jornada." });
-
   const client = await pool.connect();
+  let inTransaction = false;
   try {
     await client.query("BEGIN");
+    inTransaction = true;
+    const { rows: oldRows } = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const order = oldRows[0];
+    if (!order) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Preventa no encontrada." });
+    }
+
+    const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
+    const wd = wdRows[0];
+    if (wd && wd.status === "closed") {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "La jornada está concluida. Para editar preventas debes reabrir la jornada." });
+    }
+
     const d = parsed.data;
     const items = await make(client, d.items);
     const sub = items.reduce((n, x) => n + x.subtotal_cents, 0);
-    const tax = Math.round((sub * d.taxRatePermille) / 1000);
+    const tax = calculateTaxCents(sub, d.taxRatePermille);
     const ts = nowIso();
     const itemCount = items.reduce((n, x) => n + x.quantity, 0);
 
@@ -324,35 +376,56 @@ ordersRouter.put("/:id", async (req, res) => {
       [req.params.id, d.paymentCondition, d.taxRatePermille, sub, tax, sub + tax, itemCount, ts]
     );
     await totals(client, order.work_day_id);
+    const updatedOrder = await full(req.params.id, client);
     await client.query("COMMIT");
+    inTransaction = false;
     invalidateReadCaches();
-    res.json({ order: await full(req.params.id) });
-  } catch (e: any) {
-    await client.query("ROLLBACK");
-    res.status(400).json({ error: e.message });
+    res.json({ order: updatedOrder });
+  } catch (error: unknown) {
+    if (inTransaction) {
+      try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
+    }
+    if (error instanceof OrderValidationError || isConstraintViolation(error)) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : "Datos de preventa no válidos." });
+    }
+    console.error("Error al actualizar preventa:", error);
+    res.status(500).json({ error: "No se pudo actualizar la preventa." });
   } finally {
     client.release();
   }
 });
 
 ordersRouter.post("/:id/cancel", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM orders WHERE id = $1", [req.params.id]);
-  const d = rows[0];
-  if (!d) return res.status(404).json({ error: "Preventa no encontrada." });
-
-  const { rows: wdRows } = await pool.query("SELECT * FROM work_days WHERE id = $1", [d.work_day_id]);
-  const wd = wdRows[0];
-  if (wd && wd.status === "closed") return res.status(400).json({ error: "La jornada está concluida. Para eliminar preventas debes reabrir la jornada." });
-
   const client = await pool.connect();
+  let inTransaction = false;
   try {
     await client.query("BEGIN");
+    inTransaction = true;
+    const { rows } = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const order = rows[0];
+    if (!order) {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(404).json({ error: "Preventa no encontrada." });
+    }
+    const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
+    const wd = wdRows[0];
+    if (wd && wd.status === "closed") {
+      await client.query("ROLLBACK");
+      inTransaction = false;
+      return res.status(400).json({ error: "La jornada está concluida. Para eliminar preventas debes reabrir la jornada." });
+    }
+
     await client.query("UPDATE orders SET status = 'cancelled', updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
-    await totals(client, d.work_day_id);
+    await totals(client, order.work_day_id);
     await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
+    inTransaction = false;
+  } catch (error) {
+    if (inTransaction) {
+      try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
+    }
+    console.error("Error al cancelar preventa:", error);
+    return res.status(500).json({ error: "No se pudo cancelar la preventa." });
   } finally {
     client.release();
   }

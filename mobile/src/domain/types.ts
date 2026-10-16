@@ -1,5 +1,6 @@
-// Tipos del dominio. Dinero SIEMPRE en centavos (integer). Espejo de backend/src/types.ts
-// para que la app funcione con la MISMA lógica estando online u offline.
+// Tipos del dominio. Espejo conceptual de backend/src/types.ts: dinero SIEMPRE en centavos enteros.
+// Mobile conserva además campos de SQLite/sincronización; cualquier cambio de reglas de precios
+// debe mantenerse alineado con backend/src/services/pricing.ts.
 
 export type SyncStatus = "synced" | "pending" | "syncing" | "failed";
 

@@ -154,26 +154,52 @@ CREATE TABLE IF NOT EXISTS outbox (
   operation TEXT NOT NULL DEFAULT 'create', -- 'create' | 'update' | 'cancel'
   local_entity_id TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 2,  -- 1 = clientes/productos/categorías primero, 2 = preventas después
-  status TEXT NOT NULL DEFAULT 'pending', -- pending | syncing | failed | done
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | syncing | failed (retryable legacy) | error (permanent) | done
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   created_at TEXT NOT NULL
 );
 
--- Índices de alto rendimiento para búsquedas y joins rápidos
-CREATE INDEX IF NOT EXISTS idx_products_name ON products (name COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS idx_products_sku ON products (sku);
-CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id);
-CREATE INDEX IF NOT EXISTS idx_presentations_product ON product_presentations (product_id);
+`;
+
+// Se ejecuta después de las migraciones: en bases antiguas CREATE TABLE IF NOT
+// EXISTS no agrega columnas y un índice sobre una columna faltante abortaría el SQL.
+export const LOCAL_INDEXES = `
+CREATE INDEX IF NOT EXISTS idx_categories_name ON categories (name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_categories_name_lower ON categories (lower(name));
+CREATE INDEX IF NOT EXISTS idx_categories_server_id ON categories (server_id);
 CREATE INDEX IF NOT EXISTS idx_clients_name ON clients (business_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_clients_server_id ON clients (server_id);
 CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
+CREATE INDEX IF NOT EXISTS idx_clients_contact_name ON clients (contact_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_clients_neighborhood ON clients (neighborhood_id);
+CREATE INDEX IF NOT EXISTS idx_products_name ON products (name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_products_sku ON products (sku);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id);
+CREATE INDEX IF NOT EXISTS idx_products_server_id ON products (server_id);
+CREATE INDEX IF NOT EXISTS idx_presentations_product ON product_presentations (product_id);
+CREATE INDEX IF NOT EXISTS idx_presentations_product_name ON product_presentations (product_id, name);
+CREATE INDEX IF NOT EXISTS idx_presentations_server_id ON product_presentations (server_id);
+CREATE INDEX IF NOT EXISTS idx_combo_definitions_product ON combo_definitions (product_id, active);
+CREATE INDEX IF NOT EXISTS idx_combo_options_combo ON combo_options (combo_id, active, sort_order);
+CREATE INDEX IF NOT EXISTS idx_combo_options_presentation ON combo_options (presentation_id);
+CREATE INDEX IF NOT EXISTS idx_work_days_server_id ON work_days (server_id);
+CREATE INDEX IF NOT EXISTS idx_work_days_date_status ON work_days (work_date, status);
+CREATE INDEX IF NOT EXISTS idx_work_days_status_date ON work_days (status, work_date DESC);
+CREATE INDEX IF NOT EXISTS idx_work_days_user_status_date ON work_days (user_id, status, work_date);
 CREATE INDEX IF NOT EXISTS idx_orders_client ON orders (client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_work_day ON orders (work_day_id);
+CREATE INDEX IF NOT EXISTS idx_orders_work_day_status_created ON orders (work_day_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_work_day_sync_status ON orders (work_day_id, status, sync_status);
+CREATE INDEX IF NOT EXISTS idx_orders_server_id ON orders (server_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items (product_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_presentation ON order_items (presentation_id);
 CREATE INDEX IF NOT EXISTS idx_order_selections_item ON order_item_selections (order_item_id);
+CREATE INDEX IF NOT EXISTS idx_order_selections_product ON order_item_selections (selected_product_id);
 CREATE INDEX IF NOT EXISTS idx_order_selections_presentation ON order_item_selections (selected_presentation_id);
-CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox (status, priority);
+CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox (status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_entity_local_status ON outbox (entity_type, local_entity_id, status);
 `;
 

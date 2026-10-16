@@ -1,96 +1,117 @@
 import * as SQLite from "expo-sqlite";
-import { LOCAL_SCHEMA } from "./schema";
+import { LOCAL_INDEXES, LOCAL_SCHEMA } from "./schema";
 
 let dbInstance: SQLite.SQLiteDatabase | null = null;
+let dbInitialization: Promise<SQLite.SQLiteDatabase> | null = null;
+
+// v1: columnas de sincronización; v2: tablas de combos/selecciones; v3: retiro de stock.
+const DATABASE_SCHEMA_VERSION = 3;
+
+type ColumnMigration = { name: string; definition: string };
+
+// Columnas que se incorporaron después de las primeras bases locales.
+// Se verifican por PRAGMA antes de ALTER TABLE para que la migración sea repetible.
+const REQUIRED_ADDITIVE_COLUMNS: Record<string, ColumnMigration[]> = {
+  categories: [
+    { name: "server_id", definition: "TEXT" },
+    { name: "active", definition: "INTEGER NOT NULL DEFAULT 1" },
+    { name: "sync_status", definition: "TEXT NOT NULL DEFAULT 'synced'" },
+    { name: "updated_at", definition: "TEXT" },
+  ],
+  products: [{ name: "product_type", definition: "TEXT NOT NULL DEFAULT 'standard'" }],
+  outbox: [{ name: "operation", definition: "TEXT NOT NULL DEFAULT 'create'" }],
+};
+
+const REQUIRED_COLUMNS: Record<string, string[]> = {
+  meta: ["key", "value"],
+  categories: ["id", "server_id", "name", "active", "sync_status", "updated_at"],
+  clients: ["id", "server_id", "business_name", "contact_name", "phone", "neighborhood_id", "neighborhood_name", "address", "lat", "lng", "visit_status", "active", "sync_status", "created_at", "updated_at"],
+  products: ["id", "server_id", "sku", "name", "category_id", "base_cost_cents", "base_unit_name", "active", "promo_active", "product_type", "sync_status"],
+  combo_definitions: ["id", "server_id", "product_id", "selection_min", "selection_max", "active", "sync_status"],
+  combo_options: ["id", "server_id", "combo_id", "presentation_id", "max_quantity", "sort_order", "active", "sync_status"],
+  product_presentations: ["id", "server_id", "product_id", "name", "sort_order", "unit_equivalence", "price_cents", "cost_cents", "active"],
+  work_days: ["id", "server_id", "user_id", "work_date", "status", "order_count", "total_cents", "sync_status", "created_at"],
+  orders: ["id", "server_id", "work_day_id", "client_id", "client_name", "payment_condition", "subtotal_cents", "tax_cents", "total_cents", "item_count", "status", "sync_status", "sync_error", "created_at", "updated_at"],
+  order_items: ["id", "order_id", "product_id", "presentation_id", "product_name_snapshot", "sku_snapshot", "presentation_name_snapshot", "unit_equivalence_snapshot", "unit_price_cents_snapshot", "quantity", "subtotal_cents"],
+  order_item_selections: ["id", "order_item_id", "selected_product_id", "selected_presentation_id", "product_name_snapshot", "presentation_name_snapshot", "quantity", "sort_order"],
+  product_favorites: ["product_id", "created_at"],
+  outbox: ["id", "entity_type", "operation", "local_entity_id", "priority", "status", "attempts", "last_error", "created_at"],
+};
+
+async function tableColumnNames(db: SQLite.SQLiteDatabase, table: string): Promise<Set<string>> {
+  const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+  return new Set(columns.map((column) => column.name));
+}
+
+async function ensureRequiredColumns(db: SQLite.SQLiteDatabase): Promise<void> {
+  for (const [table, additions] of Object.entries(REQUIRED_ADDITIVE_COLUMNS)) {
+    const names = await tableColumnNames(db, table);
+    for (const column of additions) {
+      if (names.has(column.name)) continue;
+      await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${column.name} ${column.definition}`);
+      names.add(column.name);
+    }
+  }
+}
+
+async function verifyRequiredColumns(db: SQLite.SQLiteDatabase): Promise<void> {
+  for (const [table, required] of Object.entries(REQUIRED_COLUMNS)) {
+    const names = await tableColumnNames(db, table);
+    const missing = required.filter((column) => !names.has(column));
+    if (missing.length > 0) {
+      throw new Error(`Esquema SQLite incompleto en ${table}; faltan columnas: ${missing.join(", ")}.`);
+    }
+  }
+}
+
+async function removeLegacyStockColumn(db: SQLite.SQLiteDatabase): Promise<boolean> {
+  const names = await tableColumnNames(db, "product_presentations");
+  if (!names.has("quantity_available")) return true;
+  try {
+    await db.execAsync("ALTER TABLE product_presentations DROP COLUMN quantity_available");
+    return true;
+  } catch (error) {
+    // La columna ya no se usa. En SQLite antiguos se conserva, pero no se recrea
+    // ni se pierde ninguna presentación o preventa por una incompatibilidad DDL.
+    console.warn("No se pudo quitar la columna local quantity_available; se conservará sin uso.", error);
+    return false;
+  }
+}
+
+async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
+  const db = await SQLite.openDatabaseAsync("preventapro.db");
+  await db.execAsync(LOCAL_SCHEMA);
+
+  const versionRows = await db.getAllAsync<{ user_version: number }>("PRAGMA user_version");
+  const currentVersion = Number(versionRows[0]?.user_version ?? 0);
+  await db.withTransactionAsync(async () => {
+    // Se comprueba cada columna para reparar también instalaciones en las que
+    // una versión anterior dejó la migración a medio aplicar.
+    await ensureRequiredColumns(db);
+    // La verificación de columnas hace segura la operación incluso cuando el
+    // campo ya fue retirado o una versión anterior no pudo hacerlo.
+    const stockMigrationComplete = await removeLegacyStockColumn(db);
+    await verifyRequiredColumns(db);
+    const nextVersion = stockMigrationComplete
+      ? Math.max(currentVersion, DATABASE_SCHEMA_VERSION)
+      : currentVersion;
+    await db.execAsync(`PRAGMA user_version = ${nextVersion}`);
+  });
+
+  await db.execAsync(LOCAL_INDEXES);
+  dbInstance = db;
+  return db;
+}
 
 export async function getDb(): Promise<SQLite.SQLiteDatabase> {
   if (dbInstance) return dbInstance;
-  const db = await SQLite.openDatabaseAsync("preventapro.db");
-  await db.execAsync(LOCAL_SCHEMA);
-  // Elimina la columna de inventario de bases locales creadas por versiones previas.
-  try {
-    const presentationColumns = await db.getAllAsync<{ name: string }>("PRAGMA table_info(product_presentations)");
-    if (presentationColumns.some((column) => column.name === "quantity_available")) {
-      await db.execAsync("ALTER TABLE product_presentations DROP COLUMN quantity_available");
-    }
-  } catch {
-    // Si SQLite ya no tiene esa columna o no puede alterar la tabla, la app ya no depende de ella.
+  if (!dbInitialization) {
+    dbInitialization = initializeDb().catch((error) => {
+      dbInitialization = null;
+      throw error;
+    });
   }
-  // Migración para instalaciones que ya tenían creada la tabla outbox.
-  try {
-    await db.execAsync("ALTER TABLE outbox ADD COLUMN operation TEXT NOT NULL DEFAULT 'create'");
-  } catch {
-    // La columna ya existe.
-  }
-  try {
-    await db.execAsync("ALTER TABLE products ADD COLUMN product_type TEXT NOT NULL DEFAULT 'standard'");
-  } catch {
-    // La columna ya existe.
-  }
-  try {
-    await db.execAsync("ALTER TABLE categories ADD COLUMN server_id TEXT");
-  } catch {}
-  try {
-    await db.execAsync("ALTER TABLE categories ADD COLUMN active INTEGER NOT NULL DEFAULT 1");
-  } catch {}
-  try {
-    await db.execAsync("ALTER TABLE categories ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'synced'");
-  } catch {}
-  try {
-    await db.execAsync("ALTER TABLE categories ADD COLUMN updated_at TEXT");
-  } catch {}
-  try {
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS combo_definitions (
-        id TEXT PRIMARY KEY,
-        server_id TEXT,
-        product_id TEXT NOT NULL,
-        selection_min INTEGER NOT NULL,
-        selection_max INTEGER NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1,
-        sync_status TEXT NOT NULL DEFAULT 'synced'
-      );
-      CREATE TABLE IF NOT EXISTS combo_options (
-        id TEXT PRIMARY KEY,
-        server_id TEXT,
-        combo_id TEXT NOT NULL,
-        presentation_id TEXT NOT NULL,
-        max_quantity INTEGER,
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        active INTEGER NOT NULL DEFAULT 1,
-        sync_status TEXT NOT NULL DEFAULT 'synced'
-      );
-      CREATE TABLE IF NOT EXISTS order_item_selections (
-        id TEXT PRIMARY KEY,
-        order_item_id TEXT NOT NULL,
-        selected_product_id TEXT NOT NULL,
-        selected_presentation_id TEXT NOT NULL,
-        product_name_snapshot TEXT NOT NULL,
-        presentation_name_snapshot TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
-        sort_order INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS product_favorites (
-        product_id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_products_name ON products (name COLLATE NOCASE);
-      CREATE INDEX IF NOT EXISTS idx_products_sku ON products (sku);
-      CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id);
-      CREATE INDEX IF NOT EXISTS idx_presentations_product ON product_presentations (product_id);
-      CREATE INDEX IF NOT EXISTS idx_clients_name ON clients (business_name COLLATE NOCASE);
-      CREATE INDEX IF NOT EXISTS idx_clients_server_id ON clients (server_id);
-      CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
-      CREATE INDEX IF NOT EXISTS idx_orders_client ON orders (client_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_orders_work_day ON orders (work_day_id);
-      CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items (order_id);
-      CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items (product_id);
-      CREATE INDEX IF NOT EXISTS idx_order_selections_item ON order_item_selections (order_item_id);
-      CREATE INDEX IF NOT EXISTS idx_order_selections_presentation ON order_item_selections (selected_presentation_id);
-    `);
-  } catch {}
-  dbInstance = db;
-  return db;
+  return dbInitialization;
 }
 
 export async function getMeta(key: string): Promise<string | null> {

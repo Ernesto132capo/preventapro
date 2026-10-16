@@ -1,3 +1,5 @@
+// REGLA COMPARTIDA: mantener las fórmulas y redondeos idénticos a backend/src/services/pricing.ts.
+// Cualquier cambio en precios, descuentos, combos o impuestos debe replicarse en su contraparte.
 import { CartLine, Presentation, Product } from "./types";
 
 /**
@@ -14,8 +16,33 @@ export class PricingError extends Error {
   }
 }
 
+const TAX_RATE_DENOMINATOR = 1_000;
+
+export function calculateLineSubtotalCents(unitPriceCents: number, quantity: number): number {
+  if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0) {
+    throw new PricingError("El precio debe expresarse en centavos enteros.");
+  }
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
+  }
+  const subtotalCents = unitPriceCents * quantity;
+  if (!Number.isSafeInteger(subtotalCents)) {
+    throw new PricingError("El subtotal excede el monto seguro en centavos.");
+  }
+  return subtotalCents;
+}
+
+export function calculateTaxCents(subtotalCents: number, taxRatePermille: number): number {
+  return Math.round((subtotalCents * taxRatePermille) / TAX_RATE_DENOMINATOR);
+}
+
 export function buildCartLine(product: Product, presentation: Presentation, quantity: number): CartLine {
-  if (quantity <= 0) throw new PricingError("La cantidad debe ser mayor a 0.");
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
+  }
+  if (!product || !presentation) {
+    throw new PricingError("Producto o presentación no encontrados o inactivos.");
+  }
   if (presentation.product_id !== product.id) {
     throw new PricingError("La presentación no pertenece a este producto.");
   }
@@ -29,13 +56,15 @@ export function buildCartLine(product: Product, presentation: Presentation, quan
     unitEquivalence: presentation.unit_equivalence,
     unitPriceCents,
     quantity,
-    subtotalCents: unitPriceCents * quantity,
+    subtotalCents: calculateLineSubtotalCents(unitPriceCents, quantity),
   };
 }
 
 export function recalcLineQuantity(line: CartLine, quantity: number): CartLine {
-  if (quantity <= 0) throw new PricingError("La cantidad debe ser mayor a 0.");
-  return { ...line, quantity, subtotalCents: line.unitPriceCents * quantity };
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
+  }
+  return { ...line, quantity, subtotalCents: calculateLineSubtotalCents(line.unitPriceCents, quantity) };
 }
 
 export interface OrderTotals {
@@ -48,8 +77,11 @@ export interface OrderTotals {
 /** taxRatePermille: milésimas (130 = 13.0%). 0 = exento (valor actual del diseño). */
 export function calcOrderTotals(lines: CartLine[], taxRatePermille = 0): OrderTotals {
   if (lines.length === 0) throw new PricingError("La preventa debe tener al menos un producto.");
-  const subtotalCents = lines.reduce((acc, l) => acc + l.subtotalCents, 0);
-  const taxCents = Math.round((subtotalCents * taxRatePermille) / 1000);
+  const subtotalCents = lines.reduce(
+    (acc, line) => acc + calculateLineSubtotalCents(line.unitPriceCents, line.quantity),
+    0
+  );
+  const taxCents = calculateTaxCents(subtotalCents, taxRatePermille);
   const totalCents = subtotalCents + taxCents;
   const itemCount = lines.reduce((acc, l) => acc + l.quantity, 0);
   return { subtotalCents, taxCents, totalCents, itemCount };

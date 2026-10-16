@@ -30,6 +30,14 @@ const clientSchema = z.object({
   lng: z.number().finite().min(-180).max(180).optional(),
 }).strict();
 
+function isConstraintViolation(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && "code" in error &&
+    typeof (error as { code?: unknown }).code === "string" &&
+    (error as { code: string }).code.startsWith("23")
+  );
+}
+
 clientsRouter.get("/", async (_req, res) => {
   const { rows } = await pool.query(
     `SELECT c.*, n.name AS neighborhood_name
@@ -45,26 +53,52 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
   const parsed = clientSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   const d = parsed.data;
+  const client = await pool.connect();
+  let inTransaction = false;
+  try {
+    await client.query("BEGIN");
+    inTransaction = true;
 
-  if (d.clientLocalId) {
-    const existing = await pool.query("SELECT * FROM clients WHERE client_local_id = $1 LIMIT 1", [d.clientLocalId]);
-    if (existing.rows.length > 0) return res.json({ client: serializeClient(existing.rows[0]), deduped: true });
+    if (d.clientLocalId) {
+      // Serializa reintentos del mismo UUID local aunque todavía no exista un
+      // índice UNIQUE sobre client_local_id en una base ya desplegada.
+      await client.query("SELECT pg_advisory_xact_lock(1001, hashtext($1))", [d.clientLocalId]);
+      const existing = await client.query("SELECT * FROM clients WHERE client_local_id = $1 LIMIT 1", [d.clientLocalId]);
+      if (existing.rows.length > 0) {
+        await client.query("COMMIT");
+        inTransaction = false;
+        return res.json({ client: serializeClient(existing.rows[0]), deduped: true });
+      }
+    }
+
+    const id = uuid(), ts = nowIso();
+    const { rows } = await client.query(
+      `INSERT INTO clients (
+         id, client_code, business_name, contact_name, phone, neighborhood_id, address, lat, lng,
+         visit_status, active, assigned_user_id, created_by, client_local_id, created_at, updated_at
+       ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
+       RETURNING *`,
+      [
+        id, d.businessName, d.contactName ?? null, d.phone ?? null, d.neighborhoodId ?? null,
+        d.address ?? null, d.lat ?? null, d.lng ?? null, req.userId, d.clientLocalId ?? null, ts,
+      ]
+    );
+    await client.query("COMMIT");
+    inTransaction = false;
+    invalidatePullCache("clients");
+    res.status(201).json({ client: serializeClient(rows[0]) });
+  } catch (error) {
+    if (inTransaction) {
+      try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
+    }
+    if (isConstraintViolation(error)) {
+      return res.status(400).json({ error: "Uno o más datos del cliente no son válidos." });
+    }
+    console.error("Error al registrar cliente:", error);
+    res.status(500).json({ error: "No se pudo registrar el cliente." });
+  } finally {
+    client.release();
   }
-
-  const id = uuid(), ts = nowIso();
-  const { rows } = await pool.query(
-    `INSERT INTO clients (
-       id, client_code, business_name, contact_name, phone, neighborhood_id, address, lat, lng,
-       visit_status, active, assigned_user_id, created_by, client_local_id, created_at, updated_at
-     ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
-     RETURNING *`,
-    [
-      id, d.businessName, d.contactName ?? null, d.phone ?? null, d.neighborhoodId ?? null,
-      d.address ?? null, d.lat ?? null, d.lng ?? null, req.userId, d.clientLocalId ?? null, ts,
-    ]
-  );
-  invalidatePullCache("clients");
-  res.status(201).json({ client: serializeClient(rows[0]) });
 });
 
 clientsRouter.put("/:id", async (req, res) => {
