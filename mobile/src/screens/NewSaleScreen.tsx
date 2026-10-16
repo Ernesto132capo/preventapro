@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert } from "react-native";
+import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert, Modal } from "react-native";
 import { useFocusEffect, useIsFocused, useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
@@ -60,6 +60,9 @@ export function NewSaleScreen() {
   const saveInFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const editingOrderId = route.params?.orderId as string | undefined;
+
+  // Estado para modal de revisión de pedido/carrito sin scrollear
+  const [cartModalVisible, setCartModalVisible] = useState(false);
 
   // Estado para modal de selección de combo
   const [comboModalVisible, setComboModalVisible] = useState(false);
@@ -285,12 +288,19 @@ export function NewSaleScreen() {
     setSaving(true);
     try {
       let currentWd = await getTodayWorkDay(user!.id);
+      const localWdId = currentWd.id;
 
       try {
         const freshRes = await apiFetch<any>("/workdays/current?fresh=1");
         if (freshRes?.workDay) {
-          await upsertServerWorkDay(currentWd.id, freshRes.workDay);
-          currentWd = { ...currentWd, ...freshRes.workDay, status: freshRes.workDay.status };
+          await upsertServerWorkDay(localWdId, freshRes.workDay);
+          currentWd = {
+            ...currentWd,
+            ...freshRes.workDay,
+            id: localWdId,
+            server_id: freshRes.workDay.id,
+            status: freshRes.workDay.status,
+          };
           setWorkDay(currentWd);
         }
       } catch (netErr) {
@@ -317,7 +327,7 @@ export function NewSaleScreen() {
         await updateOrderLocal(editingOrderId, cart, paymentCondition);
       } else {
         await createOrderLocal({
-          workDayLocalId: currentWd.id,
+          workDayLocalId: localWdId,
           clientId: selectedClient.id,
           paymentCondition,
           lines: cart,
@@ -326,6 +336,7 @@ export function NewSaleScreen() {
       await pushSync();
       setCart([]);
       setSelectedClient(null);
+      setCartModalVisible(false);
       setStep("client");
       Alert.alert(editingOrderId ? "Preventa actualizada" : "Preventa guardada", "Se sincronizará automáticamente.");
       if (editingOrderId) navigation.goBack();
@@ -428,7 +439,14 @@ export function NewSaleScreen() {
   return (
     <View style={styles.screen}>
       <View style={styles.stepHeader}>
-        <Text style={styles.stepTitle}>Paso 2: Productos</Text>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <Text style={styles.stepTitle}>Paso 2: Productos</Text>
+          {cart.length > 0 && (
+            <Pressable style={styles.headerCartBadge} onPress={() => setCartModalVisible(true)}>
+              <Text style={styles.headerCartBadgeText}>🛒 {totals.itemCount} ({centsToBs(totals.totalCents)})</Text>
+            </Pressable>
+          )}
+        </View>
         <Pressable onPress={() => setStep("client")}>
           <Text style={styles.changeClient}>Cliente: {selectedClient?.business_name} · Cambiar</Text>
         </Pressable>
@@ -539,7 +557,7 @@ export function NewSaleScreen() {
         keyExtractor={productKeyExtractor}
         keyboardShouldPersistTaps="handled"
         renderItem={renderProductItem}
-        contentContainerStyle={{ padding: spacing.lg, paddingTop: spacing.xs }}
+        contentContainerStyle={{ padding: spacing.lg, paddingTop: spacing.xs, paddingBottom: cart.length > 0 ? 100 : spacing.lg }}
         initialNumToRender={6}
         maxToRenderPerBatch={8}
         windowSize={5}
@@ -575,6 +593,86 @@ export function NewSaleScreen() {
           ) : null
         }
       />
+
+      {/* Barra fija inferior cuando hay productos en el carrito */}
+      {cart.length > 0 && (
+        <View style={styles.dockedBottomBar}>
+          <Pressable style={styles.dockedCartInfo} onPress={() => setCartModalVisible(true)}>
+            <View style={styles.dockedCartIconWrap}>
+              <Text style={{ fontSize: 20 }}>🛒</Text>
+              <View style={styles.dockedCartBadgeCircle}>
+                <Text style={styles.dockedCartBadgeText}>{totals.itemCount}</Text>
+              </View>
+            </View>
+            <View style={{ marginLeft: 10 }}>
+              <Text style={styles.dockedTotalText}>{centsToBs(totals.totalCents)}</Text>
+              <Text style={styles.dockedSubtitle}>Toca para revisar items ({totals.itemCount})</Text>
+            </View>
+          </Pressable>
+          <Button
+            label={editingOrderId ? "Revisar / Guardar" : "Ver Pedido"}
+            variant="primary"
+            onPress={() => setCartModalVisible(true)}
+            style={styles.dockedViewBtn}
+          />
+        </View>
+      )}
+
+      {/* Modal para revisar el pedido y guardar sin necesidad de scrollear al fondo del catálogo */}
+      <Modal
+        visible={cartModalVisible}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setCartModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeaderRow}>
+              <View style={{ flex: 1, marginRight: spacing.sm }}>
+                <Text style={styles.modalTitle}>Resumen del Pedido</Text>
+                <Text style={styles.modalClientSub}>Cliente: {selectedClient?.business_name}</Text>
+              </View>
+              <Pressable onPress={() => setCartModalVisible(false)} style={styles.modalCloseBtn}>
+                <Text style={styles.modalCloseBtnText}>✕ Seguir agregando</Text>
+              </Pressable>
+            </View>
+
+            <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
+              <Text style={styles.cartTitle}>Productos añadidos ({totals.itemCount} items)</Text>
+              {cart.map((line, idx) => (
+                <CartLineItemRow
+                  key={`${line.presentationId}-${idx}`}
+                  line={line}
+                  index={idx}
+                  onChangeQty={changeLineQuantity}
+                />
+              ))}
+
+              <View style={styles.totalsBlock}>
+                <TotalRow label="Subtotal bruto" value={centsToBs(totals.subtotalCents)} />
+                <TotalRow label="Total" value={centsToBs(totals.totalCents)} bold />
+              </View>
+
+              {error && <Text style={styles.error}>{error}</Text>}
+            </ScrollView>
+
+            <View style={styles.modalFooter}>
+              <Button
+                label={editingOrderId ? "GUARDAR CAMBIOS" : "GUARDAR PREVENTA"}
+                onPress={handleSaveOrder}
+                loading={saving}
+                disabled={saving}
+              />
+              <Button
+                label="Volver al catálogo"
+                variant="outline"
+                onPress={() => setCartModalVisible(false)}
+                style={{ marginTop: spacing.sm }}
+              />
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <ComboSelectorModal
         visible={comboModalVisible}
@@ -849,4 +947,131 @@ const styles = StyleSheet.create({
   totalLabel: { fontSize: 12, color: colors.textSecondary },
   totalValue: { fontSize: 12, color: colors.textPrimary },
   error: { color: colors.errorText, marginTop: spacing.sm },
+  headerCartBadge: {
+    backgroundColor: colors.emerald,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: radius.pill,
+  },
+  headerCartBadgeText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  dockedBottomBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    elevation: 8,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+  },
+  dockedCartInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    marginRight: spacing.sm,
+  },
+  dockedCartIconWrap: {
+    position: "relative",
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.surfaceAlt,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dockedCartBadgeCircle: {
+    position: "absolute",
+    top: -4,
+    right: -4,
+    backgroundColor: colors.emerald,
+    borderRadius: 9,
+    minWidth: 18,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 3,
+  },
+  dockedCartBadgeText: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  dockedTotalText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: colors.textPrimary,
+  },
+  dockedSubtitle: {
+    fontSize: 11,
+    color: colors.textMuted,
+  },
+  dockedViewBtn: {
+    minHeight: 40,
+    paddingHorizontal: 16,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "flex-end",
+  },
+  modalCard: {
+    backgroundColor: colors.bg,
+    borderTopLeftRadius: radius.lg,
+    borderTopRightRadius: radius.lg,
+    maxHeight: "85%",
+    padding: spacing.lg,
+  },
+  modalHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    paddingBottom: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: colors.textPrimary,
+  },
+  modalClientSub: {
+    fontSize: 13,
+    color: colors.emeraldDark,
+    fontWeight: "600",
+    marginTop: 2,
+  },
+  modalCloseBtn: {
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderRadius: radius.sm,
+    backgroundColor: colors.surfaceAlt,
+  },
+  modalCloseBtnText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: colors.textSecondary,
+  },
+  modalScroll: {
+    maxHeight: 380,
+  },
+  modalFooter: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.md,
+    marginTop: spacing.sm,
+  },
 });

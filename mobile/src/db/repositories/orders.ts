@@ -22,9 +22,12 @@ export interface CreateOrderInput {
 export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOrder> {
   if (!input.clientId) throw new PricingError("Debes seleccionar un cliente.");
   const db = await getDb();
-  const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [input.workDayLocalId]);
+  const workDay = await db.getFirstAsync<{ id: string; user_id: string }>(
+    `SELECT id, user_id FROM work_days WHERE id = ? OR server_id = ?`,
+    [input.workDayLocalId, input.workDayLocalId]
+  );
   if (!workDay) throw new PricingError("No hay una jornada abierta para registrar la preventa.");
-  return withUserWorkDayLock(workDay.user_id, () => createOrderLocalLocked(input, workDay.user_id));
+  return withUserWorkDayLock(workDay.user_id, () => createOrderLocalLocked({ ...input, workDayLocalId: workDay.id }, workDay.user_id));
 }
 
 async function createOrderLocalLocked(input: CreateOrderInput, userId: string): Promise<LocalOrder> {
@@ -38,9 +41,9 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
   const ts = nowIso();
 
   await db.withTransactionAsync(async () => {
-    const currentWorkDay = await db.getFirstAsync<{ user_id: string; status: string }>(
-      `SELECT user_id, status FROM work_days WHERE id = ?`,
-      [input.workDayLocalId]
+    const currentWorkDay = await db.getFirstAsync<{ id: string; user_id: string; status: string }>(
+      `SELECT id, user_id, status FROM work_days WHERE id = ? OR server_id = ?`,
+      [input.workDayLocalId, input.workDayLocalId]
     );
     if (!currentWorkDay || currentWorkDay.user_id !== userId) {
       throw new PricingError("No hay una jornada válida para registrar la preventa.");
@@ -56,7 +59,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'pending', ?, ?)`,
       [
         orderId,
-        input.workDayLocalId,
+        currentWorkDay.id,
         input.clientId,
         client.business_name,
         input.paymentCondition,

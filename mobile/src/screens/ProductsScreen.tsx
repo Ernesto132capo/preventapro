@@ -146,62 +146,65 @@ export function ProductsScreen() {
         <Button label="+ Nuevo" onPress={() => navigation.navigate("NuevoProducto")} style={styles.newBtn} />
       </View>
 
-      <TextInput
-        style={styles.search}
-        placeholder="Buscar por nombre o SKU..."
-        placeholderTextColor={colors.textMuted}
-        value={search}
-        onChangeText={setSearch}
-      />
+      <View style={styles.topFilterSection}>
+        <TextInput
+          style={styles.search}
+          placeholder="Buscar por nombre o SKU..."
+          placeholderTextColor={colors.textMuted}
+          value={search}
+          onChangeText={setSearch}
+        />
 
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.categoriesBar}
-      >
-        <Pressable
-          style={[styles.categoryChip, !selectedCategoryId && !showOnlyFavorites && styles.categoryChipActive]}
-          onPress={() => {
-            setSelectedCategoryId(null);
-            setShowOnlyFavorites(false);
-          }}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={{ flexGrow: 0 }}
+          contentContainerStyle={styles.categoriesBar}
         >
-          <Text style={[styles.categoryChipText, !selectedCategoryId && !showOnlyFavorites && styles.categoryChipTextActive]}>
-            Todos ({products.length})
-          </Text>
-        </Pressable>
+          <Pressable
+            style={[styles.categoryChip, !selectedCategoryId && !showOnlyFavorites && styles.categoryChipActive]}
+            onPress={() => {
+              setSelectedCategoryId(null);
+              setShowOnlyFavorites(false);
+            }}
+          >
+            <Text style={[styles.categoryChipText, !selectedCategoryId && !showOnlyFavorites && styles.categoryChipTextActive]}>
+              Todos ({products.length})
+            </Text>
+          </Pressable>
 
-        <Pressable
-          style={[styles.categoryChip, showOnlyFavorites && styles.categoryChipFavoriteActive]}
-          onPress={() => {
-            setShowOnlyFavorites((prev) => !prev);
-            setSelectedCategoryId(null);
-          }}
-        >
-          <Text style={[styles.categoryChipText, showOnlyFavorites && styles.categoryChipTextActive]}>
-            ⭐ Favoritos ({favoriteCount})
-          </Text>
-        </Pressable>
+          <Pressable
+            style={[styles.categoryChip, showOnlyFavorites && styles.categoryChipFavoriteActive]}
+            onPress={() => {
+              setShowOnlyFavorites((prev) => !prev);
+              setSelectedCategoryId(null);
+            }}
+          >
+            <Text style={[styles.categoryChipText, showOnlyFavorites && styles.categoryChipTextActive]}>
+              ⭐ Favoritos ({favoriteCount})
+            </Text>
+          </Pressable>
 
-        {categories.map((cat) => {
-          const count = categoryCounts.get(cat.id) || 0;
-          const active = selectedCategoryId === cat.id && !showOnlyFavorites;
-          return (
-            <Pressable
-              key={cat.id}
-              style={[styles.categoryChip, active && styles.categoryChipActive]}
-              onPress={() => {
-                setShowOnlyFavorites(false);
-                setSelectedCategoryId(active ? null : cat.id);
-              }}
-            >
-              <Text style={[styles.categoryChipText, active && styles.categoryChipTextActive]}>
-                {cat.name} ({count})
-              </Text>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+          {categories.map((cat) => {
+            const count = categoryCounts.get(cat.id) || 0;
+            const active = selectedCategoryId === cat.id && !showOnlyFavorites;
+            return (
+              <Pressable
+                key={cat.id}
+                style={[styles.categoryChip, active && styles.categoryChipActive]}
+                onPress={() => {
+                  setShowOnlyFavorites(false);
+                  setSelectedCategoryId(active ? null : cat.id);
+                }}
+              >
+                <Text style={[styles.categoryChipText, active && styles.categoryChipTextActive]}>
+                  {cat.name} ({count})
+                </Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </View>
 
       <FlatList
         data={filteredProducts}
@@ -315,19 +318,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     backgroundColor: colors.surface,
   },
+  topFilterSection: {
+    paddingBottom: spacing.xs,
+  },
   categoriesBar: {
     paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    gap: spacing.xs,
+    paddingVertical: spacing.xs,
+    alignItems: "center",
+    flexDirection: "row",
   },
   categoryChip: {
+    height: 32,
     paddingHorizontal: 12,
-    paddingVertical: 6,
     borderRadius: radius.pill,
     backgroundColor: colors.surfaceAlt,
     borderWidth: 1,
     borderColor: colors.border,
     marginRight: spacing.xs,
+    justifyContent: "center",
+    alignItems: "center",
   },
   categoryChipActive: {
     backgroundColor: colors.navy,
@@ -341,6 +350,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
     color: colors.textSecondary,
+    lineHeight: 16,
   },
   categoryChipTextActive: {
     color: "#fff",
