@@ -11,6 +11,7 @@ import { OrderDetailScreen } from "../screens/OrderDetailScreen";
 import { NewSaleScreen } from "../screens/NewSaleScreen";
 
 export type RootStackParamList = {
+  Login: undefined;
   Tabs: undefined;
   Historial: undefined;
   NuevoCliente: { clientId?: string; returnToPreventa?: boolean } | undefined;
@@ -28,18 +29,20 @@ export function RootNavigator() {
 
   return (
     <NavigationContainer>
-      {!user ? (
-        <LoginScreen />
-      ) : (
-        <Stack.Navigator screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="Tabs" component={TabNavigator} />
-          <Stack.Screen name="Historial" component={HistoryScreen} options={{ headerShown: true, title: "Registros Históricos" }} />
-          <Stack.Screen name="NuevoCliente" component={ClientFormScreen} options={{ headerShown: true, title: "Alta Rápida de Cliente", presentation: "modal" }} />
-          <Stack.Screen name="NuevoProducto" component={ProductFormScreen} options={{ headerShown: true, title: "Registrar Producto", presentation: "modal" }} />
-          <Stack.Screen name="DetallePreventa" component={OrderDetailScreen} options={{ headerShown: true, title: "Detalle de preventa" }} />
-          <Stack.Screen name="EditarPreventa" component={NewSaleScreen} options={{ headerShown: true, title: "Editar preventa" }} />
-        </Stack.Navigator>
-      )}
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        {!user ? (
+          <Stack.Screen name="Login" component={LoginScreen} />
+        ) : (
+          <>
+            <Stack.Screen name="Tabs" component={TabNavigator} />
+            <Stack.Screen name="Historial" component={HistoryScreen} options={{ headerShown: true, title: "Registros Históricos" }} />
+            <Stack.Screen name="NuevoCliente" component={ClientFormScreen} options={{ headerShown: true, title: "Alta Rápida de Cliente", presentation: "modal" }} />
+            <Stack.Screen name="NuevoProducto" component={ProductFormScreen} options={{ headerShown: true, title: "Registrar Producto", presentation: "modal" }} />
+            <Stack.Screen name="DetallePreventa" component={OrderDetailScreen} options={{ headerShown: true, title: "Detalle de preventa" }} />
+            <Stack.Screen name="EditarPreventa" component={NewSaleScreen} options={{ headerShown: true, title: "Editar preventa" }} />
+          </>
+        )}
+      </Stack.Navigator>
     </NavigationContainer>
   );
 }

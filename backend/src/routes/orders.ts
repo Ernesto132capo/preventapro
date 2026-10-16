@@ -144,8 +144,20 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
         );
       }
 
-      for (let sIdx = 0; sIdx < x.selections.length; sIdx++) {
-        const s = x.selections[sIdx];
+      // Aggregate duplicate selections by presentation
+      const aggregatedSelections = new Map<string, any>();
+      for (const s of x.selections) {
+        const key = s.selectedPresentationId;
+        if (aggregatedSelections.has(key)) {
+          aggregatedSelections.get(key).quantity += Number(s.quantity || 0);
+        } else {
+          aggregatedSelections.set(key, { ...s, quantity: Number(s.quantity || 0) });
+        }
+      }
+      const mergedSelections = Array.from(aggregatedSelections.values());
+
+      for (let sIdx = 0; sIdx < mergedSelections.length; sIdx++) {
+        const s = mergedSelections[sIdx];
         const opt = optMap.get(s.selectedPresentationId);
         if (!opt) {
           throw new OrderValidationError(`La opción seleccionada no pertenece a este combo.`);
@@ -290,14 +302,15 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     const tax = calculateTaxCents(sub, d.taxRatePermille);
     const id = uuid();
     const ts = d.createdAt && !isNaN(new Date(d.createdAt).getTime()) ? new Date(d.createdAt).toISOString() : nowIso();
+    const serverNow = nowIso();
     const itemCount = items.reduce((n, x) => n + x.quantity, 0);
 
     await client.query(
       `INSERT INTO orders (
          id, idempotency_key, work_day_id, user_id, client_id, payment_condition, tax_rate_permille,
          subtotal_cents, tax_cents, total_cents, item_count, status, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $12, $12)`,
-      [id, d.idempotencyKey, d.workDayId, req.userId, d.clientId, d.paymentCondition, d.taxRatePermille, sub, tax, sub + tax, itemCount, ts]
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $12, $13)`,
+      [id, d.idempotencyKey, d.workDayId, req.userId, d.clientId, d.paymentCondition, d.taxRatePermille, sub, tax, sub + tax, itemCount, ts, serverNow]
     );
 
     for (const it of items) {

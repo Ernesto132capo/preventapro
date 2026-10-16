@@ -1,7 +1,8 @@
 import { Router } from "express";
 import path from "path";
 import fs from "fs";
-import { requireAuth, requireReportDownloadAuth } from "../middleware/auth";
+import { pool } from "../db/pg";
+import { requireAuth, requireReportDownloadAuth, AuthedRequest } from "../middleware/auth";
 import { createReportDownloadToken } from "../services/auth";
 import { generateClientReceiptsExcel, generateClientSummaryExcel, generateProductListExcel } from "../services/excel";
 import { generateClientReceiptsPdf } from "../services/receipts-pdf";
@@ -13,6 +14,31 @@ const REPORT_TTL_MS = 24 * 60 * 60 * 1000;
 const REPORT_GC_INTERVAL_MS = 60 * 60 * 1000;
 let lastReportGcAt = 0;
 let reportGcInFlight: Promise<void> | null = null;
+
+// [M-12] Mapa de promesas en vuelo para deduplicar la generación concurrente de reportes
+const reportsInFlight = new Map<string, Promise<string>>();
+
+export async function getOrGenerateReport(
+  fileName: string,
+  workDayId: string,
+  reportDir: string,
+  generator: (id: string, dir: string) => Promise<string>
+): Promise<string> {
+  const flightKey = `${workDayId}:${fileName}`;
+  const inFlight = reportsInFlight.get(flightKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const task = (async () => {
+    return await generator(workDayId, reportDir);
+  })().finally(() => {
+    reportsInFlight.delete(flightKey);
+  });
+
+  reportsInFlight.set(flightKey, task);
+  return task;
+}
 
 function isMissingPathError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | null)?.code;
@@ -63,8 +89,21 @@ void cleanupExpiredReportDirectories();
 
 // El navegador del teléfono no puede adjuntar el Bearer token de la app.
 // Emitimos un enlace firmado, limitado a una jornada y válido por dos minutos.
-reportsRouter.post("/:workDayId/download-token", requireAuth, (req, res) => {
-  res.json({ downloadToken: createReportDownloadToken(req.params.workDayId) });
+reportsRouter.post("/:workDayId/download-token", requireAuth, async (req: AuthedRequest, res) => {
+  const { workDayId } = req.params;
+  try {
+    const { rows } = await pool.query("SELECT id, user_id FROM work_days WHERE id = $1", [workDayId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Jornada no encontrada." });
+    }
+    const workday = rows[0];
+    if (workday.user_id && workday.user_id !== req.userId && req.userRole !== "admin") {
+      return res.status(403).json({ error: "Acceso denegado a reportes de otra jornada." });
+    }
+    res.json({ downloadToken: createReportDownloadToken(workDayId) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Error al generar token de descarga." });
+  }
 });
 
 reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req, res, next) => {
@@ -76,6 +115,15 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
     return res.status(404).json({ error: "Reporte no encontrado." });
   }
 
+  try {
+    const { rows: wdRows } = await pool.query("SELECT id FROM work_days WHERE id = $1", [safeWorkDayId]);
+    if (wdRows.length === 0) {
+      return res.status(404).json({ error: "Jornada no encontrada." });
+    }
+  } catch (err) {
+    return next(err);
+  }
+
   // Regenera solo el formato solicitado para reflejar el diseño actual y evitar
   // trabajo innecesario, por ejemplo crear un PDF al descargar un Excel.
   const generators: Record<string, (id: string, dir: string) => Promise<string>> = {
@@ -84,6 +132,7 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
     "boletas_clientes.xlsx": generateClientReceiptsExcel,
     "boletas_clientes.pdf": generateClientReceiptsPdf,
   };
+  // [M-12] Deduplicador de generación concurrente de reportes para evitar colisiones
   const generateReport = generators[safeFileName];
   if (!generateReport || safeFileName !== fileName) {
     return res.status(404).json({ error: "Reporte no encontrado." });
@@ -94,7 +143,7 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
   try {
     await cleanupExpiredReportDirectories();
     await fs.promises.mkdir(reportDir, { recursive: true });
-    await generateReport(safeWorkDayId, reportDir);
+    await getOrGenerateReport(safeFileName, safeWorkDayId, reportDir, generateReport);
 
     try {
       const stats = await fs.promises.stat(filePath);

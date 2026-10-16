@@ -19,9 +19,23 @@ import { getCategory } from "../db/repositories/categories";
 import { Category, ProductType } from "../domain/types";
 import { centsToBs } from "../domain/pricing";
 
-const DEFAULT_PRESENTATIONS: EditPresentationInput[] = [
-  { name: "Unidad", unitEquivalence: 1, priceCents: 0, costCents: 0 },
+interface FormPresentation {
+  id?: string;
+  name: string;
+  unitEquivalence: string;
+  priceText: string;
+  costText?: string;
+}
+
+const DEFAULT_PRESENTATIONS: FormPresentation[] = [
+  { name: "Unidad", unitEquivalence: "1", priceText: "", costText: "" },
 ];
+
+function parseBsToCents(text: string): number {
+  if (!text || !text.trim()) return 0;
+  const val = parseFloat(text.trim());
+  return isNaN(val) || val < 0 ? 0 : Math.round(val * 100);
+}
 
 interface FormComboOption {
   presentationId: string;
@@ -45,7 +59,7 @@ export function ProductFormScreen() {
   const [showCategoryModal, setShowCategoryModal] = useState(false);
 
   // Presentaciones normales / del combo
-  const [presentations, setPresentations] = useState<EditPresentationInput[]>(DEFAULT_PRESENTATIONS);
+  const [presentations, setPresentations] = useState<FormPresentation[]>(DEFAULT_PRESENTATIONS);
 
   // Configuración de Combo
   const [selectionMin, setSelectionMin] = useState("4");
@@ -83,9 +97,9 @@ export function ProductFormScreen() {
             product.presentations.map((p) => ({
               id: p.id,
               name: p.name,
-              unitEquivalence: p.unit_equivalence,
-              priceCents: p.price_cents,
-              costCents: p.cost_cents,
+              unitEquivalence: String(p.unit_equivalence ?? 1),
+              priceText: p.price_cents ? (p.price_cents / 100).toString() : "",
+              costText: p.cost_cents ? (p.cost_cents / 100).toString() : "",
             }))
           );
           if (product.combo_definition) {
@@ -113,19 +127,30 @@ export function ProductFormScreen() {
     })();
   }, [productId]);
 
-  function updatePresentation(idx: number, field: keyof EditPresentationInput, value: string) {
+  function updatePresentation(idx: number, field: keyof FormPresentation, value: string) {
     setPresentations((prev) =>
       prev.map((p, i) => {
         if (i !== idx) return p;
-        if (field === "name") return { ...p, name: value };
-        const num = Math.round(parseFloat(value || "0") * (field === "priceCents" || field === "costCents" ? 100 : 1));
-        return { ...p, [field]: isNaN(num) || num < 0 ? 0 : num };
+        if (field === "name") {
+          return { ...p, name: value };
+        }
+        if (field === "unitEquivalence") {
+          return { ...p, unitEquivalence: value.replace(/[^0-9]/g, "") };
+        }
+        if (field === "priceText" || field === "costText") {
+          const normalized = value.replace(",", ".");
+          const cleaned = normalized.replace(/[^0-9.]/g, "");
+          const parts = cleaned.split(".");
+          const safeVal = parts.length > 2 ? parts[0] + "." + parts.slice(1).join("") : cleaned;
+          return { ...p, [field]: safeVal };
+        }
+        return { ...p, [field]: value };
       })
     );
   }
 
   function addPresentation() {
-    setPresentations((prev) => [...prev, { name: "", unitEquivalence: 1, priceCents: 0, costCents: 0 }]);
+    setPresentations((prev) => [...prev, { name: "", unitEquivalence: "1", priceText: "", costText: "" }]);
   }
 
   function removePresentation(idx: number) {
@@ -177,7 +202,7 @@ export function ProductFormScreen() {
     }
 
     let comboDefPayload: { selectionMin: number; selectionMax: number; options: ComboOptionInput[] } | undefined;
-    let presToSave: EditPresentationInput[] = presentations;
+    let presToSave: EditPresentationInput[] = [];
 
     if (productType === "combo") {
       const min = parseInt(selectionMin, 10);
@@ -215,14 +240,14 @@ export function ProductFormScreen() {
         }
       }
 
-      const firstPres = presentations[0] || { priceCents: 0, costCents: 0, name: "Pack", unitEquivalence: 1 };
-      const priceCents = firstPres.priceCents ?? 0;
+      const firstPres = presentations[0] || { name: "Pack", unitEquivalence: "1", priceText: "0", costText: "0" };
+      const priceCents = parseBsToCents(firstPres.priceText);
       if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
         setError("El precio de venta del combo no puede ser negativo.");
         Alert.alert("Precio inválido", "El precio de venta del combo debe ser un monto válido mayor o igual a 0.");
         return;
       }
-      const costCents = firstPres.costCents ?? 0;
+      const costCents = firstPres.costText && firstPres.costText.trim() !== "" ? parseBsToCents(firstPres.costText) : 0;
       if (!Number.isSafeInteger(costCents) || costCents < 0) {
         setError("El costo del combo no puede ser negativo.");
         Alert.alert("Costo inválido", "El costo del combo debe ser un monto válido mayor o igual a 0.");
@@ -241,7 +266,6 @@ export function ProductFormScreen() {
 
       presToSave = [
         {
-          ...firstPres,
           name: (firstPres.name || "").trim() || "Pack",
           unitEquivalence: 1,
           priceCents,
@@ -256,6 +280,7 @@ export function ProductFormScreen() {
       }
 
       const seenNames = new Set<string>();
+      const parsedPres: EditPresentationInput[] = [];
       for (let i = 0; i < presentations.length; i++) {
         const p = presentations[i];
         const pName = (p.name || "").trim();
@@ -272,29 +297,37 @@ export function ProductFormScreen() {
         }
         seenNames.add(pKey);
 
-        if (!Number.isSafeInteger(p.unitEquivalence) || p.unitEquivalence <= 0) {
+        const equiv = parseInt(p.unitEquivalence || "1", 10);
+        if (!Number.isSafeInteger(equiv) || equiv <= 0) {
           setError(`La equivalencia de "${pName}" debe ser un número entero mayor a 0.`);
           Alert.alert("Equivalencia inválida", `La equivalencia en unidades para "${pName}" debe ser al menos 1.`);
           return;
         }
 
-        if (!Number.isSafeInteger(p.priceCents) || p.priceCents < 0) {
+        const priceCents = parseBsToCents(p.priceText);
+        if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
           setError(`El precio de "${pName}" no puede ser negativo.`);
           Alert.alert("Precio inválido", `El precio de venta para "${pName}" debe ser un monto válido mayor o igual a 0.`);
           return;
         }
 
-        if (p.costCents !== undefined && (!Number.isSafeInteger(p.costCents) || p.costCents < 0)) {
+        const costCents = p.costText && p.costText.trim() !== "" ? parseBsToCents(p.costText) : undefined;
+        if (costCents !== undefined && (!Number.isSafeInteger(costCents) || costCents < 0)) {
           setError(`El costo de "${pName}" no puede ser negativo.`);
           Alert.alert("Costo inválido", `El costo para "${pName}" debe ser mayor o igual a 0.`);
           return;
         }
+
+        parsedPres.push({
+          id: p.id,
+          name: pName,
+          unitEquivalence: equiv,
+          priceCents,
+          costCents: costCents ?? 0,
+        });
       }
 
-      presToSave = presentations.map((p) => ({
-        ...p,
-        name: p.name.trim(),
-      }));
+      presToSave = parsedPres;
     }
 
     isSubmittingRef.current = true;
@@ -317,7 +350,7 @@ export function ProductFormScreen() {
           comboDefinition: comboDefPayload,
         });
       }
-      await pushSync();
+      void pushSync().catch(() => {});
       navigation.goBack();
     } catch (err: any) {
       setError(err.message || "No se pudo guardar el producto.");
@@ -341,7 +374,7 @@ export function ProductFormScreen() {
           setSaving(true);
           try {
             await deleteProductLocal(productId!);
-            await pushSync();
+            void pushSync().catch(() => {});
             navigation.goBack();
           } catch (err: any) {
             Alert.alert("Error", err.message || "No se pudo eliminar el producto.");
@@ -358,7 +391,13 @@ export function ProductFormScreen() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
-      <Field label="Nombre del producto *" value={name} onChangeText={setName} placeholder="ej. Cereal Chocolate o Combo Cereales x4" />
+      <Field
+        label="Nombre del producto *"
+        value={name}
+        onChangeText={setName}
+        placeholder="ej. Cereal Chocolate o Combo Cereales x4"
+        maxLength={120}
+      />
 
       {/* Selector de Categoría */}
       <View style={{ marginBottom: spacing.md }}>
@@ -407,11 +446,15 @@ export function ProductFormScreen() {
               label="Mínimo unidades *"
               value={selectionMin}
               onChangeText={setSelectionMin}
+              keyboardType="number-pad"
+              maxLength={4}
             />
             <MiniField
               label="Máximo unidades *"
               value={selectionMax}
               onChangeText={setSelectionMax}
+              keyboardType="number-pad"
+              maxLength={4}
             />
           </View>
 
@@ -429,12 +472,14 @@ export function ProductFormScreen() {
                     value={p.name}
                     onChangeText={(v) => updatePresentation(idx, "name", v)}
                     placeholder="ej. Pack"
+                    maxLength={50}
                   />
                 </View>
                 <MiniField
                   label="Precio de venta (Bs.) *"
-                  value={p.priceCents ? String(p.priceCents / 100) : ""}
-                  onChangeText={(v) => updatePresentation(idx, "priceCents", v)}
+                  value={p.priceText}
+                  onChangeText={(v) => updatePresentation(idx, "priceText", v)}
+                  maxLength={12}
                 />
               </View>
             </View>
@@ -475,6 +520,7 @@ export function ProductFormScreen() {
                   placeholder="Sin lím."
                   keyboardType="number-pad"
                   placeholderTextColor={colors.textMuted}
+                  maxLength={4}
                 />
               </View>
             </View>
@@ -497,6 +543,7 @@ export function ProductFormScreen() {
                   onChangeText={(v) => updatePresentation(idx, "name", v)}
                   placeholder="Nombre (ej. Caja)"
                   placeholderTextColor={colors.textMuted}
+                  maxLength={50}
                 />
                 {presentations.length > 1 && (
                   <Pressable onPress={() => removePresentation(idx)} style={styles.removeBtn}>
@@ -505,8 +552,19 @@ export function ProductFormScreen() {
                 )}
               </View>
               <View style={styles.presRow}>
-                <MiniField label="Equivalencia (uds.)" value={String(p.unitEquivalence)} onChangeText={(v) => updatePresentation(idx, "unitEquivalence", v)} />
-                <MiniField label="Precio de venta (Bs.)" value={p.priceCents ? String(p.priceCents / 100) : ""} onChangeText={(v) => updatePresentation(idx, "priceCents", v)} />
+                <MiniField
+                  label="Equivalencia (uds.)"
+                  value={p.unitEquivalence}
+                  onChangeText={(v) => updatePresentation(idx, "unitEquivalence", v)}
+                  keyboardType="number-pad"
+                  maxLength={6}
+                />
+                <MiniField
+                  label="Precio de venta (Bs.)"
+                  value={p.priceText}
+                  onChangeText={(v) => updatePresentation(idx, "priceText", v)}
+                  maxLength={12}
+                />
               </View>
             </View>
           ))}
@@ -560,6 +618,7 @@ export function ProductFormScreen() {
               placeholderTextColor={colors.textMuted}
               value={optionSearch}
               onChangeText={setOptionSearch}
+              maxLength={60}
             />
             <FlatList
               data={availableProducts.filter((p) =>
@@ -592,20 +651,35 @@ export function ProductFormScreen() {
   );
 }
 
-function Field(props: { label: string; value: string; onChangeText: (t: string) => void; placeholder?: string; keyboardType?: any }) {
+function Field(props: { label: string; value: string; onChangeText: (t: string) => void; placeholder?: string; keyboardType?: any; maxLength?: number }) {
   return (
     <View style={{ marginBottom: spacing.md }}>
       <Text style={styles.label}>{props.label}</Text>
-      <TextInput style={styles.input} value={props.value} onChangeText={props.onChangeText} placeholder={props.placeholder} placeholderTextColor={colors.textMuted} keyboardType={props.keyboardType} />
+      <TextInput
+        style={styles.input}
+        value={props.value}
+        onChangeText={props.onChangeText}
+        placeholder={props.placeholder}
+        placeholderTextColor={colors.textMuted}
+        keyboardType={props.keyboardType}
+        maxLength={props.maxLength}
+      />
     </View>
   );
 }
 
-function MiniField(props: { label: string; value: string; onChangeText: (t: string) => void }) {
+function MiniField(props: { label: string; value: string; onChangeText: (t: string) => void; keyboardType?: any; maxLength?: number }) {
   return (
     <View style={{ flex: 1, marginRight: spacing.sm }}>
       <Text style={styles.miniLabel}>{props.label}</Text>
-      <TextInput style={styles.input} value={props.value} onChangeText={props.onChangeText} keyboardType="decimal-pad" placeholderTextColor={colors.textMuted} />
+      <TextInput
+        style={styles.input}
+        value={props.value}
+        onChangeText={props.onChangeText}
+        keyboardType={props.keyboardType || "decimal-pad"}
+        placeholderTextColor={colors.textMuted}
+        maxLength={props.maxLength}
+      />
     </View>
   );
 }

@@ -64,7 +64,7 @@ export function ClientFormScreen() {
             phone: phone.trim() || undefined,
             address: address.trim() || undefined,
           });
-      await pushSync();
+      void pushSync().catch(() => {});
       if (returnToPreventa && !isEditing) {
         navigation.navigate("Tabs", { screen: "Preventa", params: { preselectedClientId: client.id } });
       } else {
@@ -82,10 +82,10 @@ export function ClientFormScreen() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
-      <Field label="Nombre del negocio *" value={businessName} onChangeText={setBusinessName} placeholder="Tienda Doña Rosa" />
-      <Field label="Propietario o contacto" value={contactName} onChangeText={setContactName} placeholder="Rosa Mamani" />
-      <Field label="Teléfono / WhatsApp" value={phone} onChangeText={setPhone} placeholder="77712345" keyboardType="phone-pad" />
-      <Field label="Dirección" value={address} onChangeText={setAddress} placeholder="Av. Principal 123" />
+      <Field label="Nombre del negocio *" value={businessName} onChangeText={setBusinessName} placeholder="Tienda Doña Rosa" maxLength={120} />
+      <Field label="Propietario o contacto" value={contactName} onChangeText={setContactName} placeholder="Rosa Mamani" maxLength={100} />
+      <Field label="Teléfono / WhatsApp" value={phone} onChangeText={setPhone} placeholder="77712345" keyboardType="phone-pad" maxLength={30} />
+      <Field label="Dirección" value={address} onChangeText={setAddress} placeholder="Av. Principal 123" maxLength={200} />
 
       {error && <Text style={styles.error}>{error}</Text>}
 
@@ -104,7 +104,7 @@ export function ClientFormScreen() {
   );
 }
 
-function Field(props: { label: string; value: string; onChangeText: (t: string) => void; placeholder?: string; keyboardType?: any }) {
+function Field(props: { label: string; value: string; onChangeText: (t: string) => void; placeholder?: string; keyboardType?: any; maxLength?: number }) {
   return (
     <View style={{ marginBottom: spacing.md }}>
       <Text style={styles.label}>{props.label}</Text>
@@ -115,6 +115,7 @@ function Field(props: { label: string; value: string; onChangeText: (t: string) 
         placeholder={props.placeholder}
         placeholderTextColor={colors.textMuted}
         keyboardType={props.keyboardType}
+        maxLength={props.maxLength}
       />
     </View>
   );

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
 import { Alert } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getSecureItem, setSecureItem, deleteSecureItem } from "../services/secureStorage";
 import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError, subscribeToUnauthorized } from "../services/api";
 
 export interface AuthUser {
@@ -34,13 +34,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       try {
         const [token, storedUser] = await Promise.all([
           getAccessToken(),
-          AsyncStorage.getItem(USER_KEY),
+          getSecureItem(USER_KEY),
         ]);
         if (token && storedUser) {
           try {
             setUser(JSON.parse(storedUser) as AuthUser);
           } catch {
-            await AsyncStorage.removeItem(USER_KEY);
+            await deleteSecureItem(USER_KEY);
             await clearTokens();
           }
         }
@@ -66,7 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       // La expiración de sesión solo elimina credenciales; nunca reinicia SQLite ni el outbox.
       await clearTokens().catch(() => undefined);
-      await AsyncStorage.removeItem(USER_KEY).catch(() => undefined);
+      await deleteSecureItem(USER_KEY).catch(() => undefined);
       setError(null);
       setUser(null);
       Alert.alert(
@@ -86,9 +86,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       await setTokens(res.accessToken, rememberSession);
       if (rememberSession) {
-        await AsyncStorage.setItem(USER_KEY, JSON.stringify(res.user));
+        await setSecureItem(USER_KEY, JSON.stringify(res.user));
       } else {
-        await AsyncStorage.removeItem(USER_KEY);
+        await deleteSecureItem(USER_KEY);
       }
       setUser(res.user);
       unauthorizedHandlingRef.current = false;
@@ -105,7 +105,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     await clearTokens();
-    await AsyncStorage.removeItem(USER_KEY);
+    await deleteSecureItem(USER_KEY);
     setUser(null);
   }, []);
 

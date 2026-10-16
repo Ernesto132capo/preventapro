@@ -54,19 +54,25 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
   res.status(statusCode).json({ error: err?.message && statusCode < 500 ? err.message : "Error interno del servidor." });
 });
 
-// Protección contra excepciones y rechazos no capturados para no tumbar el proceso
+const PORT = Number(process.env.PORT) || 4000;
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ PreventaPro backend escuchando en http://0.0.0.0:${PORT}`);
+});
+
+// Protección contra excepciones y rechazos no capturados
 process.on("unhandledRejection", (reason) => {
-  // eslint-disable-next-line no-console
   console.error("⚠️ Unhandled Promise Rejection:", reason);
 });
 
 process.on("uncaughtException", (error) => {
-  // eslint-disable-next-line no-console
-  console.error("⚠️ Uncaught Exception:", error);
-});
-
-const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, "0.0.0.0", () => {
-  // eslint-disable-next-line no-console
-  console.log(`✅ PreventaPro backend escuchando en http://0.0.0.0:${PORT}`);
+  console.error("💥 Uncaught Exception crítica:", error);
+  // Cierre con gracia y terminación del proceso para evitar estados corruptos
+  try {
+    server.close(() => {
+      process.exit(1);
+    });
+  } catch {}
+  setTimeout(() => {
+    process.exit(1);
+  }, 1000).unref();
 });

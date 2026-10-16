@@ -15,7 +15,7 @@ const clientKeyExtractor = (c: Client) => c.id;
 
 export function ClientsScreen() {
   const navigation = useNavigation<any>();
-  const { syncTick } = useSync();
+  const { syncTick, pushSync } = useSync();
   const [clients, setClients] = useState<Client[]>([]);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
@@ -45,12 +45,13 @@ export function ClientsScreen() {
           style: "destructive",
           onPress: async () => {
             await deleteClientLocal(c.id);
+            void pushSync().catch(() => {});
             load();
           },
         },
       ]
     );
-  }, [load]);
+  }, [load, pushSync]);
 
   const renderClientItem = useCallback(
     ({ item }: { item: Client }) => (
@@ -102,6 +103,19 @@ export function ClientsScreen() {
   );
 }
 
+async function safeOpenUrl(url: string, failureTitle: string, failureMsg: string) {
+  try {
+    const can = await Linking.canOpenURL(url);
+    if (can) {
+      await Linking.openURL(url);
+    } else {
+      Alert.alert(failureTitle, failureMsg);
+    }
+  } catch {
+    Alert.alert("Error", "No se pudo abrir el enlace o la aplicación seleccionada.");
+  }
+}
+
 const ClientCardItem = React.memo(function ClientCardItem({
   item,
   onEdit,
@@ -125,12 +139,27 @@ const ClientCardItem = React.memo(function ClientCardItem({
       <View style={styles.actionsRow}>
         {!!item.phone && (
           <>
-            <Pressable style={styles.actionBtn} onPress={() => Linking.openURL(`tel:${item.phone}`)}>
+            <Pressable
+              style={styles.actionBtn}
+              onPress={() =>
+                safeOpenUrl(
+                  `tel:${item.phone}`,
+                  "Llamada no disponible",
+                  "No se detectó una aplicación de llamadas en este dispositivo."
+                )
+              }
+            >
               <Text style={styles.actionText}>📞 Llamar</Text>
             </Pressable>
             <Pressable
               style={styles.actionBtn}
-              onPress={() => Linking.openURL(`https://wa.me/${item.phone!.replace(/\D/g, "")}`)}
+              onPress={() =>
+                safeOpenUrl(
+                  `https://wa.me/${item.phone!.replace(/\D/g, "")}`,
+                  "WhatsApp no disponible",
+                  "No se pudo abrir WhatsApp o la aplicación no está instalada."
+                )
+              }
             >
               <Text style={styles.actionText}>💬 WhatsApp</Text>
             </Pressable>

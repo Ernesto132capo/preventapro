@@ -4,6 +4,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 
+process.env.AUTH_TOKEN_SECRET = "test-secret-at-least-32-characters-long-12345";
+
 // ─── Mocks para la base de datos PostgreSQL ─────────────────────────────────
 const mockClient = {
   query: vi.fn(),
@@ -25,26 +27,32 @@ vi.mock("../db/pg", () => ({
 
 vi.mock("../middleware/auth", () => ({
   requireAuth: (req: any, _res: any, next: any) => {
-    req.userId = "usr-test-1";
+    req.userId = req.userId || "usr-test-1";
+    req.userRole = req.userRole || (req.headers && req.headers["x-role"]) || "admin";
     next();
   },
+  requireRole: () => (_req: any, _res: any, next: any) => next(),
+  requireReportDownloadAuth: (_req: any, _res: any, next: any) => next(),
 }));
 
 import { syncRouter } from "../routes/sync";
 import { workdaysRouter, closeStaleOpenWorkDays } from "../routes/workdays";
+import { reportsRouter } from "../routes/reports";
 import {
   generateClientReceiptsExcel,
   generateClientSummaryExcel,
   generateProductListExcel,
+  getUniqueSheetName,
 } from "../services/excel";
-import { generateClientReceiptsPdf } from "../services/receipts-pdf";
-import { formatBoliviaDate, formatBoliviaDateTime } from "../services/dates";
+import { generateClientReceiptsPdf, sanitizePdfText } from "../services/receipts-pdf";
+import { formatBoliviaDate, formatBoliviaDateTime, getBoliviaToday } from "../services/dates";
+import ExcelJS from "exceljs";
 
 let runSpecificMigration: any;
 
 function makeRequest(
   app: express.Express,
-  options: { method: string; url: string; body?: any; userId?: string }
+  options: { method: string; url: string; body?: any; userId?: string; userRole?: string }
 ): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
     const req = {
@@ -53,6 +61,7 @@ function makeRequest(
       headers: { "content-type": "application/json" },
       body: options.body || {},
       userId: options.userId || "usr-test-1",
+      userRole: options.userRole,
     } as any;
 
     const fakeRes = {
@@ -85,6 +94,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
   let tempDir: string;
   let syncApp: express.Express;
   let workdaysApp: express.Express;
+  let reportsApp: express.Express;
 
   beforeAll(async () => {
     const mod = await vi.importActual<any>("../../scripts/migrate");
@@ -102,6 +112,10 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
     workdaysApp = express();
     workdaysApp.use(express.json());
     workdaysApp.use("/workdays", workdaysRouter);
+
+    reportsApp = express();
+    reportsApp.use(express.json());
+    reportsApp.use("/api/reports", reportsRouter);
   });
 
   afterEach(() => {
@@ -306,6 +320,199 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       const postCloseResult = res.body.results.find((r: any) => r.id === "ord-offline-post-close");
       expect(postCloseResult.status).toBe("failed");
       expect(postCloseResult.error).toContain("concluida");
+    });
+
+    it("M-01: Cancelación en sync rechaza cancelar un pedido de jornada cerrada", async () => {
+      mockClient.query.mockImplementation(async (sql: string) => {
+        const clean = sql.replace(/\s+/g, " ").trim();
+        if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+        if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
+        if (clean.includes("SELECT * FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE")) {
+          return { rows: [{ id: "order-to-cancel", work_day_id: "wd-closed-99", user_id: "usr-test-1", status: "active" }] };
+        }
+        if (clean.includes("SELECT status FROM work_days WHERE id = $1")) {
+          return { rows: [{ status: "closed" }] };
+        }
+        return { rows: [] };
+      });
+
+      const payload = {
+        operations: [
+          {
+            id: "op-cancel-1",
+            entityType: "order",
+            action: "cancel",
+            data: { serverId: "order-to-cancel" },
+          },
+        ],
+      };
+
+      const res = await makeRequest(syncApp, { method: "POST", url: "/api/sync/push", body: payload });
+      expect(res.status).toBe(200);
+      expect(res.body.failed).toBe(1);
+      expect(res.body.results[0].status).toBe("failed");
+      expect(res.body.results[0].error).toContain("La jornada está cerrada");
+    });
+
+    it("M-07 y A-06: Búsqueda insensible de categorías y guardado de neighborhood_id en clientes", async () => {
+      let executedCategoryUpdate = false;
+      let insertedNeighborhoodId: string | null = null;
+
+      mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
+        const clean = sql.replace(/\s+/g, " ").trim();
+        if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+        if (clean.includes("SELECT id FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2))")) {
+          return { rows: [{ id: "cat-existente" }] };
+        }
+        if (clean.includes("UPDATE categories SET name = $1")) {
+          executedCategoryUpdate = true;
+          return { rows: [] };
+        }
+        if (clean.includes("SELECT id FROM clients WHERE")) {
+          return { rows: [] };
+        }
+        if (clean.includes("INSERT INTO clients")) {
+          insertedNeighborhoodId = params[8]; // $9 is neighborhood_id (index 8)
+          return { rows: [] };
+        }
+        return { rows: [] };
+      });
+
+      const payload = {
+        categories: [{ name: "gaseosas" }],
+        clients: [{ businessName: "Tienda San Juan", neighborhoodId: "neigh-123" }],
+      };
+
+      const res = await makeRequest(syncApp, { method: "POST", url: "/api/sync/push", body: payload });
+      expect(res.status).toBe(200);
+      expect(executedCategoryUpdate).toBe(true);
+      expect(insertedNeighborhoodId).toBe("neigh-123");
+    });
+
+    it("C-03: processProductSync guarda combo_definitions y combo_options para combos", async () => {
+      let insertedComboDef = false;
+      let insertedComboOptsCount = 0;
+
+      mockClient.query.mockImplementation(async (sql: string) => {
+        const clean = sql.replace(/\s+/g, " ").trim();
+        if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+        if (clean.includes("SELECT id FROM products WHERE")) return { rows: [] };
+        if (clean.includes("INSERT INTO products")) return { rows: [] };
+        if (clean.includes("INSERT INTO product_presentations")) return { rows: [] };
+        if (clean.includes("DELETE FROM combo_options WHERE combo_id IN")) return { rows: [] };
+        if (clean.includes("DELETE FROM combo_definitions WHERE product_id = $1")) return { rows: [] };
+        if (clean.includes("INSERT INTO combo_definitions")) {
+          insertedComboDef = true;
+          return { rows: [] };
+        }
+        if (clean.includes("INSERT INTO combo_options")) {
+          insertedComboOptsCount++;
+          return { rows: [] };
+        }
+        return { rows: [] };
+      });
+
+      const payload = {
+        operations: [
+          {
+            id: "prod-combo-op",
+            entityType: "product",
+            data: {
+              sku: "CMB-999",
+              name: "Combo Super",
+              productType: "combo",
+              presentations: [{ name: "Pack", priceCents: 1000 }],
+              comboDefinition: {
+                selectionMin: 2,
+                selectionMax: 4,
+                options: [
+                  { presentationId: "pres-a", maxQuantity: 2, sortOrder: 0 },
+                  { presentationId: "pres-b", maxQuantity: 2, sortOrder: 1 },
+                ],
+              },
+            },
+          },
+        ],
+      };
+
+      const res = await makeRequest(syncApp, { method: "POST", url: "/api/sync/push", body: payload });
+      expect(res.status).toBe(200);
+      expect(res.body.succeeded).toBe(1);
+      expect(insertedComboDef).toBe(true);
+      expect(insertedComboOptsCount).toBe(2);
+    });
+
+    it("A-12: Agrega selecciones duplicadas de combo antes de validar cantidades máximas", async () => {
+      let insertedSelections = 0;
+
+      mockClient.query.mockImplementation(async (sql: string) => {
+        const clean = sql.replace(/\s+/g, " ").trim();
+        if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+        if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
+        if (clean.includes("SELECT id, user_id FROM orders WHERE idempotency_key = $1")) return { rows: [] };
+        if (clean.includes("SELECT * FROM work_days WHERE id = $1 FOR UPDATE")) {
+          return { rows: [{ id: "wd-open-1", user_id: "usr-test-1", status: "open" }] };
+        }
+        if (clean.includes("SELECT id, active FROM clients WHERE")) return { rows: [{ id: "cli-1", active: true }] };
+        if (clean.includes("SELECT id, name, sku, product_type, active FROM products WHERE id = $1")) {
+          return { rows: [{ id: "p-combo", name: "Combo Cereal", sku: "CMB-1", product_type: "combo", active: true }] };
+        }
+        if (clean.includes("SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1")) {
+          return { rows: [{ id: "pres-combo", product_id: "p-combo", name: "Pack", unit_equivalence: 1, price_cents: 2000, active: true }] };
+        }
+        if (clean.includes("SELECT * FROM combo_definitions WHERE product_id = $1 AND active = true")) {
+          return { rows: [{ id: "cdef-1", product_id: "p-combo", selection_min: 2, selection_max: 2, active: true }] };
+        }
+        if (clean.includes("SELECT * FROM combo_options WHERE combo_id = $1 AND active = true")) {
+          return { rows: [{ id: "copt-1", combo_id: "cdef-1", presentation_id: "pres-choc", max_quantity: 2, active: true }] };
+        }
+        if (clean.includes("SELECT pp.name as pres_name, p.name as prod_name, p.id as prod_id FROM product_presentations pp")) {
+          return { rows: [{ prod_id: "p-choc", prod_name: "Choc", pres_name: "Unidad" }] };
+        }
+        if (clean.includes("INSERT INTO order_item_selections")) {
+          insertedSelections++;
+          return { rows: [] };
+        }
+        if (clean.includes("SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders")) {
+          return { rows: [{ count: 1, total: 2000 }] };
+        }
+        return { rows: [] };
+      });
+
+      const payload = {
+        operations: [
+          {
+            id: "ord-combo-dup-sel",
+            entityType: "order",
+            data: {
+              workDayId: "wd-open-1",
+              clientId: "cli-1",
+              items: [
+                {
+                  productId: "p-combo",
+                  presentationId: "pres-combo",
+                  quantity: 1,
+                  selections: [
+                    { selectedPresentationId: "pres-choc", quantity: 1 },
+                    { selectedPresentationId: "pres-choc", quantity: 1 },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const res = await makeRequest(syncApp, { method: "POST", url: "/api/sync/push", body: payload });
+      expect(res.status).toBe(200);
+      expect(res.body.succeeded).toBe(1);
+      // Las 2 selecciones duplicadas de 1 se agregaron en 1 selección consolidada de cantidad 2
+      expect(insertedSelections).toBe(1);
+    });
+
+    it("B-03: getBoliviaToday devuelve fecha 'YYYY-MM-DD' válida", () => {
+      const today = getBoliviaToday();
+      expect(today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     });
   });
 
@@ -660,6 +867,290 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       );
       expect(insertCall).toBeDefined();
       expect(insertCall![1]).toEqual(["002_auth"]);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 5. AUDITORÍA Y ENDURECIMIENTO (C-01, C-02, A-02, A-12, M-02, M-03, M-04)
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("5. Auditoría y Endurecimiento (C-01, C-02, A-02, A-12, M-02, M-03, M-04)", () => {
+    describe("[C-01] Prevención IDOR en descarga de reportes", () => {
+      it("rechaza con 403 Forbidden si un preventista intenta obtener token de descarga de otra jornada", async () => {
+        mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+          if (sql.includes("FROM work_days WHERE id = $1")) {
+            return {
+              rows: [{ id: params[0], user_id: "usr-preventista-original" }],
+            };
+          }
+          return { rows: [] };
+        });
+
+        const res = await makeRequest(reportsApp, {
+          method: "POST",
+          url: "/api/reports/wd-otro-usuario/download-token",
+          userId: "usr-preventista-atacante",
+          userRole: "preventista",
+        });
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("Acceso denegado a reportes de otra jornada.");
+      });
+
+      it("permite a un usuario con rol 'admin' obtener token de descarga para cualquier jornada", async () => {
+        mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+          if (sql.includes("FROM work_days WHERE id = $1")) {
+            return {
+              rows: [{ id: params[0], user_id: "usr-preventista-original" }],
+            };
+          }
+          return { rows: [] };
+        });
+
+        const res = await makeRequest(reportsApp, {
+          method: "POST",
+          url: "/api/reports/wd-otro-usuario/download-token",
+          userId: "usr-admin-1",
+          userRole: "admin",
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.downloadToken).toBeDefined();
+      });
+    });
+
+    describe("[C-02] Cursor delta updated_at asignado por el servidor (ignora reloj cliente)", () => {
+      it("asigna updated_at con la hora del servidor (NOW()) e ignora timestamp enviado por cliente en orden", async () => {
+        let insertedUpdatedAt: string | null = null;
+        mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
+          const clean = sql.replace(/\s+/g, " ").trim();
+          if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+          if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (clean.includes("SELECT id, user_id FROM orders WHERE idempotency_key = $1")) return { rows: [] };
+          if (clean.includes("FROM work_days")) {
+            return { rows: [{ id: "wd-test-1", active: true, status: "open", user_id: "usr-test-1" }] };
+          }
+          if (clean.includes("FROM clients")) {
+            return { rows: [{ id: "client-1", active: true, business_name: "Cliente 1" }] };
+          }
+          if (clean.includes("SELECT id, name, sku, product_type, active FROM products")) {
+            return { rows: [{ id: "prod-1", name: "P1", sku: "SKU1", product_type: "standard", active: true }] };
+          }
+          if (clean.includes("SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations")) {
+            return { rows: [{ id: "pres-1", product_id: "prod-1", name: "Unidad", unit_equivalence: 1, price_cents: 1000, active: true }] };
+          }
+          if (clean.includes("INSERT INTO orders")) {
+            // $13 is updated_at
+            insertedUpdatedAt = params[12];
+            return { rows: [] };
+          }
+          if (clean.includes("FROM orders WHERE work_day_id = $1")) {
+            return { rows: [{ count: 1, total: 1000 }] };
+          }
+          if (clean.includes("UPDATE work_days SET order_count = $1")) {
+            return { rows: [] };
+          }
+          return { rows: [] };
+        });
+
+        const arbitraryClientTime = "2099-01-01T00:00:00.000Z";
+        const res = await makeRequest(syncApp, {
+          method: "POST",
+          url: "/api/sync/push",
+          body: {
+            items: [
+              {
+                entityType: "order",
+                operation: "create",
+                data: {
+                  localId: "ord-clock-skew",
+                  idempotencyKey: "idem-clock-skew-1",
+                  workDayId: "wd-test-1",
+                  clientId: "client-1",
+                  updated_at: arbitraryClientTime,
+                  createdAt: "2026-10-16T12:00:00.000Z",
+                  items: [{ productId: "prod-1", presentationId: "pres-1", quantity: 1 }],
+                },
+              },
+            ],
+          },
+        });
+
+        expect(res.status).toBe(200);
+        expect(insertedUpdatedAt).toBeDefined();
+        // El servidor asignó su timestamp actual, NO el año 2099 del cliente
+        expect(insertedUpdatedAt).not.toBe(arbitraryClientTime);
+        expect(new Date(insertedUpdatedAt!).getFullYear()).toBe(2026);
+      });
+
+      it("devuelve cursor delta generado por el servidor en la respuesta de pull", async () => {
+        mockPool.query.mockImplementation(async (sql: string) => {
+          if (sql.includes("SELECT * FROM clients")) return { rows: [] };
+          if (sql.includes("SELECT * FROM products")) return { rows: [] };
+          if (sql.includes("SELECT * FROM categories")) return { rows: [] };
+          if (sql.includes("SELECT * FROM neighborhoods")) return { rows: [] };
+          if (sql.includes("SELECT * FROM work_days")) return { rows: [] };
+          if (sql.includes("SELECT * FROM combo_definitions")) return { rows: [] };
+          if (sql.includes("SELECT * FROM combo_options")) return { rows: [] };
+          if (sql.includes("SELECT id, product_id, name")) return { rows: [] };
+          if (sql.includes("SELECT o.*")) return { rows: [] };
+          return { rows: [] };
+        });
+
+        const res = await makeRequest(syncApp, {
+          method: "GET",
+          url: "/api/sync/pull?since=2026-10-15T00:00:00.000Z",
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.cursor).toBeDefined();
+        expect(typeof res.body.cursor).toBe("string");
+        expect(new Date(res.body.cursor).getFullYear()).toBe(2026);
+      });
+    });
+
+    describe("[A-02] Fallo de BD en requireAuth responde 503 y nunca 401", () => {
+      it("responde 503 Service Unavailable ante fallo de conexión de BD", async () => {
+        const { requireAuth: realRequireAuth } = await vi.importActual<any>("../middleware/auth");
+        const { createAccessToken } = await vi.importActual<any>("../services/auth");
+
+        const validToken = createAccessToken("usr-valid-token");
+
+        // Simular fallo de base de datos en pool.query
+        mockPool.query.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:5432"));
+
+        const fakeReq = {
+          headers: { authorization: `Bearer ${validToken}` },
+        } as any;
+
+        let statusCode = 0;
+        let responseJson: any = null;
+        const fakeRes = {
+          status(code: number) {
+            statusCode = code;
+            return fakeRes;
+          },
+          json(data: any) {
+            responseJson = data;
+            return fakeRes;
+          },
+        } as any;
+
+        const next = vi.fn();
+
+        await realRequireAuth(fakeReq, fakeRes, next);
+
+        expect(next).not.toHaveBeenCalled();
+        expect(statusCode).not.toBe(401);
+        expect(statusCode).toBe(503);
+        expect(responseJson.error).toContain("Error de conexión con la base de datos");
+      });
+    });
+
+    describe("[A-12] Validación de combos agrega presentaciones repetidas", () => {
+      it("rechaza la preventa si opciones repetidas con la misma presentación superan max_quantity sumadas", async () => {
+        mockClient.query.mockImplementation(async (sql: string) => {
+          const clean = sql.replace(/\s+/g, " ").trim();
+          if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
+          if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (clean.includes("SELECT id, user_id FROM orders WHERE idempotency_key = $1")) return { rows: [] };
+          if (clean.includes("FROM work_days")) {
+            return { rows: [{ id: "wd-test-1", active: true, status: "open", user_id: "usr-test-1" }] };
+          }
+          if (clean.includes("FROM clients")) {
+            return { rows: [{ id: "client-1", active: true, business_name: "Cliente 1" }] };
+          }
+          if (clean.includes("SELECT id, name, sku, product_type, active FROM products")) {
+            return { rows: [{ id: "prod-combo-1", name: "Combo Pack", sku: "CB01", product_type: "combo", active: true }] };
+          }
+          if (clean.includes("SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1")) {
+            return { rows: [{ id: "pres-combo-main", product_id: "prod-combo-1", name: "Pack", unit_equivalence: 1, price_cents: 3000, active: true }] };
+          }
+          if (clean.includes("SELECT * FROM combo_definitions")) {
+            return { rows: [{ id: "combo-def-1", product_id: "prod-combo-1", selection_min: 1, selection_max: 5, active: true }] };
+          }
+          if (clean.includes("SELECT * FROM combo_options")) {
+            // max_quantity = 2 para la presentación pres-opt-1
+            return { rows: [{ id: "opt-1", combo_id: "combo-def-1", presentation_id: "pres-opt-1", max_quantity: 2, active: true }] };
+          }
+          return { rows: [] };
+        });
+
+        // Enviar dos selecciones para la misma presentación pres-opt-1 con cantidades 2 y 1 (suman 3 > max 2)
+        const res = await makeRequest(syncApp, {
+          method: "POST",
+          url: "/api/sync/push",
+          body: {
+            items: [
+              {
+                entityType: "order",
+                operation: "create",
+                data: {
+                  localId: "ord-combo-dup",
+                  idempotencyKey: "idem-combo-dup-1",
+                  workDayId: "wd-test-1",
+                  clientId: "client-1",
+                  items: [
+                    {
+                      productId: "prod-combo-1",
+                      presentationId: "pres-combo-main",
+                      quantity: 1,
+                      selections: [
+                        { selectedPresentationId: "pres-opt-1", quantity: 2 },
+                        { selectedPresentationId: "pres-opt-1", quantity: 1 },
+                      ],
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.results).toBeDefined();
+        const orderResult = res.body.results[0];
+        expect(orderResult.status).toBe("failed");
+        expect(orderResult.error).toContain("excede el límite de 2");
+      });
+    });
+
+    describe("[M-02 / M-03 / M-04] Robustez en Excel y Sanitización de PDF", () => {
+      it("[M-02] generateClientSummaryExcel agrupa por c.id y c.business_name para no fusionar clientes homónimos", async () => {
+        let sqlExecuted = "";
+        mockPool.query.mockImplementation(async (sql: string) => {
+          sqlExecuted = sql;
+          return {
+            rows: [
+              { client_id: "c-1", business_name: "Tienda Doña Rosa", total_cents: "1500" },
+              { client_id: "c-2", business_name: "Tienda Doña Rosa", total_cents: "3000" },
+            ],
+          };
+        });
+
+        const summaryPath = await generateClientSummaryExcel("wd-test-1", tempDir);
+        expect(fs.existsSync(summaryPath)).toBe(true);
+        expect(sqlExecuted).toContain("GROUP BY c.id, c.business_name");
+      });
+
+      it("[M-03] getUniqueSheetName evita colisiones en hojas duplicadas y caracteres inválidos", () => {
+        const wb = new ExcelJS.Workbook();
+        const clean1 = getUniqueSheetName(wb, "Boleta [001] / Especial *");
+        expect(clean1).not.toMatch(/[*?:\\/\[\]]/);
+
+        wb.addWorksheet(clean1);
+        const clean2 = getUniqueSheetName(wb, "Boleta [001] / Especial *");
+        expect(clean2).toBe(`${clean1} (2)`);
+      });
+
+      it("[M-04] sanitizePdfText normaliza texto y remueve emojis fuera del rango WinAnsi", () => {
+        const raw = "Preventista José 😊 ➔ Promoción ‘Especial’ — 100% 👍";
+        const sanitized = sanitizePdfText(raw);
+        expect(sanitized).not.toContain("😊");
+        expect(sanitized).not.toContain("👍");
+        expect(sanitized).toContain("José");
+        expect(sanitized).toContain("->");
+        expect(sanitized).toContain("-");
+      });
     });
   });
 });

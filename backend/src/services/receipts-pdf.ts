@@ -35,6 +35,38 @@ function money(cents: number) {
   return `Bs. ${(cents / 100).toFixed(2)}`;
 }
 
+/**
+ * [M-04] Sanitiza texto para fuentes estándar de PDFKit (Helvetica / WinAnsi).
+ * Normaliza a NFC, reemplaza símbolos comunes y elimina emojis/glifos fuera del rango Latin-1
+ * para evitar que PDFKit lance excepciones o corrompa el archivo PDF.
+ */
+export function sanitizePdfText(text: string | null | undefined): string {
+  if (text == null) return "";
+  let str = String(text).normalize("NFC");
+
+  // Reemplazar caracteres de control no permitidos
+  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Reemplazar comillas, guiones y flechas por equivalentes compatibles
+  str = str
+    .replace(/[—–]/g, "-")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[→➔➜]/g, "->")
+    .replace(/[←]/g, "<-");
+
+  // Eliminar emojis (surrogate pairs y bloques Unicode emoji)
+  str = str.replace(
+    /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}]/gu,
+    ""
+  );
+
+  // Mantener solo caracteres en rango WinAnsi (ASCII, Latin-1 suplementario, saltos y viñeta •)
+  str = str.replace(/[^\x20-\x7E\xA0-\xFF\u2022\n\r\t]/g, "");
+
+  return str.replace(/[ \t]+/g, " ").trim();
+}
+
 /** Un PDF imprimible: varias boletas por página, separadas por línea de corte. */
 export async function generateClientReceiptsPdf(workDayId: string, outDir: string): Promise<string> {
   // Filtro estricto por status = 'active' para excluir pedidos anulados de la impresión
@@ -102,83 +134,116 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
   for (const line of lines) byOrder.set(line.order_id, [...(byOrder.get(line.order_id) || []), line]);
 
   const filePath = path.join(outDir, "boletas_clientes.pdf");
+  // [M-12] y [A-11] Escritura atómica a archivo temporal con manejo robusto de errores
+  const tmpFilePath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
     const doc = new PDFDocument({ size: "A4", margin: 42 });
-    const stream = fs.createWriteStream(filePath);
-    doc.pipe(stream);
-    stream.on("finish", resolve);
-    stream.on("error", reject);
+    const stream = fs.createWriteStream(tmpFilePath);
 
-    for (const order of byOrder.values()) {
-      const first = order[0];
-      // Cada línea estándar necesita ~20 pt; cada selección de combo ~16 pt.
-      const totalVisualRows = order.reduce((sum, item) => sum + 1 + (item.selections?.length || 0), 0);
-      const receiptHeight = 160 + totalVisualRows * 20;
+    const cleanup = (err: any) => {
+      if (settled) return;
+      settled = true;
+      try {
+        stream.destroy();
+      } catch {
+        /* ignore */
+      }
+      fs.promises.unlink(tmpFilePath).catch(() => {});
+      reject(err);
+    };
 
-      if (doc.y > 60 && doc.y + receiptHeight > 752) doc.addPage();
+    doc.on("error", cleanup);
+    stream.on("error", cleanup);
 
-      // text() con x y width explícitos evita que el centrado herede el ancho
-      // de la columna anterior al imprimir varios comprobantes en una página.
-      doc.fillColor("#001428").font("Helvetica-Bold").fontSize(13)
-        .text("COMPROBANTE DE VENTA", 42, doc.y, { width: 511, align: "center" });
-      doc.moveDown(0.35);
-      doc.fillColor("#111827").font("Helvetica").fontSize(10);
-      doc.text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 });
-      doc.text(`Cliente: ${first.business_name}`);
-      doc.text(`Fecha: ${formatBoliviaDate(first.created_at)}`);
-      if (first.address) doc.text(`Dirección: ${first.address}`);
-      doc.moveDown(0.45);
+    stream.on("finish", () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
 
-      const x = [42, 215, 315, 380, 470];
-      const widths = [173, 100, 65, 90, 83];
-      const headerY = doc.y;
-      doc.rect(42, headerY, 511, 18).fill("#001428");
-      doc.fillColor("white").font("Helvetica-Bold").fontSize(8);
-      const headerAlignments: PDFKit.Mixins.TextOptions["align"][] = ["left", "left", "center", "right", "right"];
-      ["Producto", "Presentación", "Cantidad", "Precio unitario", "Subtotal"].forEach((label, i) =>
-        doc.text(label, x[i] + 4, headerY + 5, { width: widths[i] - 8, align: headerAlignments[i] })
-      );
-      doc.y = headerY + 23;
+    try {
+      doc.pipe(stream);
 
-      for (const line of order) {
-        const isCombo = line.selections && line.selections.length > 0;
-        const displayName = isCombo ? `${line.product_name_snapshot} (Combo)` : line.product_name_snapshot;
-        const rowY = doc.y;
+      for (const order of byOrder.values()) {
+        const first = order[0];
+        // Cada línea estándar necesita ~20 pt; cada selección de combo ~16 pt.
+        const totalVisualRows = order.reduce((sum, item) => sum + 1 + (item.selections?.length || 0), 0);
+        const receiptHeight = 160 + totalVisualRows * 20;
 
-        doc.fillColor("#111827").font("Helvetica").fontSize(9);
-        doc.text(displayName, x[0] + 4, rowY, { width: widths[0] - 8 });
-        doc.text(line.presentation_name_snapshot, x[1] + 4, rowY, { width: widths[1] - 8 });
-        doc.text(String(line.quantity), x[2] + 4, rowY, { width: widths[2] - 8, align: "center" });
-        doc.text(money(line.unit_price_cents_snapshot), x[3] + 4, rowY, { width: widths[3] - 8, align: "right" });
-        doc.text(money(line.subtotal_cents), x[4] + 4, rowY, { width: widths[4] - 8, align: "right" });
-        doc.moveTo(42, rowY + 15).lineTo(553, rowY + 15).strokeColor("#D1D5DB").stroke();
-        doc.y = rowY + 19;
+        if (doc.y > 60 && doc.y + receiptHeight > 752) doc.addPage();
 
-        // Desglose de ítems incluidos en el combo
-        if (isCombo) {
-          for (const sel of line.selections) {
-            const selY = doc.y;
-            doc.fillColor("#4B5563").font("Helvetica-Oblique").fontSize(8);
-            doc.text(`   • ${sel.product_name_snapshot}`, x[0] + 4, selY, { width: widths[0] - 8 });
-            doc.text(sel.presentation_name_snapshot, x[1] + 4, selY, { width: widths[1] - 8 });
-            doc.text(String(sel.quantity), x[2] + 4, selY, { width: widths[2] - 8, align: "center" });
-            doc.text("-", x[3] + 4, selY, { width: widths[3] - 8, align: "right" });
-            doc.text("-", x[4] + 4, selY, { width: widths[4] - 8, align: "right" });
-            doc.moveTo(42, selY + 13).lineTo(553, selY + 13).strokeColor("#E5E7EB").stroke();
-            doc.y = selY + 17;
+        // text() con x y width explícitos evita que el centrado herede el ancho
+        // de la columna anterior al imprimir varios comprobantes en una página.
+        doc.fillColor("#001428").font("Helvetica-Bold").fontSize(13)
+          .text("COMPROBANTE DE VENTA", 42, doc.y, { width: 511, align: "center" });
+        doc.moveDown(0.35);
+        doc.fillColor("#111827").font("Helvetica").fontSize(10);
+        doc.text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 });
+        doc.text(`Cliente: ${sanitizePdfText(first.business_name)}`);
+        doc.text(`Fecha: ${formatBoliviaDate(first.created_at)}`);
+        if (first.address) doc.text(`Dirección: ${sanitizePdfText(first.address)}`);
+        doc.moveDown(0.45);
+
+        const x = [42, 215, 315, 380, 470];
+        const widths = [173, 100, 65, 90, 83];
+        const headerY = doc.y;
+        doc.rect(42, headerY, 511, 18).fill("#001428");
+        doc.fillColor("white").font("Helvetica-Bold").fontSize(8);
+        const headerAlignments: PDFKit.Mixins.TextOptions["align"][] = ["left", "left", "center", "right", "right"];
+        ["Producto", "Presentación", "Cantidad", "Precio unitario", "Subtotal"].forEach((label, i) =>
+          doc.text(label, x[i] + 4, headerY + 5, { width: widths[i] - 8, align: headerAlignments[i] })
+        );
+        doc.y = headerY + 23;
+
+        for (const line of order) {
+          const isCombo = line.selections && line.selections.length > 0;
+          const rawName = isCombo ? `${line.product_name_snapshot} (Combo)` : line.product_name_snapshot;
+          const displayName = sanitizePdfText(rawName);
+          const rowY = doc.y;
+
+          doc.fillColor("#111827").font("Helvetica").fontSize(9);
+          doc.text(displayName, x[0] + 4, rowY, { width: widths[0] - 8 });
+          doc.text(sanitizePdfText(line.presentation_name_snapshot), x[1] + 4, rowY, { width: widths[1] - 8 });
+          doc.text(String(line.quantity), x[2] + 4, rowY, { width: widths[2] - 8, align: "center" });
+          doc.text(money(line.unit_price_cents_snapshot), x[3] + 4, rowY, { width: widths[3] - 8, align: "right" });
+          doc.text(money(line.subtotal_cents), x[4] + 4, rowY, { width: widths[4] - 8, align: "right" });
+          doc.moveTo(42, rowY + 15).lineTo(553, rowY + 15).strokeColor("#D1D5DB").stroke();
+          doc.y = rowY + 19;
+
+          // Desglose de ítems incluidos en el combo
+          if (isCombo) {
+            for (const sel of line.selections) {
+              const selY = doc.y;
+              doc.fillColor("#4B5563").font("Helvetica-Oblique").fontSize(8);
+              doc.text(`   • ${sanitizePdfText(sel.product_name_snapshot)}`, x[0] + 4, selY, { width: widths[0] - 8 });
+              doc.text(sanitizePdfText(sel.presentation_name_snapshot), x[1] + 4, selY, { width: widths[1] - 8 });
+              doc.text(String(sel.quantity), x[2] + 4, selY, { width: widths[2] - 8, align: "center" });
+              doc.text("-", x[3] + 4, selY, { width: widths[3] - 8, align: "right" });
+              doc.text("-", x[4] + 4, selY, { width: widths[4] - 8, align: "right" });
+              doc.moveTo(42, selY + 13).lineTo(553, selY + 13).strokeColor("#E5E7EB").stroke();
+              doc.y = selY + 17;
+            }
           }
         }
+
+        doc.moveDown(0.25);
+        doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(`TOTAL: ${money(first.total_cents)}`, { align: "right" });
+        doc.moveDown(0.45);
+        doc.dash(3, { space: 3 }).moveTo(42, doc.y).lineTo(553, doc.y).strokeColor("#6B7280").stroke().undash();
+        doc.moveDown(0.55);
       }
 
-      doc.moveDown(0.25);
-      doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(`TOTAL: ${money(first.total_cents)}`, { align: "right" });
-      doc.moveDown(0.45);
-      doc.dash(3, { space: 3 }).moveTo(42, doc.y).lineTo(553, doc.y).strokeColor("#6B7280").stroke().undash();
-      doc.moveDown(0.55);
+      if (byOrder.size === 0) {
+        doc.fillColor("#111827").font("Helvetica").fontSize(14).text("No hay preventas activas para esta jornada.");
+      }
+      doc.end();
+    } catch (err) {
+      cleanup(err);
     }
-
-    if (byOrder.size === 0) doc.fillColor("#111827").font("Helvetica").fontSize(14).text("No hay preventas activas para esta jornada.");
-    doc.end();
   });
+
+  await fs.promises.rename(tmpFilePath, filePath);
   return filePath;
 }

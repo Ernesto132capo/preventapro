@@ -84,10 +84,10 @@ export function OrderDetailScreen() {
     setIsSubmitting(true);
     try {
       await cancelOrderLocal(data.order.id);
-      await forceSync();
+      void forceSync().catch(() => {});
       navigation.goBack();
     } catch (err: any) {
-      Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa.");
+      Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa localmente.");
     } finally {
       isSubmittingRef.current = false;
       setIsSubmitting(false);

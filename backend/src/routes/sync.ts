@@ -5,20 +5,11 @@ import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { calculateLineSubtotalCents, calculateTaxCents } from "../services/pricing";
 import { closeStaleOpenWorkDays, invalidateWorkdayCache } from "./workdays";
+import { getBoliviaToday } from "../services/dates";
+import { resolveCategoryId, UUID_REGEX } from "./catalog";
 
 export const syncRouter = Router();
 syncRouter.use(requireAuth);
-
-function today() {
-  const p = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/La_Paz",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const v = (t: string) => p.find((x) => x.type === t)?.value;
-  return `${v("year")}-${v("month")}-${v("day")}`;
-}
 
 function client(row: any) {
   return {
@@ -75,7 +66,7 @@ interface PullCache {
   payload: string;
 }
 const pullCache = new Map<string, PullCache>();
-const MAX_PULL_CACHE_ENTRIES = 100;
+const MAX_PULL_CACHE_ENTRIES = 25;
 type PullDomain = "all" | "clients" | "products" | "orders" | "workdays";
 
 const clientQueryCache = new Map<string, any[]>();
@@ -154,7 +145,7 @@ function simpleHash(str: string): string {
 }
 
 const FORCE_TTL_MS = Number(process.env.SYNC_FORCE_TTL_MS) || 45_000;
-let lastRealForceFetchAt = 0;
+const lastRealForceFetchByUser = new Map<string, number>();
 
 async function recalcWorkDayTotals(client: PoolClient, workDayId: string): Promise<void> {
   const { rows } = await client.query(
@@ -182,9 +173,17 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     const requestedForce = req.query.force === "1";
 
     const now = Date.now();
-    const forceThrottled = requestedForce && now - lastRealForceFetchAt < FORCE_TTL_MS;
+    const userLastForce = lastRealForceFetchByUser.get(req.userId!) || 0;
+    const forceThrottled = requestedForce && now - userLastForce < FORCE_TTL_MS;
     const force = requestedForce && !forceThrottled;
-    if (force) lastRealForceFetchAt = now;
+    if (force) lastRealForceFetchByUser.set(req.userId!, now);
+    // Clean old entries
+    if (lastRealForceFetchByUser.size > 200) {
+      const cutoff = now - FORCE_TTL_MS * 2;
+      for (const [uid, ts] of lastRealForceFetchByUser) {
+        if (ts < cutoff) lastRealForceFetchByUser.delete(uid);
+      }
+    }
 
     const cached = !force && !isInitial ? pullCache.get(pullKey) : undefined;
     if (cached) {
@@ -211,7 +210,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       forcedPullsInFlight.set(forcedKey, resolvableTask);
     }
 
-    const todayDate = today();
+    const todayDate = getBoliviaToday();
 
     // Auto-cerrar jornadas pasadas abiertas para mantener consistencia con workdays.ts
     const cleanupClient = await pool.connect();
@@ -226,7 +225,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     }
 
     const cursorKey = isInitial ? "__initial__" : since;
-    const [clientRows, productRows, categoryRows, neighborhoodRows, todayWorkDayRows, comboDefRows, comboOptionRows] =
+    const [clientRows, productRows, categoryRows, neighborhoodRows, workDayRows, comboDefRows, comboOptionRows] =
       await Promise.all([
         cachedRows(
           "clients",
@@ -265,9 +264,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         cachedRows(
           "workdays",
           workdayQueryCache,
-          `${req.userId}:${todayDate}`,
+          `${req.userId}:${cursorKey}`,
           async () =>
-            (await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2", [req.userId, todayDate])).rows,
+            isInitial
+              ? (await pool.query("SELECT * FROM work_days WHERE user_id = $1 ORDER BY work_date DESC LIMIT 30", [req.userId])).rows
+              : (await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND updated_at > $2", [req.userId, since])).rows,
           force
         ),
         cachedRows(
@@ -311,21 +312,25 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
     const presentations = rawPresentationRows.map((row: any) => presentation(row));
 
-    const sortedTodayRows = [...todayWorkDayRows].sort((a, b) =>
+    const sortedWorkDayRows = [...workDayRows].sort((a, b) =>
       String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""))
     );
-    const todayWorkDayRow = sortedTodayRows[0] || null;
+    const todayWorkDayRow = sortedWorkDayRows.find((w) => w.work_date === todayDate) || sortedWorkDayRows[0] || null;
 
     let orders: any[] = [];
-    if (todayWorkDayRow) {
-      const orderRows = await cachedRows(
-        "orders",
-        orderQueryCache,
-        todayWorkDayRow.id,
-        async () => (await pool.query("SELECT * FROM orders WHERE work_day_id = $1", [todayWorkDayRow.id])).rows,
-        force
-      );
-      const activeOrders = orderRows.filter((row) => row.status === "active");
+    if (workDayRows.length > 0) {
+      const allOrderRows: any[] = [];
+      for (const wd of workDayRows) {
+        const orderRows = await cachedRows(
+          "orders",
+          orderQueryCache,
+          wd.id,
+          async () => (await pool.query("SELECT * FROM orders WHERE work_day_id = $1", [wd.id])).rows,
+          force
+        );
+        allOrderRows.push(...orderRows);
+      }
+      const activeOrders = allOrderRows.filter((row) => row.status === "active");
 
       if (activeOrders.length > 0) {
         const [itemsResults, clientIds] = [
@@ -431,6 +436,19 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         }
       : null;
 
+    const workDaysData = workDayRows.map((wd: any) => ({
+      id: wd.id,
+      server_id: wd.id,
+      user_id: wd.user_id,
+      work_date: wd.work_date,
+      status: wd.status,
+      order_count: Number(wd.order_count ?? 0),
+      total_cents: Number(wd.total_cents ?? 0),
+      created_at: wd.created_at,
+      closed_at: wd.closed_at ?? null,
+      auto_closed: wd.auto_closed === true,
+    }));
+
     const hasChanges =
       isInitial ||
       clientRows.length > 0 ||
@@ -440,7 +458,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       comboDefRows.length > 0 ||
       comboOptionRows.length > 0 ||
       neighborhoodRows.length > 0 ||
-      Boolean(todayWorkDayRow && String(todayWorkDayRow.updated_at || todayWorkDayRow.created_at || "") > since) ||
+      workDayRows.some((wd: any) => String(wd.updated_at || wd.created_at || "") > since) ||
       orders.some((order) => String(order.updated_at || order.created_at || "") > since);
 
     const nowIsoStr = new Date().toISOString();
@@ -450,6 +468,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       hasChanges,
       refreshThrottled: forceThrottled,
       workDay: workDayData,
+      workDays: workDaysData,
       clients: clientRows.map((row: any) => client(row)),
       products: productRows.map((row: any) => product(row)),
       presentations,
@@ -531,6 +550,8 @@ interface SyncOperationResult {
 async function processOrderSync(client: PoolClient, op: SyncOperationItem, userId: string): Promise<SyncOperationResult> {
   const localId = op.id || op.local_entity_id || op.localId || uuid();
   const data = op.data || op;
+  const idempotencyKey = data.idempotencyKey || data.idempotency_key || localId;
+  await client.query("SELECT pg_advisory_xact_lock(1002, hashtext($1))", [idempotencyKey]);
   const action = op.operation || op.action || data.operation || (data.status === "cancelled" ? "cancel" : "create");
 
   if (action === "cancel") {
@@ -541,6 +562,11 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
     );
     if (existing.length > 0) {
       const order = existing[0];
+      // Validate workday is not closed
+      const { rows: wdRows } = await client.query("SELECT status FROM work_days WHERE id = $1", [order.work_day_id]);
+      if (wdRows.length > 0 && wdRows[0].status === 'closed') {
+        throw new Error('La jornada está cerrada. No se puede cancelar un pedido de una jornada concluida.');
+      }
       await client.query("UPDATE orders SET status = 'cancelled', updated_at = $2 WHERE id = $1", [order.id, nowIso()]);
       await recalcWorkDayTotals(client, order.work_day_id);
       return { id: localId, serverId: order.id, entityType: "order", status: "synced", action: "cancelled" };
@@ -548,7 +574,6 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
     return { id: localId, entityType: "order", status: "synced", action: "cancelled" };
   }
 
-  const idempotencyKey = data.idempotencyKey || data.idempotency_key || localId;
   const existingOrder = await client.query(
     "SELECT id, user_id FROM orders WHERE idempotency_key = $1 LIMIT 1",
     [idempotencyKey]
@@ -566,7 +591,7 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
   }
   if (!wd) {
     // Intentar resolver por fecha y usuario
-    const orderDate = data.work_date || (data.createdAt ? String(data.createdAt).slice(0, 10) : today());
+    const orderDate = data.work_date || (data.createdAt ? String(data.createdAt).slice(0, 10) : getBoliviaToday());
     const { rows } = await client.query(
       "SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
       [userId, orderDate]
@@ -648,8 +673,20 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
         throw new Error(`La selección para "${p.name}" debe ser entre ${comboDef.selection_min} y ${comboDef.selection_max} unidades.`);
       }
 
-      for (let sIdx = 0; sIdx < rawSelections.length; sIdx++) {
-        const s = rawSelections[sIdx];
+      // Aggregate duplicate selections by presentation
+      const aggregatedSelections = new Map<string, any>();
+      for (const s of rawSelections) {
+        const key = s.selectedPresentationId || s.selected_presentation_id;
+        if (aggregatedSelections.has(key)) {
+          aggregatedSelections.get(key).quantity += Number(s.quantity || 0);
+        } else {
+          aggregatedSelections.set(key, { ...s, quantity: Number(s.quantity || 0) });
+        }
+      }
+      const mergedSelections = Array.from(aggregatedSelections.values());
+
+      for (let sIdx = 0; sIdx < mergedSelections.length; sIdx++) {
+        const s = mergedSelections[sIdx];
         const sPresId = s.selectedPresentationId || s.selected_presentation_id;
         const sQty = Number(s.quantity);
         const opt = optMap.get(sPresId);
@@ -698,13 +735,14 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
   const orderId = uuid();
   const orderCreatedAt = data.createdAt || data.created_at;
   const ts = orderCreatedAt && !isNaN(new Date(orderCreatedAt).getTime()) ? new Date(orderCreatedAt).toISOString() : nowIso();
+  const serverNow = nowIso();
 
   await client.query(
     `INSERT INTO orders (
        id, idempotency_key, work_day_id, user_id, client_id, payment_condition, tax_rate_permille,
        subtotal_cents, tax_cents, total_cents, item_count, status, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $12, $12)`,
-    [orderId, idempotencyKey, wd.id, userId, clientRow.id, data.paymentCondition || data.payment_condition || "Contado 48h", taxRate, subtotal, tax, total, itemCount, ts]
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $12, $13)`,
+    [orderId, idempotencyKey, wd.id, userId, clientRow.id, data.paymentCondition || data.payment_condition || "Contado 48h", taxRate, subtotal, tax, total, itemCount, ts, serverNow]
   );
 
   for (const it of processedItems) {
@@ -742,12 +780,13 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
     [data.serverId || data.server_id || localId, clientLocalId]
   );
 
+  const neighborhoodId = data.neighborhoodId ?? data.neighborhood_id ?? null;
   if (existing.length > 0) {
     const serverId = existing[0].id;
     await client.query(
-      `UPDATE clients SET business_name = $1, contact_name = $2, phone = $3, address = $4, lat = $5, lng = $6, updated_at = now()
+      `UPDATE clients SET business_name = $1, contact_name = $2, phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $8, updated_at = now()
        WHERE id = $7`,
-      [businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId]
+      [businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId, neighborhoodId]
     );
     return { id: localId, serverId, entityType: "client", status: "synced" };
   }
@@ -755,9 +794,9 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
   const serverId = uuid();
   await client.query(
     `INSERT INTO clients (
-       id, client_local_id, business_name, contact_name, phone, address, lat, lng, visit_status, active, created_by, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, now(), now())`,
-    [serverId, clientLocalId, businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, userId]
+       id, client_local_id, business_name, contact_name, phone, address, lat, lng, neighborhood_id, visit_status, active, created_by, created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
+    [serverId, clientLocalId, businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, userId]
   );
   return { id: localId, serverId, entityType: "client", status: "synced" };
 }
@@ -768,15 +807,20 @@ async function processCategorySync(client: PoolClient, op: SyncOperationItem): P
   const name = String(data.name || "").trim();
   if (!name) throw new Error("El nombre de la categoría es obligatorio.");
 
+  // [M-05] Si el nombre enviado es un UUID, no crear una categoría con nombre UUID
+  if (UUID_REGEX.test(name)) {
+    return { id: localId, entityType: "category", status: "synced" };
+  }
+
   const targetId = data.serverId || data.server_id || localId;
-  const { rows: existing } = await client.query("SELECT id FROM categories WHERE id = $1 OR name = $2 LIMIT 1", [targetId, name]);
+  const { rows: existing } = await client.query("SELECT id FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1", [targetId, name]);
   if (existing.length > 0) {
     const serverId = existing[0].id;
     await client.query("UPDATE categories SET name = $1, active = true, updated_at = now() WHERE id = $2", [name, serverId]);
     return { id: localId, serverId, entityType: "category", status: "synced" };
   }
 
-  const serverId = uuid();
+  const serverId = UUID_REGEX.test(targetId) ? targetId : uuid();
   await client.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, now(), now())", [serverId, name]);
   return { id: localId, serverId, entityType: "category", status: "synced" };
 }
@@ -791,23 +835,35 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
   const baseCost = Math.max(0, Number(data.baseCostCents ?? data.base_cost_cents ?? 0));
   const productType = data.productType || data.product_type || "standard";
 
+  // [M-05] Resolver categoría sin crear nombres que sean cadenas UUID
+  const targetCategoryId = await resolveCategoryId(
+    client,
+    data.categoryId || data.category_id || null,
+    data.categoryName || data.category_name || null
+  );
+
   const targetId = data.serverId || data.server_id || localId;
-  const { rows: existing } = await client.query("SELECT id FROM products WHERE id = $1 OR sku = $2 LIMIT 1", [targetId, sku]);
+  const { rows: existing } = await client.query(
+    "SELECT id, active FROM products WHERE id = $1 OR sku = $2 OR lower(name) = lower($3) LIMIT 1",
+    [targetId, sku, name]
+  );
 
   let serverId = targetId;
-  if (existing.length > 0) {
+  const isExisting = existing.length > 0;
+  if (isExisting) {
     serverId = existing[0].id;
+    // [M-06] Reactivar si estaba inactivo y actualizar sus datos
     await client.query(
       `UPDATE products SET name = $1, sku = $2, base_cost_cents = $3, product_type = $4, category_id = $5, active = true, updated_at = now()
        WHERE id = $6`,
-      [name, sku, baseCost, productType, data.categoryId || data.category_id || null, serverId]
+      [name, sku, baseCost, productType, targetCategoryId, serverId]
     );
   } else {
     serverId = uuid();
     await client.query(
       `INSERT INTO products (id, sku, name, category_id, base_cost_cents, base_unit_name, product_type, active, created_by, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, now(), now())`,
-      [serverId, sku, name, data.categoryId || data.category_id || null, baseCost, data.baseUnitName || data.base_unit_name || "Unidad", productType, userId]
+      [serverId, sku, name, targetCategoryId, baseCost, data.baseUnitName || data.base_unit_name || "Unidad", productType, userId]
     );
   }
 
@@ -831,7 +887,47 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
     );
   }
 
-  return { id: localId, serverId, entityType: "product", status: "synced" };
+  // Combos
+  const comboDef = data.comboDefinition || data.combo_definition;
+  if (comboDef && productType === "combo") {
+    const selMin = Number(comboDef.selectionMin ?? comboDef.selection_min ?? 1);
+    const selMax = Number(comboDef.selectionMax ?? comboDef.selection_max ?? selMin);
+    const options = comboDef.options || [];
+
+    // a. DELETE existing combo_options for this product's combo_definitions
+    await client.query(
+      "DELETE FROM combo_options WHERE combo_id IN (SELECT id FROM combo_definitions WHERE product_id = $1)",
+      [serverId]
+    );
+
+    // b. DELETE existing combo_definitions for this product
+    await client.query("DELETE FROM combo_definitions WHERE product_id = $1", [serverId]);
+
+    // c. INSERT into combo_definitions (id, product_id, selection_min, selection_max, active, created_at, updated_at)
+    const comboDefId = comboDef.id || uuid();
+    const ts = nowIso();
+    await client.query(
+      `INSERT INTO combo_definitions (id, product_id, selection_min, selection_max, active, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, true, $5, $5)`,
+      [comboDefId, serverId, selMin, selMax, ts]
+    );
+
+    // d. For each option, INSERT into combo_options (id, combo_id, presentation_id, max_quantity, sort_order, active, created_at, updated_at)
+    for (let i = 0; i < options.length; i++) {
+      const opt = options[i];
+      const optId = opt.id || uuid();
+      const presId = opt.presentationId || opt.presentation_id;
+      const maxQty = opt.maxQuantity ?? opt.max_quantity ?? null;
+      const sortOrder = opt.sortOrder ?? opt.sort_order ?? i;
+      await client.query(
+        `INSERT INTO combo_options (id, combo_id, presentation_id, max_quantity, sort_order, active, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, true, $6, $6)`,
+        [optId, comboDefId, presId, maxQty != null ? Number(maxQty) : null, sortOrder, ts]
+      );
+    }
+  }
+
+  return { id: localId, serverId, entityType: "product", status: "synced", deduped: isExisting };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -876,39 +972,48 @@ syncRouter.post(["/push", "/"], async (req: AuthedRequest, res) => {
   const results: SyncOperationResult[] = [];
   let hasModifications = false;
 
-  for (const op of sortedOps) {
-    const entityType = op.entityType || op.entity_type || op.type || "order";
-    const opId = op.id || op.local_entity_id || op.localId || uuid();
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      let result: SyncOperationResult;
-      if (entityType === "client") {
-        result = await processClientSync(client, op, req.userId!);
-      } else if (entityType === "category") {
-        result = await processCategorySync(client, op);
-      } else if (entityType === "product") {
-        result = await processProductSync(client, op, req.userId!);
-      } else {
-        result = await processOrderSync(client, op, req.userId!);
-      }
-      await client.query("COMMIT");
-      results.push(result);
-      if (result.status === "synced") hasModifications = true;
-    } catch (err: any) {
+  const batchClient = await pool.connect();
+  try {
+    await batchClient.query("BEGIN");
+    for (const op of sortedOps) {
+      const entityType = op.entityType || op.entity_type || op.type || "order";
+      const opId = op.id || op.local_entity_id || op.localId || uuid();
+      const savepointName = `sp_${results.length}`;
       try {
-        await client.query("ROLLBACK");
-      } catch {}
-      // Aislamiento de fallos: un ítem rechazado no aborta el lote completo
-      results.push({
-        id: opId,
-        entityType,
-        status: "failed",
-        error: err.message || "Error al procesar la operación de sincronización.",
-      });
-    } finally {
-      client.release();
+        await batchClient.query(`SAVEPOINT ${savepointName}`);
+        let result: SyncOperationResult;
+        if (entityType === "client") {
+          result = await processClientSync(batchClient, op, req.userId!);
+        } else if (entityType === "category") {
+          result = await processCategorySync(batchClient, op);
+        } else if (entityType === "product") {
+          result = await processProductSync(batchClient, op, req.userId!);
+        } else {
+          result = await processOrderSync(batchClient, op, req.userId!);
+        }
+        await batchClient.query(`RELEASE SAVEPOINT ${savepointName}`);
+        results.push(result);
+        if (result.status === "synced") hasModifications = true;
+      } catch (err: any) {
+        try {
+          await batchClient.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        } catch {}
+        results.push({
+          id: opId,
+          entityType,
+          status: "failed",
+          error: err.message || "Error al procesar la operación de sincronización.",
+        });
+      }
     }
+    await batchClient.query("COMMIT");
+  } catch (batchErr) {
+    try {
+      await batchClient.query("ROLLBACK");
+    } catch {}
+    throw batchErr;
+  } finally {
+    batchClient.release();
   }
 
   if (hasModifications) {

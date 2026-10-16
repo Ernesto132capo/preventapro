@@ -5,6 +5,7 @@ import { pool } from "../db/pg";
 export interface AuthedRequest extends Request {
   userId?: string; // id de la fila en la tabla "users" de Neon
   userCode?: string;
+  userRole?: string;
 }
 
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -13,19 +14,44 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
     return res.status(401).json({ error: "No autenticado. Token faltante." });
   }
   const idToken = header.slice("Bearer ".length);
+  let decoded: { uid: string };
   try {
-    const decoded = verifyAccessToken(idToken);
-    const { rows } = await pool.query("SELECT active, code FROM users WHERE id = $1", [decoded.uid]);
+    decoded = verifyAccessToken(idToken);
+  } catch {
+    return res.status(401).json({ error: "Sesión inválida o expirada." });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT active, code, COALESCE(role, 'preventista') AS role FROM users WHERE id = $1",
+      [decoded.uid]
+    );
     const user = rows[0];
     if (!user || user.active === false) {
       return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
     }
     req.userId = decoded.uid;
     req.userCode = user.code;
+    req.userRole = user.role || "preventista";
     next();
-  } catch (err) {
-    return res.status(401).json({ error: "Sesión inválida o expirada." });
+  } catch (dbErr) {
+    console.error("Error de base de datos en requireAuth:", dbErr);
+    return res.status(503).json({ error: "Error de conexión con la base de datos. Intente más tarde." });
   }
+}
+
+/** Middleware para exigir roles específicos (ej. 'admin'). */
+export function requireRole(...allowedRoles: string[]) {
+  return (req: AuthedRequest, res: Response, next: NextFunction) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: "No autenticado." });
+    }
+    const currentRole = req.userRole || "preventista";
+    if (!allowedRoles.includes(currentRole)) {
+      return res.status(403).json({ error: "Acceso denegado: se requieren permisos administrativos." });
+    }
+    next();
+  };
 }
 
 /** Autoriza enlaces de descarga firmados, breves y limitados a una jornada. */

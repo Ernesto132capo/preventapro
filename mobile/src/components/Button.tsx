@@ -9,9 +9,10 @@ interface Props {
   disabled?: boolean;
   loading?: boolean;
   style?: ViewStyle;
+  accessibilityLabel?: string;
 }
 
-export function Button({ label, onPress, variant = "primary", disabled, loading, style }: Props) {
+export function Button({ label, onPress, variant = "primary", disabled, loading, style, accessibilityLabel }: Props) {
   const bg = {
     primary: colors.emerald,
     secondary: colors.navy,
@@ -24,6 +25,9 @@ export function Button({ label, onPress, variant = "primary", disabled, loading,
     <Pressable
       onPress={onPress}
       disabled={disabled || loading}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || label}
+      accessibilityState={{ disabled: !!(disabled || loading), busy: !!loading }}
       style={({ pressed }) => [
         styles.base,
         { backgroundColor: bg, opacity: disabled ? 0.5 : pressed ? 0.85 : 1 },

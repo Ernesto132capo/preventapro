@@ -43,7 +43,9 @@ export function buildCartLine(product: Product, presentation: Presentation, quan
   if (!product || !presentation) {
     throw new PricingError("Producto o presentación no encontrados o inactivos.");
   }
-  if (presentation.product_id !== product.id) {
+  const matches = presentation.product_id === product.id ||
+    (product.server_id != null && presentation.product_id === product.server_id);
+  if (!matches) {
     throw new PricingError("La presentación no pertenece a este producto.");
   }
   const unitPriceCents = presentation.price_cents;

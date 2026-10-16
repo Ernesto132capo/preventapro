@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { pool } from "../db/pg";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireRole } from "../middleware/auth";
 
 export const settingsRouter = Router();
 settingsRouter.use(requireAuth);
@@ -25,12 +25,22 @@ const counterSchema = z.object({ value: z.number().int().nonnegative().max(2_000
 // Ajuste manual temporal (ver pedido del cliente): permite alinear el
 // correlativo con el arrastre histórico de un sistema anterior. Sobrescribe
 // el valor directamente — la siguiente preventa emitirá `value + 1`.
-settingsRouter.put("/receipt-counter", async (req, res, next) => {
+settingsRouter.put("/receipt-counter", requireRole("admin"), async (req, res, next) => {
   const parsed = counterSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   try {
-    const { rows } = await pool.query("SELECT setval('receipt_number_seq', $1)", [parsed.data.value]);
-    res.json({ ok: true, value: Number(rows[0]?.setval ?? parsed.data.value) });
+    const val = parsed.data.value;
+    let newSeqVal: number;
+    if (val <= 0) {
+      // En Postgres, las secuencias con MINVALUE 1 no aceptan 0 en setval('seq', 0).
+      // Usamos setval('receipt_number_seq', 1, false) para que el próximo nextval() devuelva 1.
+      await pool.query("SELECT setval('receipt_number_seq', 1, false)");
+      newSeqVal = 0;
+    } else {
+      const { rows } = await pool.query("SELECT setval('receipt_number_seq', $1, true)", [val]);
+      newSeqVal = Number(rows[0]?.setval ?? val);
+    }
+    res.json({ ok: true, value: newSeqVal });
   } catch (err) {
     next(err);
   }

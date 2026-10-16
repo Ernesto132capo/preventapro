@@ -1,4 +1,4 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getSecureItem, setSecureItem, deleteSecureItem } from "./secureStorage";
 import { API_BASE_URL } from "./config";
 
 const ACCESS_TOKEN_KEY = "preventapro_access_token";
@@ -35,7 +35,7 @@ export class ApiError extends Error {
 
 export async function getAccessToken(): Promise<string | null> {
   if (!tokenLoaded) {
-    accessToken = await AsyncStorage.getItem(ACCESS_TOKEN_KEY);
+    accessToken = await getSecureItem(ACCESS_TOKEN_KEY);
     tokenLoaded = true;
   }
   return accessToken;
@@ -46,16 +46,16 @@ export async function setTokens(token: string, rememberSession = true): Promise<
   accessToken = token;
   tokenLoaded = true;
   if (rememberSession) {
-    await AsyncStorage.setItem(ACCESS_TOKEN_KEY, token);
+    await setSecureItem(ACCESS_TOKEN_KEY, token);
   } else {
-    await AsyncStorage.removeItem(ACCESS_TOKEN_KEY);
+    await deleteSecureItem(ACCESS_TOKEN_KEY);
   }
 }
 
 export async function clearTokens(): Promise<void> {
   accessToken = null;
   tokenLoaded = true;
-  await AsyncStorage.removeItem(ACCESS_TOKEN_KEY);
+  await deleteSecureItem(ACCESS_TOKEN_KEY);
 }
 
 interface RequestOptions {

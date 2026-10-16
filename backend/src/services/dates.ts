@@ -52,3 +52,17 @@ export function formatBoliviaDateTime(value: string | Date | null | undefined): 
     hour12: false,
   }).format(date);
 }
+
+/**
+ * Obtiene la fecha actual en formato 'YYYY-MM-DD' en la zona horaria de Bolivia (America/La_Paz).
+ */
+export function getBoliviaToday(): string {
+  const p = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/La_Paz",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const v = (t: string) => p.find((x) => x.type === t)?.value;
+  return `${v("year")}-${v("month")}-${v("day")}`;
+}

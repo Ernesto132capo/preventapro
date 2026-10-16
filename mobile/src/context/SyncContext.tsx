@@ -36,6 +36,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   // Refs para evitar stale closures en el timer y el listener de AppState
   const syncingRef = useRef(false);
+  const pendingPushRef = useRef(false);
   const isConnectedRef = useRef(true);
   const isActiveRef = useRef(true);   // false cuando la app esta en background
   const userRef = useRef(user);
@@ -91,6 +92,13 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       setConnection(isConnectedRef.current ? "online" : "offline");
     } finally {
       syncingRef.current = false;
+      if (pendingPushRef.current && userRef.current) {
+        pendingPushRef.current = false;
+        pushOnlySync(userRef.current.id).then(
+          (r) => applyResultRef.current(r),
+          () => {}
+        );
+      }
     }
   });
 
@@ -104,7 +112,11 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   /** pushSync: solo push del outbox sin pull de catalogo.
    *  Usar despues de crear/editar clientes, productos o preventas. */
   const pushSync = useCallback(async () => {
-    if (!userRef.current || syncingRef.current) return;
+    if (!userRef.current) return;
+    if (syncingRef.current) {
+      pendingPushRef.current = true;  // will run after current sync finishes
+      return;
+    }
     syncingRef.current = true;
     setConnection("syncing");
     try {
@@ -116,6 +128,11 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       setConnection(isConnectedRef.current ? "online" : "offline");
     } finally {
       syncingRef.current = false;
+      if (pendingPushRef.current) {
+        pendingPushRef.current = false;
+        // Schedule the pending push on next tick to avoid recursion
+        setTimeout(() => { void pushSync(); }, 50);
+      }
     }
   }, [refreshPendingCount]);
 
@@ -135,7 +152,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   // Detectar cambios de conectividad
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener((state) => {
-      const online = !!state.isConnected && !!state.isInternetReachable;
+      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
       setIsConnected(online);
       isConnectedRef.current = online;
       if (online) {

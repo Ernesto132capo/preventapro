@@ -1,14 +1,7 @@
 import { v4 as uuid } from "uuid";
 import { getDb, nowIso } from "../client";
 import { WorkDay } from "../../domain/types";
-
-function todayStr(): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(new Date());
-  const part = (type: string) => parts.find((p) => p.type === type)?.value;
-  return `${part("year")}-${part("month")}-${part("day")}`;
-}
+import { todayBolivia } from "../../utils/dates";
 
 const userWorkDayLocks = new Map<string, Promise<void>>();
 
@@ -33,7 +26,7 @@ export async function withUserWorkDayLock<T>(userId: string, operation: () => Pr
 /** Devuelve la jornada de hoy. Si fue concluida, retorna 'closed' y no la sobreescribe a 'open'. */
 export async function getTodayWorkDay(userId: string): Promise<WorkDay> {
   const db = await getDb();
-  const today = todayStr();
+  const today = todayBolivia();
   return withUserWorkDayLock(userId, async () => {
     let row: any = null;
     await db.withTransactionAsync(async () => {
@@ -47,12 +40,16 @@ export async function getTodayWorkDay(userId: string): Promise<WorkDay> {
         [userId, today]
       );
 
-      const futureOpen = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE user_id = ? AND status = 'open' AND work_date > ? LIMIT 1`,
+      // Si ya existe una jornada abierta con fecha posterior (debido a clock skew del teléfono o cambio de huso),
+      // no crasheamos: la reutilizamos como la jornada activa actual para que el usuario pueda trabajar o cerrarla limpiamente.
+      const futureOpen = await db.getFirstAsync<any>(
+        `SELECT * FROM work_days WHERE user_id = ? AND status = 'open' AND work_date > ?
+         ORDER BY work_date DESC, created_at DESC LIMIT 1`,
         [userId, today]
       );
       if (futureOpen) {
-        throw new Error('Ya existe una jornada abierta para este preventista. Ciérrala antes de abrir otra.');
+        row = futureOpen;
+        return;
       }
 
       const rows = await db.getAllAsync<any>(

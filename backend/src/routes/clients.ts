@@ -105,39 +105,50 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
   }
 });
 
-clientsRouter.put("/:id", async (req, res) => {
-  const parsed = clientSchema.partial().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+clientsRouter.put("/:id", async (req, res, next) => {
+  try {
+    const parsed = clientSchema.partial().safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
 
-  const existing = await pool.query("SELECT * FROM clients WHERE id = $1", [req.params.id]);
-  const current = existing.rows[0];
-  if (!current || current.active === false) return res.status(404).json({ error: "Cliente no encontrado." });
+    const existing = await pool.query("SELECT * FROM clients WHERE id = $1", [req.params.id]);
+    const current = existing.rows[0];
+    if (!current || current.active === false) return res.status(404).json({ error: "Cliente no encontrado." });
 
-  const d = parsed.data;
-  const merged = {
-    business_name: d.businessName !== undefined ? d.businessName : current.business_name,
-    contact_name: d.contactName !== undefined ? d.contactName : current.contact_name,
-    phone: d.phone !== undefined ? d.phone : current.phone,
-    neighborhood_id: d.neighborhoodId !== undefined ? d.neighborhoodId : current.neighborhood_id,
-    address: d.address !== undefined ? d.address : current.address,
-    lat: d.lat !== undefined ? d.lat : current.lat,
-    lng: d.lng !== undefined ? d.lng : current.lng,
-  };
-  const ts = nowIso();
-  const { rows } = await pool.query(
-    `UPDATE clients SET business_name = $2, contact_name = $3, phone = $4, neighborhood_id = $5,
-       address = $6, lat = $7, lng = $8, updated_at = $9
-     WHERE id = $1
-     RETURNING *`,
-    [req.params.id, merged.business_name, merged.contact_name, merged.phone, merged.neighborhood_id, merged.address, merged.lat, merged.lng, ts]
-  );
-  invalidatePullCache("clients");
-  res.json({ client: serializeClient(rows[0]) });
+    const d = parsed.data;
+    const merged = {
+      business_name: d.businessName !== undefined ? d.businessName : current.business_name,
+      contact_name: d.contactName !== undefined ? d.contactName : current.contact_name,
+      phone: d.phone !== undefined ? d.phone : current.phone,
+      neighborhood_id: d.neighborhoodId !== undefined ? d.neighborhoodId : current.neighborhood_id,
+      address: d.address !== undefined ? d.address : current.address,
+      lat: d.lat !== undefined ? d.lat : current.lat,
+      lng: d.lng !== undefined ? d.lng : current.lng,
+    };
+    const ts = nowIso();
+    const { rows } = await pool.query(
+      `UPDATE clients SET business_name = $2, contact_name = $3, phone = $4, neighborhood_id = $5,
+         address = $6, lat = $7, lng = $8, updated_at = $9
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id, merged.business_name, merged.contact_name, merged.phone, merged.neighborhood_id, merged.address, merged.lat, merged.lng, ts]
+    );
+    invalidatePullCache("clients");
+    res.json({ client: serializeClient(rows[0]) });
+  } catch (err) {
+    next(err);
+  }
 });
 
-clientsRouter.delete("/:id", async (req, res) => {
-  const orders = await pool.query("SELECT id FROM orders WHERE client_id = $1 LIMIT 1", [req.params.id]);
-  await pool.query("UPDATE clients SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
-  invalidatePullCache("clients");
-  res.json({ ok: true, hadHistory: orders.rows.length > 0 });
+clientsRouter.delete("/:id", async (req, res, next) => {
+  try {
+    const { rowCount } = await pool.query("UPDATE clients SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
+    if (!rowCount || rowCount === 0) {
+      return res.status(404).json({ error: "Cliente no encontrado." });
+    }
+    const orders = await pool.query("SELECT id FROM orders WHERE client_id = $1 LIMIT 1", [req.params.id]);
+    invalidatePullCache("clients");
+    res.json({ ok: true, hadHistory: orders.rows.length > 0 });
+  } catch (err) {
+    next(err);
+  }
 });

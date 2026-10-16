@@ -22,6 +22,7 @@ import {
   deleteClosedWorkDayLocal,
   upsertServerWorkDay,
 } from "../db/repositories/workdays";
+import { upsertOrderFromServer } from "../db/repositories/orders";
 
 // Simulación en memoria de la base de datos SQLite local para pruebas unitarias
 interface MockOutboxRow {
@@ -50,9 +51,17 @@ interface MockWorkDayRow {
 
 interface MockOrderRow {
   id: string;
+  server_id?: string | null;
   work_day_id: string;
+  client_id?: string;
+  client_name?: string;
+  payment_condition?: string;
   status: "active" | "cancelled";
+  sync_status?: string;
   total_cents: number;
+  item_count?: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
 const mockDbState = {
@@ -277,6 +286,55 @@ const mockDb = {
       return { changes: 1 };
     }
 
+    // ORDERS: upsertOrderFromServer
+    if (cleanSql.startsWith("INSERT INTO orders") && cleanSql.includes("ON CONFLICT(id) DO UPDATE SET")) {
+      const [
+        targetOrderId,
+        serverId,
+        workDayLocalId,
+        clientLocalId,
+        clientName,
+        paymentCondition,
+        _subtotalCents,
+        _taxCents,
+        totalCents,
+        itemCount,
+        status,
+        createdAt,
+        updatedAt,
+      ] = params;
+      const existing = mockDbState.orders.find((o) => o.id === targetOrderId || (serverId && o.server_id === serverId));
+      if (existing) {
+        existing.server_id = serverId;
+        existing.work_day_id = workDayLocalId;
+        existing.client_id = clientLocalId;
+        existing.client_name = clientName;
+        existing.payment_condition = paymentCondition;
+        existing.total_cents = totalCents;
+        existing.item_count = itemCount;
+        existing.status = status;
+        existing.sync_status = "synced";
+        existing.updated_at = updatedAt;
+      } else {
+        mockDbState.orders.push({
+          id: targetOrderId,
+          server_id: serverId,
+          work_day_id: workDayLocalId,
+          client_id: clientLocalId,
+          client_name: clientName,
+          payment_condition: paymentCondition,
+          status,
+          sync_status: "synced",
+          total_cents: totalCents,
+          item_count: itemCount,
+          created_at: createdAt,
+          updated_at: updatedAt,
+        });
+      }
+      return { changes: 1 };
+    }
+    if (cleanSql.includes("INSERT INTO order_items")) return { changes: 1 };
+
     return { changes: 0 };
   }),
 
@@ -372,6 +430,33 @@ const mockDb = {
       const orders = mockDbState.orders.filter((o) => o.work_day_id === localId && o.status === "active");
       const total_cents = orders.reduce((sum, o) => sum + o.total_cents, 0);
       return { order_count: orders.length, total_cents };
+    }
+
+    // ORDERS: find for upsert
+    if (cleanSql.includes("FROM orders WHERE server_id = ? OR id = ?")) {
+      const [serverId, id] = params;
+      const found = mockDbState.orders.find((o) => (serverId && o.server_id === serverId) || o.id === id);
+      return found ? { id: found.id, sync_status: found.sync_status || "synced" } : null;
+    }
+
+    // CLIENTS: find for order upsert
+    if (cleanSql.includes("FROM clients WHERE server_id = ? OR id = ?")) {
+      const [serverId, id] = params;
+      return { id: serverId || id, business_name: "Cliente Test" };
+    }
+
+    // WORKDAYS: find for order upsert
+    if (cleanSql.startsWith("SELECT id FROM work_days WHERE") && !cleanSql.includes("id != ?") && !cleanSql.includes("work_date > ?")) {
+      const found = mockDbState.workDays.find((w) => w.id === params[0] || w.server_id === params[0] || w.status === "open");
+      return found ? { id: found.id } : { id: "wd-test" };
+    }
+
+    // PRODUCTS: find for order items upsert
+    if (cleanSql.includes("FROM products WHERE server_id = ? OR id = ?")) {
+      return { id: params[0] || params[1] };
+    }
+    if (cleanSql.includes("FROM product_presentations WHERE server_id = ? OR id = ?")) {
+      return { id: params[0] || params[1] };
     }
 
     return null;
@@ -516,6 +601,134 @@ describe("Outbox deduplication and sorting logic", () => {
     const discarded = await discardFailed();
     expect(discarded).toBe(1);
     expect(mockDbState.outbox.find((r) => r.id === row.id)?.status).toBe("done");
+  });
+
+  it("[C-08] recupera ítems con status 'failed' en listPending() para que sean reintentados consistentemente", async () => {
+    await enqueue("order", "ord-fail-1", 2, "create");
+    const [row] = await listPending();
+
+    // Simulamos fallo transitorio (red o 500)
+    await markFailed(row.id, "500 Internal Server Error");
+
+    const failed = mockDbState.outbox.find((r) => r.id === row.id);
+    expect(failed?.status).toBe("failed");
+    expect(failed?.attempts).toBe(1);
+    expect(failed?.last_error).toBe("500 Internal Server Error");
+
+    // listPending DEBE incluir ítems 'failed' para la siguiente pasada de sincronización
+    const pendingForNextPass = await listPending();
+    expect(pendingForNextPass.some((r) => r.id === row.id)).toBe(true);
+
+    // Reintento: pasa a syncing
+    await markSyncing(row.id);
+    expect(mockDbState.outbox.find((r) => r.id === row.id)?.status).toBe("syncing");
+
+    // Si se aplaza con deferForRetry, status vuelve a pending incrementando attempts
+    await deferForRetry(row.id, "Connection reset by peer");
+    const retried = mockDbState.outbox.find((r) => r.id === row.id);
+    expect(retried?.status).toBe("pending");
+    expect(retried?.attempts).toBe(2);
+    expect(retried?.last_error).toBe("Connection reset by peer");
+
+    // Éxito final: markDone lo pasa a done y limpia el error
+    await markDone(row.id);
+    expect(mockDbState.outbox.find((r) => r.id === row.id)?.status).toBe("done");
+    expect(mockDbState.outbox.find((r) => r.id === row.id)?.last_error).toBeNull();
+
+    // Ya no figura en pendientes
+    const finalList = await listPending();
+    expect(finalList.some((r) => r.id === row.id)).toBe(false);
+  });
+
+  it("[A-16] encola una ejecución inmediata de pushSync si se invoca durante una sincronización activa", async () => {
+    // Simulación del patrón implementado en SyncContext (syncingRef + pendingPushRef)
+    const executionLog: string[] = [];
+    let syncing = false;
+    let pendingPush = false;
+
+    async function simulatedPushSync() {
+      if (syncing) {
+        pendingPush = true;
+        return;
+      }
+      syncing = true;
+      executionLog.push("start-push");
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        executionLog.push("complete-push");
+      } finally {
+        syncing = false;
+        if (pendingPush) {
+          pendingPush = false;
+          setTimeout(() => { void simulatedPushSync(); }, 10);
+        }
+      }
+    }
+
+    // 1. Iniciar la primera sincronización
+    const firstSyncPromise = simulatedPushSync();
+    expect(syncing).toBe(true);
+
+    // 2. Invocar pushSync mientras está en vuelo la primera
+    await simulatedPushSync();
+    expect(pendingPush).toBe(true);
+    // No debe iniciar una segunda en paralelo
+    expect(executionLog.filter((x) => x === "start-push")).toHaveLength(1);
+
+    // 3. Esperar que termine la primera y que el timer ejecute la encolada
+    await firstSyncPromise;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Verificamos que se ejecutó la llamada encolada posteriormente
+    expect(executionLog).toEqual(["start-push", "complete-push", "start-push", "complete-push"]);
+    expect(syncing).toBe(false);
+    expect(pendingPush).toBe(false);
+  });
+
+  it("[C-05] upsertOrderFromServer realiza upsert incremental sin purgar órdenes locales previas", async () => {
+    // 1. Existen tres órdenes locales:
+    // - ord-1: sincronizada previamente (no incluida en este delta)
+    // - ord-2: sincronizada previamente (viene actualizada en el delta)
+    // - ord-3: pendiente offline (no debe tocarse ni sobreescribirse)
+    mockDbState.orders.push(
+      { id: "ord-1", server_id: "srv-1", work_day_id: "wd-test", status: "active", sync_status: "synced", total_cents: 1000 },
+      { id: "ord-2", server_id: "srv-2", work_day_id: "wd-test", status: "active", sync_status: "synced", total_cents: 2000 },
+      { id: "ord-3", server_id: null, work_day_id: "wd-test", status: "active", sync_status: "pending", total_cents: 3000 }
+    );
+
+    // 2. Llega delta con ord-2 actualizada (total 2500) y nueva srv-4 (total 4000)
+    const deltaOrders = [
+      { id: "srv-2", work_day_id: "wd-test", client_id: "cli-1", total_cents: 2500, status: "active" },
+      { id: "srv-4", work_day_id: "wd-test", client_id: "cli-1", total_cents: 4000, status: "active" },
+    ];
+
+    for (const srvOrder of deltaOrders) {
+      await upsertOrderFromServer(srvOrder);
+    }
+
+    // Verificamos que ord-1 sigue intacta (no fue borrada a pesar de no venir en el delta)
+    const ord1 = mockDbState.orders.find((o) => o.id === "ord-1");
+    expect(ord1).toBeDefined();
+    expect(ord1?.total_cents).toBe(1000);
+
+    // Verificamos que ord-3 (pendiente local) sigue intacta
+    const ord3 = mockDbState.orders.find((o) => o.id === "ord-3");
+    expect(ord3).toBeDefined();
+    expect(ord3?.sync_status).toBe("pending");
+    expect(ord3?.total_cents).toBe(3000);
+
+    // Verificamos que ord-2 fue actualizada con el valor del servidor
+    const ord2 = mockDbState.orders.find((o) => o.id === "ord-2");
+    expect(ord2).toBeDefined();
+    expect(ord2?.total_cents).toBe(2500);
+
+    // Verificamos que srv-4 fue agregada
+    const ord4 = mockDbState.orders.find((o) => o.server_id === "srv-4");
+    expect(ord4).toBeDefined();
+    expect(ord4?.total_cents).toBe(4000);
+
+    // Total de órdenes en BD = 4 (ninguna orden local previa fue purgada)
+    expect(mockDbState.orders).toHaveLength(4);
   });
 });
 

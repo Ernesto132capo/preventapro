@@ -163,37 +163,39 @@ export async function resolveServerClientId(localId: string): Promise<string | n
  */
 export async function mergeDuplicateClients(): Promise<number> {
   const db = await getDb();
-  const groups = await db.getAllAsync<{ server_id: string; ids: string }>(
-    `SELECT server_id, GROUP_CONCAT(id) as ids FROM clients
-     WHERE server_id IS NOT NULL AND active = 1
-     GROUP BY server_id HAVING COUNT(*) > 1`
-  );
-
   let removed = 0;
-  for (const group of groups) {
-    const ids = group.ids.split(",");
-
-    // Preferí como "canónica" la fila que ya tenga preventas asociadas
-    // (para no romper el historial); si ninguna tiene, la más antigua.
-    const withOrders = await db.getFirstAsync<{ client_id: string }>(
-      `SELECT client_id FROM orders WHERE client_id IN (${ids.map(() => "?").join(",")}) LIMIT 1`,
-      ids
+  await db.withTransactionAsync(async () => {
+    const groups = await db.getAllAsync<{ server_id: string; ids: string }>(
+      `SELECT server_id, GROUP_CONCAT(id) as ids FROM clients
+       WHERE server_id IS NOT NULL AND active = 1
+       GROUP BY server_id HAVING COUNT(*) > 1`
     );
-    let canonicalId = withOrders?.client_id;
-    if (!canonicalId) {
-      const oldest = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM clients WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at ASC LIMIT 1`,
+
+    for (const group of groups) {
+      const ids = group.ids.split(",");
+
+      // Preferí como "canónica" la fila que ya tenga preventas asociadas
+      // (para no romper el historial); si ninguna tiene, la más antigua.
+      const withOrders = await db.getFirstAsync<{ client_id: string }>(
+        `SELECT client_id FROM orders WHERE client_id IN (${ids.map(() => "?").join(",")}) LIMIT 1`,
         ids
       );
-      canonicalId = oldest!.id;
-    }
+      let canonicalId = withOrders?.client_id;
+      if (!canonicalId) {
+        const oldest = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM clients WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at ASC LIMIT 1`,
+          ids
+        );
+        canonicalId = oldest?.id || ids[0];
+      }
 
-    for (const id of ids) {
-      if (id === canonicalId) continue;
-      await db.runAsync(`UPDATE orders SET client_id = ? WHERE client_id = ?`, [canonicalId, id]);
-      await db.runAsync(`DELETE FROM clients WHERE id = ?`, [id]);
-      removed++;
+      for (const id of ids) {
+        if (id === canonicalId) continue;
+        await db.runAsync(`UPDATE orders SET client_id = ? WHERE client_id = ?`, [canonicalId, id]);
+        await db.runAsync(`DELETE FROM clients WHERE id = ?`, [id]);
+        removed++;
+      }
     }
-  }
+  });
   return removed;
 }

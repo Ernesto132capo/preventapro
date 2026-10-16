@@ -660,6 +660,11 @@ const ProductPickerItem = React.memo(function ProductPickerItem({
   const [qty, setQty] = useState("1");
   const isCombo = product.product_type === "combo";
 
+  useEffect(() => {
+    setSelectedPres(product.presentations[0] || null);
+    setQty("1");
+  }, [product.id]);
+
   if (product.presentations.length === 0) return null;
 
   return (
@@ -684,7 +689,10 @@ const ProductPickerItem = React.memo(function ProductPickerItem({
         {product.presentations.map((p) => (
           <Pressable
             key={p.id}
-            onPress={() => setSelectedPres(p)}
+            onPress={() => {
+              setSelectedPres(p);
+              setQty("1");
+            }}
             style={[styles.presChoice, selectedPres?.id === p.id && styles.presChoiceActive]}
           >
             <Text style={[styles.presChoiceText, selectedPres?.id === p.id && { color: "#fff" }]}>{p.name}</Text>
@@ -706,12 +714,21 @@ const ProductPickerItem = React.memo(function ProductPickerItem({
         </View>
       ) : (
         <View style={styles.addRow}>
-          <TextInput style={styles.qtyInput} value={qty} onChangeText={setQty} keyboardType="number-pad" />
+          <TextInput
+            style={styles.qtyInput}
+            value={qty}
+            onChangeText={setQty}
+            keyboardType="number-pad"
+            maxLength={4}
+          />
           <Button
             label="Agregar"
             onPress={() => {
               const n = parseInt(qty, 10);
-              if (selectedPres && n > 0) onAdd(product, selectedPres, n);
+              if (selectedPres && n > 0) {
+                onAdd(product, selectedPres, n);
+                setQty("1");
+              }
             }}
             style={{ flex: 1, marginLeft: spacing.sm }}
           />

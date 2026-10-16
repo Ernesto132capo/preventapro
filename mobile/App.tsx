@@ -58,7 +58,7 @@ export default function App() {
     <SafeAreaProvider>
       <AuthProvider>
         <SyncProvider>
-          <SafeAreaView style={{ flex: 1 }} edges={["top"]}>
+          <SafeAreaView style={{ flex: 1 }} edges={["top", "bottom", "left", "right"]}>
             <StatusBar style="dark" />
             <RootNavigator />
           </SafeAreaView>

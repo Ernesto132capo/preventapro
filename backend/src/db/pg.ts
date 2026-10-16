@@ -14,8 +14,20 @@ import { Pool, types } from "pg";
 // como el mismo string ISO que ya usa el resto del código (nowIso()).
 const TIMESTAMP_OID = 1114;
 const TIMESTAMPTZ_OID = 1184;
-types.setTypeParser(TIMESTAMP_OID, (value: string | null) => (value === null ? null : new Date(value + "Z").toISOString()));
-types.setTypeParser(TIMESTAMPTZ_OID, (value: string | null) => (value === null ? null : new Date(value).toISOString()));
+
+function safeDateIso(value: string | null, isUtcSuffix = false): string | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const dateStr = isUtcSuffix ? value + "Z" : value;
+    const date = new Date(dateStr);
+    return isNaN(date.getTime()) ? value : date.toISOString();
+  } catch {
+    return value;
+  }
+}
+
+types.setTypeParser(TIMESTAMP_OID, (value: string | null) => safeDateIso(value, true));
+types.setTypeParser(TIMESTAMPTZ_OID, (value: string | null) => safeDateIso(value, false));
 
 // Connection string pooleado de Neon. Ejemplo:
 // postgres://user:password@ep-xxxx-pooler.region.aws.neon.tech/neondb?sslmode=require
@@ -25,9 +37,14 @@ if (!process.env.DATABASE_URL) {
   );
 }
 
+const rejectUnauthorizedEnv = process.env.PGSSLREJECTUNAUTHORIZED || process.env.DB_SSL_REJECT_UNAUTHORIZED;
+const sslRejectUnauthorized = rejectUnauthorizedEnv !== undefined
+  ? rejectUnauthorizedEnv === "true" || rejectUnauthorizedEnv === "1"
+  : process.env.NODE_ENV === "production";
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: sslRejectUnauthorized },
 });
 
 pool.on("error", (err) => {

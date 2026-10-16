@@ -1,4 +1,5 @@
 import "dotenv/config";
+import path from "path";
 import type { PoolClient } from "pg";
 import { pool } from "../src/db/pg";
 
@@ -23,11 +24,13 @@ export const migrations: Migration[] = [
           code TEXT UNIQUE NOT NULL,
           real_email TEXT,
           password_hash TEXT,
+          role TEXT NOT NULL DEFAULT 'preventista',
           full_name TEXT NOT NULL,
           active BOOLEAN NOT NULL DEFAULT true,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'preventista';
         CREATE INDEX IF NOT EXISTS idx_users_code ON users(code);
 
         -- Barrios para ruteo de clientes
@@ -202,6 +205,8 @@ export const migrations: Migration[] = [
           max_quantity INTEGER CHECK (max_quantity IS NULL OR max_quantity > 0),
           sort_order INTEGER NOT NULL DEFAULT 0,
           active BOOLEAN NOT NULL DEFAULT true,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           UNIQUE(combo_id, presentation_id)
         );
         CREATE INDEX IF NOT EXISTS idx_combo_options_combo ON combo_options(combo_id, active, sort_order);
@@ -242,54 +247,76 @@ async function ensureMigrationsTable(client: PoolClient): Promise<void> {
   `);
 }
 
+let migrationInFlight: Promise<void> | null = null;
+
 export async function runMigrations(): Promise<void> {
-  console.log("🚀 Iniciando runner de migraciones de PreventaPro...");
-
-  const setupClient = await pool.connect();
-  let appliedMigrationNames: Set<string>;
-  try {
-    await ensureMigrationsTable(setupClient);
-    const { rows } = await setupClient.query<{ name: string }>("SELECT name FROM _migrations");
-    appliedMigrationNames = new Set(rows.map((r) => r.name));
-  } finally {
-    setupClient.release();
+  if (migrationInFlight) {
+    return migrationInFlight;
   }
+  migrationInFlight = (async () => {
+    console.log("🚀 Iniciando runner de migraciones de PreventaPro...");
 
-  let newlyApplied = 0;
-
-  for (const migration of migrations) {
-    if (appliedMigrationNames.has(migration.id)) {
-      console.log(`  ⏩ [omitida] ${migration.id}: ${migration.description} (ya registrada en _migrations)`);
-      continue;
-    }
-
-    console.log(`  ⏳ [ejecutando] ${migration.id}: ${migration.description}...`);
-    const client = await pool.connect();
+    const lockClient = await pool.connect();
     try {
-      await client.query("BEGIN");
-      await migration.run(client);
-      await client.query("INSERT INTO _migrations (name, executed_at) VALUES ($1, now())", [migration.id]);
-      await client.query("COMMIT");
-      console.log(`  ✅ [completada] ${migration.id} aplicada exitosamente.`);
-      newlyApplied++;
-    } catch (error) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        // La conexión puede haber caído
-      }
-      console.error(`  ❌ [error] Falló la migración ${migration.id}:`, error);
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
+      // Advisory lock para que ejecuciones paralelas esperen ordenadamente
+      await lockClient.query("SELECT pg_advisory_lock(987654)");
 
-  if (newlyApplied === 0) {
-    console.log("✨ Todas las migraciones están al día. No hubo cambios pendientes.");
-  } else {
-    console.log(`🎉 Migraciones finalizadas: ${newlyApplied} migración(es) aplicada(s) correctamente.`);
-  }
+      const setupClient = await pool.connect();
+      let appliedMigrationNames: Set<string>;
+      try {
+        await ensureMigrationsTable(setupClient);
+        const { rows } = await setupClient.query<{ name: string }>("SELECT name FROM _migrations");
+        appliedMigrationNames = new Set(rows.map((r) => r.name));
+      } finally {
+        setupClient.release();
+      }
+
+      let newlyApplied = 0;
+
+      for (const migration of migrations) {
+        if (appliedMigrationNames.has(migration.id)) {
+          console.log(`  ⏩ [omitida] ${migration.id}: ${migration.description} (ya registrada en _migrations)`);
+          continue;
+        }
+
+        console.log(`  ⏳ [ejecutando] ${migration.id}: ${migration.description}...`);
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await migration.run(client);
+          await client.query("INSERT INTO _migrations (name, executed_at) VALUES ($1, now())", [migration.id]);
+          await client.query("COMMIT");
+          console.log(`  ✅ [completada] ${migration.id} aplicada exitosamente.`);
+          newlyApplied++;
+        } catch (error) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // La conexión puede haber caído
+          }
+          console.error(`  ❌ [error] Falló la migración ${migration.id}:`, error);
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
+
+      if (newlyApplied === 0) {
+        console.log("✨ Todas las migraciones están al día. No hubo cambios pendientes.");
+      } else {
+        console.log(`🎉 Migraciones finalizadas: ${newlyApplied} migración(es) aplicada(s) correctamente.`);
+      }
+    } finally {
+      try {
+        await lockClient.query("SELECT pg_advisory_unlock(987654)");
+      } catch {}
+      lockClient.release();
+    }
+  })().finally(() => {
+    migrationInFlight = null;
+  });
+
+  return migrationInFlight;
 }
 
 /** Ejecuta una migración individual registrándola de manera transaccional e idempotente en _migrations. */
@@ -329,7 +356,11 @@ export async function runSpecificMigration(migrationId: string): Promise<void> {
   }
 }
 
-if (require.main === module || process.argv[1]?.includes("migrate")) {
+const isDirectRun =
+  require.main === module ||
+  (Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(__filename));
+
+if (isDirectRun) {
   runMigrations()
     .catch((error) => {
       console.error("💥 Error fatal al ejecutar migraciones:", error.message || error);

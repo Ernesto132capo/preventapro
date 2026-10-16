@@ -17,7 +17,7 @@ const productKeyExtractor = (product: ProductWithPresentations) => product.id;
 
 export function ProductsScreen() {
   const navigation = useNavigation<any>();
-  const { syncTick } = useSync();
+  const { syncTick, pushSync } = useSync();
   const [products, setProducts] = useState<ProductWithPresentations[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
@@ -112,12 +112,13 @@ export function ProductsScreen() {
           style: "destructive",
           onPress: async () => {
             await deleteProductLocal(p.id);
+            void pushSync().catch(() => {});
             load();
           },
         },
       ]
     );
-  }, [load]);
+  }, [load, pushSync]);
 
   const handleEditProduct = useCallback((productId: string) => {
     navigation.navigate("NuevoProducto", { productId });

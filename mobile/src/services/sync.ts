@@ -125,23 +125,9 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
     const todayLocal = await getTodayWorkDay(userId);
     await upsertServerWorkDay(todayLocal.id, data.workDay);
 
-    // Limpiar órdenes locales viejas o fantasmas que ya no pertenecen a la jornada de hoy
-    if (data.orders && Array.isArray(data.orders)) {
-      const validServerOrderIds = new Set(data.orders.map((o: any) => o.id));
-      const db = await getDb();
-      const localOrders = await db.getAllAsync<{ id: string; server_id: string | null; sync_status: string }>(
-        `SELECT id, server_id, sync_status FROM orders WHERE (work_day_id = ? OR work_day_id = ?) AND status = 'active'`,
-        [todayLocal.id, data.workDay.id]
-      );
-      for (const lo of localOrders) {
-        // Solo descartar órdenes ya sincronizadas cuyo server_id ya no existe en la jornada actual
-        if (lo.sync_status === "synced" && lo.server_id && !validServerOrderIds.has(lo.server_id)) {
-          await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [lo.id]);
-          await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [lo.id]);
-          await db.runAsync(`DELETE FROM orders WHERE id = ?`, [lo.id]);
-        }
-      }
-    }
+    // IMPORTANT: Do NOT delete local orders based on incremental pull data.
+    // In delta pulls, data.orders only contains orders modified since last_pull_at,
+    // not the complete set. Deleting based on this subset would erase valid orders.
   }
 
   // Guardar siempre el cursor real del servidor (timestamp más fresco)
@@ -469,8 +455,14 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     try {
       const res = await apiFetch<any>(`/workdays/current`);
       if (res?.workDay?.id) {
-        workDayServerId = res.workDay.id;
-        await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [workDayServerId, order.work_day_id]);
+        // Only assign if the local workday matches the server workday's date
+        const localWd = await db.getFirstAsync<{ work_date: string }>(
+          `SELECT work_date FROM work_days WHERE id = ?`, [order.work_day_id]
+        );
+        if (localWd && res.workDay.work_date === localWd.work_date) {
+          workDayServerId = res.workDay.id;
+          await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [workDayServerId, order.work_day_id]);
+        }
       }
     } catch {}
   }
@@ -653,7 +645,12 @@ const MIN_PULL_INTERVAL_MS = 60_000; // el timer ya es de 60 s; evita pulls dupl
  */
 async function performPushOnlySync(userId: string): Promise<SyncResult> {
   try {
-    await resolveTodayWorkDay(userId);
+    try {
+      await resolveTodayWorkDay(userId);
+    } catch (e) {
+      // Network failure resolving workday should not abort pushing clients/products/categories
+      console.warn('[performPushOnlySync] Could not resolve workday (will retry later):', e);
+    }
     const pushed = await pushOutbox(userId);
     return { ok: true, pulled: { clients: 0, products: 0 }, pushed };
   } catch (err: any) {
@@ -749,7 +746,7 @@ async function rescueLocalConflict(userId: string) {
   // Limpiar filas de outbox en conflicto irrecuperable
   try {
     await db.runAsync(
-      `UPDATE outbox SET status = 'done' WHERE status = 'failed' AND (
+      `UPDATE outbox SET status = 'done' WHERE status IN ('failed', 'error') AND (
         last_error LIKE '%jornada%' OR 
         last_error LIKE '%concluida%' OR 
         last_error LIKE '%cerrada%'
@@ -779,7 +776,11 @@ async function performRunSync(
     if (options.forcePull) await rescueLocalConflict(userId);
     // También corre después del rescate forzado: las preventas no salen sin
     // haber intentado resolver primero su jornada padre.
-    await resolveTodayWorkDay(userId);
+    try {
+      await resolveTodayWorkDay(userId);
+    } catch (e) {
+      console.warn('[performRunSync] Could not resolve workday:', e);
+    }
 
     let pulled = { clients: 0, products: 0 };
     if (!skipPull) {

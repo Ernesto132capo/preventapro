@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import fs from "fs";
 import path from "path";
 import { pool } from "../db/pg";
 import { formatBoliviaDate } from "./dates";
@@ -14,6 +15,7 @@ export interface OrderSelectionSnapshot {
 
 export interface ProductLineRow {
   order_item_id: string;
+  client_id?: string;
   business_name: string;
   address: string | null;
   product_name_snapshot: string;
@@ -36,12 +38,65 @@ const accentFill = "0F766E";
 // se interpretan erróneamente como fechas. La moneda queda explícita en los encabezados.
 const moneyFormat = "#,##0.00";
 
+/**
+ * [M-03] Genera un nombre de hoja único y seguro para ExcelJS.
+ * - Limpia caracteres prohibidos: * ? : \ / [ ]
+ * - Limita la longitud máxima a 31 caracteres (límite de especificación de Excel)
+ * - Evita colisiones de nombres (case-insensitive) agregando sufijos " (2)", " (3)", etc.
+ */
+export function getUniqueSheetName(workbook: ExcelJS.Workbook, rawName: string): string {
+  let cleanName = (rawName || "Hoja")
+    .replace(/[*?:\\/\[\]]/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+
+  if (!cleanName) cleanName = "Hoja";
+
+  const existingNames = new Set(
+    workbook.worksheets.map((ws) => ws.name.toLowerCase().trim())
+  );
+
+  let candidate = cleanName.slice(0, 31).trim();
+  if (!existingNames.has(candidate.toLowerCase())) {
+    return candidate;
+  }
+
+  const base = cleanName.slice(0, 26).trim() || "Hoja";
+  let counter = 2;
+  while (true) {
+    const suffix = ` (${counter})`;
+    const allowedLen = 31 - suffix.length;
+    candidate = `${base.slice(0, allowedLen).trim()}${suffix}`;
+    if (!existingNames.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+    counter++;
+  }
+}
+
+/**
+ * [M-12] Escritura atómica a archivo temporal con rename para evitar archivos corruptos en concurrencia.
+ */
+async function writeWorkbookAtomic(wb: ExcelJS.Workbook, filePath: string): Promise<string> {
+  const tmpFilePath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    await wb.xlsx.writeFile(tmpFilePath);
+    await fs.promises.rename(tmpFilePath, filePath);
+    return filePath;
+  } catch (err) {
+    await fs.promises.unlink(tmpFilePath).catch(() => {});
+    throw err;
+  }
+}
+
 async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[]> {
   // Filtro estricto por status = 'active' para que preventas anuladas/canceladas
   // jamás sumen unidades ni montos en los reportes.
+  // [M-02] Incluye c.id para distinguir clientes homónimos
   const { rows } = await pool.query(
     `SELECT
        oi.id AS order_item_id,
+       c.id AS client_id,
        c.business_name, c.address,
        oi.product_name_snapshot, oi.presentation_name_snapshot, oi.quantity,
        oi.unit_price_cents_snapshot, oi.subtotal_cents,
@@ -51,7 +106,7 @@ async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[
      JOIN clients c ON c.id = o.client_id
      JOIN order_items oi ON oi.order_id = o.id
      WHERE o.work_day_id = $1 AND o.status = 'active'
-     ORDER BY c.business_name, o.created_at, oi.id`,
+     ORDER BY c.business_name, c.id, o.created_at, oi.id`,
     [workDayId]
   );
 
@@ -83,6 +138,7 @@ async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[
 
   return rows.map((row: any) => ({
     order_item_id: row.order_item_id,
+    client_id: row.client_id,
     business_name: row.business_name,
     address: row.address,
     product_name_snapshot: row.product_name_snapshot,
@@ -115,7 +171,7 @@ function styleClientHeading(row: ExcelJS.Row) {
 export async function generateProductListExcel(workDayId: string, outDir: string): Promise<string> {
   const rows = await productRowsForWorkDay(workDayId);
   const wb = new ExcelJS.Workbook();
-  const sheet = wb.addWorksheet("Lista de Productos");
+  const sheet = wb.addWorksheet(getUniqueSheetName(wb, "Lista de Productos"));
   sheet.columns = [{ width: 32 }, { width: 22 }, { width: 12 }, { width: 20 }, { width: 20 }];
   sheet.mergeCells("A1:E1");
   sheet.getCell("A1").value = "Lista de productos por cliente";
@@ -173,27 +229,28 @@ export async function generateProductListExcel(workDayId: string, outDir: string
   }
 
   const filePath = path.join(outDir, "lista_de_productos.xlsx");
-  await wb.xlsx.writeFile(filePath);
-  return filePath;
+  return await writeWorkbookAtomic(wb, filePath);
 }
 
 /** Resumen compacto: una fila por cliente sin órdenes canceladas. */
 export async function generateClientSummaryExcel(workDayId: string, outDir: string): Promise<string> {
+  // [M-02] Agrupación por c.id y c.business_name para evitar fusionar clientes homónimos
   const { rows: summaryRows } = await pool.query(
-    `SELECT c.business_name, COALESCE(SUM(o.total_cents), 0)::text AS total_cents
+    `SELECT c.id AS client_id, c.business_name, COALESCE(SUM(o.total_cents), 0)::text AS total_cents
      FROM orders o
      JOIN clients c ON c.id = o.client_id
      WHERE o.work_day_id = $1 AND o.status = 'active'
-     GROUP BY c.business_name
-     ORDER BY c.business_name`,
+     GROUP BY c.id, c.business_name
+     ORDER BY c.business_name, c.id`,
     [workDayId]
   );
   const rows = summaryRows.map((row: any) => ({
+    client_id: row.client_id,
     business_name: row.business_name,
     total_cents: Number(row.total_cents),
   }));
   const wb = new ExcelJS.Workbook();
-  const sheet = wb.addWorksheet("Resumen de Clientes");
+  const sheet = wb.addWorksheet(getUniqueSheetName(wb, "Resumen de Clientes"));
   sheet.columns = [{ width: 10 }, { width: 35 }, { width: 20 }];
   styleTableHeader(sheet.addRow(["Nro.", "Cliente", "Total (Bs.)"]));
   let grandTotal = 0;
@@ -206,8 +263,7 @@ export async function generateClientSummaryExcel(workDayId: string, outDir: stri
   total.font = { bold: true };
   total.getCell(3).numFmt = moneyFormat;
   const filePath = path.join(outDir, "resumen_clientes.xlsx");
-  await wb.xlsx.writeFile(filePath);
-  return filePath;
+  return await writeWorkbookAtomic(wb, filePath);
 }
 
 /** Boletas: una hoja por preventa activa para entregar al cliente. */
@@ -220,7 +276,7 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
   for (const lines of byOrder.values()) {
     const first = lines[0];
     const receiptCode = String(first.receipt_number).padStart(6, "0");
-    const sheet = wb.addWorksheet(`Boleta ${receiptCode}`);
+    const sheet = wb.addWorksheet(getUniqueSheetName(wb, `Boleta ${receiptCode}`));
     sheet.columns = [{ width: 32 }, { width: 22 }, { width: 12 }, { width: 20 }, { width: 20 }];
     sheet.mergeCells("A1:E1");
     sheet.getCell("A1").value = "BOLETA DE PREVENTA";
@@ -267,8 +323,7 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
     total.getCell(5).numFmt = moneyFormat;
   }
 
-  if (byOrder.size === 0) wb.addWorksheet("Sin boletas").getCell("A1").value = "No hay preventas activas.";
+  if (byOrder.size === 0) wb.addWorksheet(getUniqueSheetName(wb, "Sin boletas")).getCell("A1").value = "No hay preventas activas.";
   const filePath = path.join(outDir, "boletas_clientes.xlsx");
-  await wb.xlsx.writeFile(filePath);
-  return filePath;
+  return await writeWorkbookAtomic(wb, filePath);
 }

@@ -13,6 +13,7 @@ export function LoginScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const isSubmittingRef = useRef(false);
+  const passwordRef = useRef<TextInput>(null);
 
   async function handleSubmit() {
     if (isSubmittingRef.current || submitting) return;
@@ -61,10 +62,15 @@ export function LoginScreen() {
           placeholder="PV001"
           placeholderTextColor={colors.textMuted}
           editable={!submitting}
+          returnKeyType="next"
+          onSubmitEditing={() => passwordRef.current?.focus()}
+          blurOnSubmit={false}
+          maxLength={80}
         />
 
         <Text style={styles.label}>Contraseña</Text>
         <TextInput
+          ref={passwordRef}
           style={styles.input}
           value={password}
           onChangeText={setPassword}
@@ -72,6 +78,9 @@ export function LoginScreen() {
           placeholder="••••••••"
           placeholderTextColor={colors.textMuted}
           editable={!submitting}
+          returnKeyType="done"
+          onSubmitEditing={handleSubmit}
+          maxLength={80}
         />
 
         <View style={styles.rememberRow}>

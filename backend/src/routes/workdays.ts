@@ -7,11 +7,11 @@ import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
 import { z } from "zod";
+import { getBoliviaToday } from "../services/dates";
 
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
 
-function today() { const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/La_Paz", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()); const v = (t: string) => p.find(x => x.type === t)?.value; return `${v("year")}-${v("month")}-${v("day")}`; }
 function serial(row: any) { return { id: row.id, server_id: row.id, user_id: row.user_id, work_date: row.work_date, status: row.status, order_count: row.order_count ?? 0, total_cents: row.total_cents ?? 0, created_at: row.created_at, closed_at: row.closed_at ?? null, auto_closed: row.auto_closed === true }; }
 
 async function recalc(id: string, db: PoolClient) {
@@ -63,28 +63,34 @@ async function lockUserWorkDays(client: PoolClient, userId: string) {
   await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${userId}`]);
 }
 
-// ─── Caché en memoria para /workdays/current ─────────────────────────────────
+// ─── Caché en memoria para /workdays/current (indexada por userId) ────────────
 // Evita releer Postgres en cada poll de 60s cuando la jornada no cambió.
-// Se invalida en cada mutación de jornada o pedido; por eso no expira por
-// tiempo y los polls sin cambios no leen la base.
+// Aislada por preventista para evitar que las consultas de un usuario invaliden las del otro.
 interface WorkdayCache {
   userId: string;
   date: string;
   data: object;
+  cachedAt: number;
 }
-let workdayCacheEntry: WorkdayCache | null = null;
+const workdayCache = new Map<string, WorkdayCache>();
+const WORKDAY_CACHE_TTL_MS = 60_000;
+const MAX_WORKDAY_CACHE_ENTRIES = 100;
 
-export function invalidateWorkdayCache() {
-  workdayCacheEntry = null;
+export function invalidateWorkdayCache(userId?: string) {
+  if (userId) {
+    workdayCache.delete(userId);
+  } else {
+    workdayCache.clear();
+  }
 }
 
 workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
-  const date = today();
+  const date = getBoliviaToday();
   const fresh = req.query.fresh === "1" || req.query.fresh === "true";
-  // Devolver caché si pertenece al mismo día y no se solicita verificación fresca.
-  // Se invalida al crear, editar o cerrar jornadas y al crear/editar/cancelar pedidos.
-  if (!fresh && workdayCacheEntry && workdayCacheEntry.userId === req.userId && workdayCacheEntry.date === date) {
-    return res.json(workdayCacheEntry.data);
+  const now = Date.now();
+  const cached = req.userId ? workdayCache.get(req.userId) : undefined;
+  if (!fresh && cached && cached.date === date && now - cached.cachedAt < WORKDAY_CACHE_TTL_MS) {
+    return res.json(cached.data);
   }
 
   const client = await pool.connect();
@@ -126,7 +132,13 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
       await client.query("COMMIT");
       inTransaction = false;
       if (closedStale || todayOpenRows.length > 1) invalidatePullCache("workdays");
-      workdayCacheEntry = { userId: req.userId!, date, data: payload };
+      if (req.userId) {
+        workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
+        if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
+          const oldest = workdayCache.keys().next().value;
+          if (oldest) workdayCache.delete(oldest);
+        }
+      }
       return res.json(payload);
     }
 
@@ -139,7 +151,13 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
       await client.query("COMMIT");
       inTransaction = false;
       if (closedStale) invalidatePullCache("workdays");
-      workdayCacheEntry = { userId: req.userId!, date, data: payload };
+      if (req.userId) {
+        workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
+        if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
+          const oldest = workdayCache.keys().next().value;
+          if (oldest) workdayCache.delete(oldest);
+        }
+      }
       return res.json(payload);
     }
 
@@ -158,7 +176,13 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     inTransaction = false;
     if (closedStale) invalidateWorkdayCache();
     invalidatePullCache("workdays");
-    workdayCacheEntry = { userId: req.userId!, date, data: payload };
+    if (req.userId) {
+      workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
+      if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
+        const oldest = workdayCache.keys().next().value;
+        if (oldest) workdayCache.delete(oldest);
+      }
+    }
     return res.json(payload);
   } catch (error) {
     if (inTransaction) {

@@ -178,44 +178,43 @@ export async function getOrderWithItems(orderId: string) {
 export async function upsertOrderFromServer(serverOrder: any) {
   const db = await getDb();
 
-  let localWorkDay = serverOrder.user_id
-    ? await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE user_id = ? AND (server_id = ? OR id = ?) LIMIT 1`,
-        [serverOrder.user_id, serverOrder.work_day_id, serverOrder.work_day_id]
-      )
-    : await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
-        [serverOrder.work_day_id, serverOrder.work_day_id]
-      );
-  if (!localWorkDay) {
-    localWorkDay = serverOrder.user_id
-      ? await db.getFirstAsync<{ id: string }>(
-          `SELECT id FROM work_days WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1`,
-          [serverOrder.user_id]
-        )
-      : null;
-  }
-  const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
-
-  const localClient = await db.getFirstAsync<{ id: string; business_name: string }>(
-    `SELECT id, business_name FROM clients WHERE server_id = ? OR id = ?`,
-    [serverOrder.client_id, serverOrder.client_id]
-  );
-  const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
-  const clientName = serverOrder.client_name || localClient?.business_name || "Cliente";
-
-  const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
-    `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
-    [serverOrder.id, serverOrder.id]
-  );
-
-  if (existing && existing.sync_status === "pending") {
-    return;
-  }
-
-  const targetOrderId = existing ? existing.id : serverOrder.id;
-
   await db.withTransactionAsync(async () => {
+    let localWorkDay = serverOrder.user_id
+      ? await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM work_days WHERE user_id = ? AND (server_id = ? OR id = ?) LIMIT 1`,
+          [serverOrder.user_id, serverOrder.work_day_id, serverOrder.work_day_id]
+        )
+      : await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
+          [serverOrder.work_day_id, serverOrder.work_day_id]
+        );
+    if (!localWorkDay) {
+      localWorkDay = serverOrder.user_id
+        ? await db.getFirstAsync<{ id: string }>(
+            `SELECT id FROM work_days WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1`,
+            [serverOrder.user_id]
+          )
+        : null;
+    }
+    const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
+
+    const localClient = await db.getFirstAsync<{ id: string; business_name: string }>(
+      `SELECT id, business_name FROM clients WHERE server_id = ? OR id = ?`,
+      [serverOrder.client_id, serverOrder.client_id]
+    );
+    const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
+    const clientName = serverOrder.client_name || localClient?.business_name || "Cliente";
+
+    const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
+      `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
+      [serverOrder.id, serverOrder.id]
+    );
+
+    if (existing && existing.sync_status === "pending") {
+      return;
+    }
+
+    const targetOrderId = existing ? existing.id : serverOrder.id;
     await db.runAsync(
       `INSERT INTO orders
         (id, server_id, work_day_id, client_id, client_name, payment_condition,
