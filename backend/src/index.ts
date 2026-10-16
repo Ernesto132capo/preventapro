@@ -1,9 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
-import "./firebase/admin"; // inicializa Firebase Admin al arrancar
+import helmet from "helmet";
 import { authRouter } from "./routes/auth";
 import { clientsRouter } from "./routes/clients";
 import { catalogRouter } from "./routes/catalog";
@@ -14,15 +12,13 @@ import { reportsRouter } from "./routes/reports";
 import { settingsRouter } from "./routes/settings";
 
 const app = express();
+app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
-// Registro local temporal para diagnosticar sincronización durante desarrollo.
+// Registra el path sin query string para no guardar tokens de descarga en los logs.
 app.use((req, res, next) => {
   res.on("finish", () => {
-    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
-    if (req.originalUrl.startsWith("/api/")) {
-      fs.appendFileSync(path.join(__dirname, "../sync-debug.log"), `${new Date().toISOString()} ${req.method} ${req.originalUrl} ${res.statusCode}\n`);
-    }
+    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path} -> ${res.statusCode}`);
   });
   next();
 });

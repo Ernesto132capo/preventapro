@@ -8,7 +8,10 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "migrate:combos": "tsx scripts/migrate-combos.ts"
+    "migrate:combos": "tsx scripts/migrate-combos.ts",
+    "migrate:auth": "tsx scripts/migrate-auth.ts",
+    "migrate:remove-stock": "tsx scripts/migrate-remove-stock.ts",
+    "user:set-password": "tsx scripts/set-user-password.ts"
   },
   "dependencies": {
     "@types/pdfkit": "^0.17.6",
@@ -17,7 +20,7 @@
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
-    "firebase-admin": "^12.6.0",
+    "helmet": "^8.3.0",
     "pdfkit": "^0.20.2",
     "pg": "^8.23.0",
     "uuid": "^9.0.1",

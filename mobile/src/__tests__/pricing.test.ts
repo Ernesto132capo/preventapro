@@ -9,11 +9,11 @@ const product: Product = {
 
 const unidad: Presentation = {
   id: "pr1", product_id: "p1", name: "Unidad", sort_order: 0, unit_equivalence: 1,
-  price_cents: 750, cost_cents: 500, quantity_available: 140, active: 1,
+  price_cents: 750, cost_cents: 500, active: 1,
 };
 const caja: Presentation = {
   id: "pr2", product_id: "p1", name: "Caja", sort_order: 4, unit_equivalence: 24,
-  price_cents: 15600, cost_cents: 11200, quantity_available: 7, active: 1,
+  price_cents: 15600, cost_cents: 11200, active: 1,
 };
 
 describe("pricing (mobile, offline-capable)", () => {

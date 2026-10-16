@@ -12,7 +12,7 @@ import { listOrdersForWorkDay } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { WorkDay } from "../domain/types";
 import { API_BASE_URL } from "../services/config";
-import { apiFetch, getAccessToken } from "../services/api";
+import { apiFetch } from "../services/api";
 
 /** Registros Históricos (Fase 29) — jornadas cerradas, de solo lectura, con enlaces a reportes. */
 export function HistoryScreen() {
@@ -66,11 +66,12 @@ export function HistoryScreen() {
   );
 
   async function openReport(workDayServerId: string, fileName: string) {
-    const token = await getAccessToken();
-    if (!token) return;
-    // El navegador no comparte los headers de la app: el backend valida este
-    // token en la ruta de reportes antes de entregar el archivo.
-    Linking.openURL(`${API_BASE_URL}/reports/${workDayServerId}/${fileName}?access_token=${encodeURIComponent(token)}`);
+    try {
+      const { downloadToken } = await apiFetch<{ downloadToken: string }>(`/reports/${workDayServerId}/download-token`, { method: "POST" });
+      await Linking.openURL(`${API_BASE_URL}/reports/${workDayServerId}/${fileName}?download_token=${encodeURIComponent(downloadToken)}`);
+    } catch (err: any) {
+      Alert.alert("No se pudo abrir el reporte", err?.message || "Verifica tu conexión e inténtalo de nuevo.");
+    }
   }
 
   async function deleteRecord(item: WorkDay) {

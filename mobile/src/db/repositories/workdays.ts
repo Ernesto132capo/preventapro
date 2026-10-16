@@ -126,6 +126,14 @@ export async function listClosedWorkDays(userId?: string): Promise<WorkDay[]> {
 export async function deleteClosedWorkDayLocal(localId: string): Promise<void> {
   const db = await getDb();
   await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `DELETE FROM order_item_selections
+       WHERE order_item_id IN (
+         SELECT id FROM order_items
+         WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = ?)
+       )`,
+      [localId]
+    );
     await db.runAsync(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = ?)`, [localId]);
     await db.runAsync(`DELETE FROM orders WHERE work_day_id = ?`, [localId]);
     await db.runAsync(`DELETE FROM work_days WHERE id = ? AND status = 'closed'`, [localId]);

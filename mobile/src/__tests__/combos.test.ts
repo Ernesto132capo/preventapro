@@ -22,7 +22,6 @@ const comboPres: Presentation = {
   unit_equivalence: 1,
   price_cents: 2500,
   cost_cents: 1500,
-  quantity_available: 50,
   active: 1,
 };
 
@@ -81,7 +80,6 @@ describe("combos (mobile, offline-first)", () => {
       unit_equivalence: 1,
       price_cents: 800,
       cost_cents: 500,
-      quantity_available: 100,
       active: 1,
     };
 

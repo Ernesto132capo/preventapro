@@ -49,13 +49,24 @@ const orderItemQueryCache = new Map<string, any[]>();
 const clientNameCache = new Map<string, string>();
 const sourceReadsInFlight = new Map<string, Promise<any[]>>();
 const forcedPullsInFlight = new Map<string, Promise<PullCache>>();
+const MAX_SOURCE_CACHE_ENTRIES = 25;
+const MAX_CLIENT_NAME_CACHE_ENTRIES = 1000;
+
+function setBoundedCacheEntry<T>(cache: Map<string, T>, key: string, value: T, maxEntries: number) {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) cache.delete(oldestKey);
+  }
+  cache.set(key, value);
+}
 
 async function cachedRows(domain: string, cache: Map<string, any[]>, key: string, load: () => Promise<any[]>, force = false): Promise<any[]> {
   if (!force && cache.has(key)) return cache.get(key)!;
   const flightKey = `${domain}:${key}`;
   const inFlight = sourceReadsInFlight.get(flightKey);
   if (inFlight) return inFlight;
-  const task = load().then((rows) => { cache.set(key, rows); return rows; });
+  const task = load().then((rows) => { setBoundedCacheEntry(cache, key, rows, MAX_SOURCE_CACHE_ENTRIES); return rows; });
   sourceReadsInFlight.set(flightKey, task);
   try { return await task; } finally { sourceReadsInFlight.delete(flightKey); }
 }
@@ -160,8 +171,8 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     const todayDate = `${v("year")}-${v("month")}-${v("day")}`;
 
     // ── Queries paralelas optimizadas ──────────────────────────────────────────
-    // Mismo criterio que existía con Firestore: en el pull inicial se trae todo
-    // lo activo; en un pull incremental, solo lo que cambió después de `since`,
+    // En el pull inicial se trae todo lo activo; en un pull incremental,
+    // solo lo que cambió después de `since`,
     // usando los índices de updated_at ya creados en el esquema.
     const cursorKey = isInitial ? "__initial__" : since;
     const [clientRows, productRows, categoryRows, neighborhoodRows, todayWorkDayRows, comboDefRows, comboOptionRows] = await Promise.all([
@@ -199,8 +210,8 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // cumplen la condición, usando el índice de product_presentations.updated_at.
     const rawPresentationRows = await cachedRows("presentations", presentationQueryCache, cursorKey, async () =>
       isInitial
-        ? (await pool.query("SELECT * FROM product_presentations WHERE active = true")).rows
-        : (await pool.query("SELECT * FROM product_presentations WHERE updated_at > $1", [since])).rows,
+        ? (await pool.query("SELECT id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at FROM product_presentations WHERE active = true")).rows
+        : (await pool.query("SELECT id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at FROM product_presentations WHERE updated_at > $1", [since])).rows,
       force);
 
     const presentations = rawPresentationRows.map((row: any) => presentation(row));
@@ -261,14 +272,14 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         for (const row of clientRows) {
           const name = row.business_name || "Cliente";
           clientMap.set(row.id, name);
-          clientNameCache.set(row.id, name);
+          setBoundedCacheEntry(clientNameCache, row.id, name, MAX_CLIENT_NAME_CACHE_ENTRIES);
         }
         const missingClientIds = clientIds.filter((cid) => !clientMap.has(cid));
         if (missingClientIds.length > 0) {
           const uncachedIds = missingClientIds.filter((cid) => !clientNameCache.has(cid));
           if (uncachedIds.length > 0) {
             const { rows: fetchedClients } = await pool.query("SELECT id, business_name FROM clients WHERE id = ANY($1)", [uncachedIds]);
-            for (const c of fetchedClients) clientNameCache.set(c.id, c.business_name || "Cliente");
+            for (const c of fetchedClients) setBoundedCacheEntry(clientNameCache, c.id, c.business_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
           }
           for (const cid of missingClientIds) {
             clientMap.set(cid, clientNameCache.get(cid) || "Cliente");
@@ -344,12 +355,6 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         max_quantity: row.max_quantity ?? null,
         sort_order: row.sort_order ?? 0,
         active: row.active === false ? 0 : 1,
-      })),
-      inventory: presentations.map((p) => ({
-        id: p.id,
-        presentation_id: p.id,
-        quantity_available: rawPresentationRows.find((row: any) => row.id === p.id)?.quantity_available ?? 0,
-        updated_at: p.updated_at,
       })),
       orders,
       categories: categoryRows.map((row: any) => ({ id: row.id, name: row.name, active: row.active === false ? 0 : 1, updated_at: row.updated_at })),

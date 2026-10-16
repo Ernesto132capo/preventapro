@@ -81,7 +81,6 @@ CREATE TABLE IF NOT EXISTS product_presentations (
   unit_equivalence INTEGER NOT NULL,
   price_cents INTEGER NOT NULL,
   cost_cents INTEGER NOT NULL DEFAULT 0,
-  quantity_available INTEGER NOT NULL DEFAULT 0,
   active INTEGER NOT NULL DEFAULT 1
 );
 
@@ -167,12 +166,14 @@ CREATE INDEX IF NOT EXISTS idx_products_sku ON products (sku);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id);
 CREATE INDEX IF NOT EXISTS idx_presentations_product ON product_presentations (product_id);
 CREATE INDEX IF NOT EXISTS idx_clients_name ON clients (business_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_clients_server_id ON clients (server_id);
 CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
 CREATE INDEX IF NOT EXISTS idx_orders_client ON orders (client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_work_day ON orders (work_day_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items (product_id);
 CREATE INDEX IF NOT EXISTS idx_order_selections_item ON order_item_selections (order_item_id);
+CREATE INDEX IF NOT EXISTS idx_order_selections_presentation ON order_item_selections (selected_presentation_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox (status, priority);
 `;
 

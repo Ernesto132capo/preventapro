@@ -92,8 +92,14 @@ async function full(id: string, client: PoolClient | typeof pool = pool) {
 async function make(client: PoolClient, items: z.infer<typeof item>[]) {
   const out: any[] = [];
   for (const x of items) {
-    const { rows: pRows } = await client.query("SELECT * FROM products WHERE id = $1", [x.productId]);
-    const { rows: qRows } = await client.query("SELECT * FROM product_presentations WHERE id = $1", [x.presentationId]);
+    const { rows: pRows } = await client.query(
+      "SELECT id, name, sku, product_type, active FROM products WHERE id = $1",
+      [x.productId]
+    );
+    const { rows: qRows } = await client.query(
+      "SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1",
+      [x.presentationId]
+    );
     const p = pRows[0], q = qRows[0];
     if (!p || p.active === false || !q || q.active === false) throw Error("Producto o presentación no encontrados o inactivos.");
     if (q.product_id !== x.productId) throw Error("La presentación no pertenece a este producto.");

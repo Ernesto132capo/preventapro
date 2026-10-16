@@ -42,14 +42,8 @@ async function pullCatalog(force = false): Promise<{ clients: number; products: 
     presByProduct[p.product_id] = presByProduct[p.product_id] || [];
     presByProduct[p.product_id].push(p);
   }
-  const invByPresentation: Record<string, number> = {};
-  for (const inv of data.inventory) invByPresentation[inv.presentation_id] = inv.quantity_available;
-
   for (const prod of data.products) {
-    const presentations = (presByProduct[prod.id] || []).map((p) => ({
-      ...p,
-      quantity_available: invByPresentation[p.id] ?? 0,
-    }));
+    const presentations = presByProduct[prod.id] || [];
     await upsertProductFromServer({ ...prod, presentations });
   }
 
@@ -293,7 +287,10 @@ async function pushProduct(row: OutboxRow) {
 
   // Solo se envían las presentaciones activas; las borradas localmente se omiten (el servidor las desactiva por ausencia).
   const presentations = await db.getAllAsync<any>(
-    `SELECT * FROM product_presentations WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1 ORDER BY sort_order ASC`,
+    `SELECT id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active
+     FROM product_presentations
+     WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1
+     ORDER BY sort_order ASC`,
     [product.id, product.server_id]
   );
 
@@ -342,7 +339,6 @@ async function pushProduct(row: OutboxRow) {
       unitEquivalence: p.unit_equivalence,
       priceCents: p.price_cents,
       costCents: p.cost_cents,
-      stock: p.quantity_available ?? 0,
     })),
     comboDefinition: comboDefinitionBody,
   };
@@ -380,14 +376,20 @@ async function pushProduct(row: OutboxRow) {
   await markDone(row.id);
 }
 
-async function pushOrder(row: OutboxRow, userId: string) {
+type PushOutcome = "done" | "deferred" | "failed";
+
+async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   const db = await getDb();
   const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ?`, [row.local_entity_id]);
-  if (!order) return markDone(row.id);
+  if (!order) {
+    await markDone(row.id);
+    return "done";
+  }
   if (row.operation === "cancel" || order.status === "cancelled") {
     // Si nunca llegó al servidor, basta con descartar sus operaciones locales.
     if (order.server_id) await apiFetch<any>(`/orders/${order.server_id}/cancel`, { method: "POST" });
-    return markDone(row.id);
+    await markDone(row.id);
+    return "done";
   }
 
   let workDayServerId = await resolveServerWorkDayId(order.work_day_id);
@@ -404,7 +406,8 @@ async function pushOrder(row: OutboxRow, userId: string) {
   const clientServerId = await resolveServerClientId(order.client_id);
   if (!workDayServerId || !clientServerId) {
     console.warn(`[pushOrder] Deferring order ${order.id}: workDayServerId=${workDayServerId}, clientServerId=${clientServerId}`);
-    return deferForDependency(row.id);
+    await deferForDependency(row.id);
+    return "deferred";
   }
 
   const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
@@ -414,7 +417,8 @@ async function pushOrder(row: OutboxRow, userId: string) {
     const presentationServerId = await resolveServerPresentationId(item.presentation_id);
     if (!productServerId || !presentationServerId) {
       console.warn(`[pushOrder] Deferring order ${order.id}: item ${item.id} missing productServerId=${productServerId}, presentationServerId=${presentationServerId}`);
-      return deferForDependency(row.id); // el producto creado offline todavía no sincronizó
+      await deferForDependency(row.id);
+      return "deferred"; // el producto creado offline todavía no sincronizó
     }
 
     const selections = await db.getAllAsync<any>(
@@ -429,7 +433,8 @@ async function pushOrder(row: OutboxRow, userId: string) {
         const selPresServerId = await resolveServerPresentationId(sel.selected_presentation_id);
         if (!selProdServerId || !selPresServerId) {
           console.warn(`[pushOrder] Deferring order ${order.id}: selection missing server id`);
-          return deferForDependency(row.id);
+          await deferForDependency(row.id);
+          return "deferred";
         }
         resolvedSelections.push({
           selectedProductId: selProdServerId,
@@ -461,11 +466,13 @@ async function pushOrder(row: OutboxRow, userId: string) {
         });
     await markOrderSynced(order.id, res.order.id);
     await markDone(row.id);
+    return "done";
   } catch (err) {
     const message = err instanceof ApiError ? err.message : "Error de sincronización";
     if (err instanceof ApiError && err.status === 0) {
       // Error de red real (no de validación) — reintentar sin marcar como fallo definitivo.
-      return deferForDependency(row.id);
+      await deferForDependency(row.id);
+      return "deferred";
     }
 
     // Blindaje de jornada concluida / cerrada: evitar bucle infinito de reintentos
@@ -483,44 +490,43 @@ async function pushOrder(row: OutboxRow, userId: string) {
       );
       // Descartar la orden del outbox para NO entrar en bucle infinito
       await markDone(row.id);
-      return;
+      return "failed";
     }
 
     await markOrderFailed(order.id, message);
     await markFailed(row.id, message);
+    return "failed";
   }
 }
 
 /** PUSH: procesa la cola de salida en orden de prioridad (clientes/productos antes que preventas). */
 async function pushOutbox(userId: string): Promise<{ done: number; deferred: number; failed: number }> {
   const rows = await listPending();
-  let done = 0,
-    deferred = 0,
-    failed = 0;
+  const outcomes = new Map<string, PushOutcome>();
 
   for (const row of rows) {
-    await markSyncing(row.id);
     try {
+      await markSyncing(row.id);
       if (row.entity_type === "category") {
         await pushCategory(row);
-        done++;
+        outcomes.set(row.id, "done");
       } else if (row.entity_type === "client") {
         await pushClient(row);
-        done++;
+        outcomes.set(row.id, "done");
       } else if (row.entity_type === "product") {
         await pushProduct(row);
-        done++;
+        outcomes.set(row.id, "done");
       } else if (row.entity_type === "order") {
-        await pushOrder(row, userId);
+        outcomes.set(row.id, await pushOrder(row, userId));
       }
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Error desconocido";
       if (err instanceof ApiError && err.status === 0) {
         await deferForDependency(row.id);
-        deferred++;
+        outcomes.set(row.id, "deferred");
       } else {
         await markFailed(row.id, message);
-        failed++;
+        outcomes.set(row.id, "failed");
       }
       continue;
     }
@@ -531,12 +537,23 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
   for (const row of remaining) {
     if (row.entity_type !== "order") continue;
     try {
-      await pushOrder(row, userId);
-    } catch {
-      /* se maneja dentro de pushOrder */
+      await markSyncing(row.id);
+      outcomes.set(row.id, await pushOrder(row, userId));
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Error desconocido";
+      if (err instanceof ApiError && err.status === 0) {
+        await deferForDependency(row.id);
+        outcomes.set(row.id, "deferred");
+      } else {
+        await markFailed(row.id, message);
+        outcomes.set(row.id, "failed");
+      }
     }
   }
 
+  const counts = { done: 0, deferred: 0, failed: 0 };
+  for (const outcome of outcomes.values()) counts[outcome]++;
+  const { done, deferred, failed } = counts;
   return { done, deferred, failed };
 }
 

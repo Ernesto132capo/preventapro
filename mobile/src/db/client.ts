@@ -7,6 +7,15 @@ export async function getDb(): Promise<SQLite.SQLiteDatabase> {
   if (dbInstance) return dbInstance;
   const db = await SQLite.openDatabaseAsync("preventapro.db");
   await db.execAsync(LOCAL_SCHEMA);
+  // Elimina la columna de inventario de bases locales creadas por versiones previas.
+  try {
+    const presentationColumns = await db.getAllAsync<{ name: string }>("PRAGMA table_info(product_presentations)");
+    if (presentationColumns.some((column) => column.name === "quantity_available")) {
+      await db.execAsync("ALTER TABLE product_presentations DROP COLUMN quantity_available");
+    }
+  } catch {
+    // Si SQLite ya no tiene esa columna o no puede alterar la tabla, la app ya no depende de ella.
+  }
   // Migración para instalaciones que ya tenían creada la tabla outbox.
   try {
     await db.execAsync("ALTER TABLE outbox ADD COLUMN operation TEXT NOT NULL DEFAULT 'create'");
@@ -70,12 +79,14 @@ export async function getDb(): Promise<SQLite.SQLiteDatabase> {
       CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id);
       CREATE INDEX IF NOT EXISTS idx_presentations_product ON product_presentations (product_id);
       CREATE INDEX IF NOT EXISTS idx_clients_name ON clients (business_name COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS idx_clients_server_id ON clients (server_id);
       CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
       CREATE INDEX IF NOT EXISTS idx_orders_client ON orders (client_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_orders_work_day ON orders (work_day_id);
       CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items (order_id);
       CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items (product_id);
       CREATE INDEX IF NOT EXISTS idx_order_selections_item ON order_item_selections (order_item_id);
+      CREATE INDEX IF NOT EXISTS idx_order_selections_presentation ON order_item_selections (selected_presentation_id);
     `);
   } catch {}
   dbInstance = db;
@@ -111,6 +122,7 @@ export async function resetLocalDatabase(): Promise<void> {
     await db.runAsync(`DELETE FROM outbox`);
     await db.runAsync(`DELETE FROM combo_options`);
     await db.runAsync(`DELETE FROM combo_definitions`);
+    await db.runAsync(`DELETE FROM product_favorites`);
     await db.runAsync(`DELETE FROM product_presentations`);
     await db.runAsync(`DELETE FROM products`);
     await db.runAsync(`DELETE FROM clients`);

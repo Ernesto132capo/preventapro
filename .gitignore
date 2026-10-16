@@ -9,12 +9,8 @@ reports/*/
 .env.*
 !.env.example
 
-# Credenciales y configuración local de Firebase: nunca versionarlas.
-firebase-service-account.json
-firebase-service-account-*.json
-**/firebase-service-account.json
-firebase.json
-firestore.indexes.json
+# Logs generados localmente por el backend.
+/backend/sync-debug.log
 
 # Tokens, claves y certificados locales.
 *.token

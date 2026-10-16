@@ -29,8 +29,7 @@ function localDate(value: string) {
 export async function generateClientReceiptsPdf(workDayId: string, outDir: string): Promise<string> {
   // JOIN en una sola consulta en vez de N+1 lecturas por orden (cliente + items).
   // receipt_number siempre viene asignado por la secuencia de Postgres al crear
-  // la orden, así que ya no hace falta la asignación perezosa que existía con
-  // Firestore para órdenes legadas.
+  // la orden, así que no hace falta asignar números al generar el reporte.
   const { rows } = await pool.query(
     `SELECT
        o.id AS order_id, o.created_at, o.total_cents, o.receipt_number,

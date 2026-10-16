@@ -1,26 +1,37 @@
 import { Router } from "express";
 import { z } from "zod";
-import { auth } from "../firebase/admin";
-import { codeToEmail, createAuthUser } from "../services/auth";
-import { pool, nowIso } from "../db/pg";
+import { pool } from "../db/pg";
+import { createAccessToken, verifyPassword } from "../services/auth";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 
 export const authRouter = Router();
 
-// El login YA NO pasa por el backend: el celular llama directo a Firebase
-// Authentication (signInWithEmailAndPassword) con el SDK cliente, usando el
-// email sintético que devuelve este endpoint. El backend nunca ve la contraseña,
-// y el SDK cliente maneja solo la sesión persistida sin conexión.
-authRouter.get("/resolve-code/:code", async (req, res) => {
-  const code = req.params.code;
+const loginSchema = z.object({
+  identifier: z.string().trim().min(1).max(254),
+  password: z.string().min(1).max(128),
+}).strict();
+
+authRouter.post("/login", async (req, res) => {
+  const parsed = loginSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Ingresa tu código y contraseña válidos." });
+
+  const { identifier, password } = parsed.data;
   const { rows } = await pool.query(
-    "SELECT id FROM users WHERE code = $1 AND active = true LIMIT 1",
-    [code]
+    `SELECT id, code, real_email, full_name, active, password_hash
+     FROM users
+     WHERE lower(code) = lower($1) OR lower(coalesce(real_email, '')) = lower($1)
+     LIMIT 1`,
+    [identifier]
   );
-  if (rows.length === 0) {
-    return res.status(404).json({ error: "Código de preventista no encontrado." });
+  const user = rows[0];
+  if (!user || user.active === false || !(await verifyPassword(password, user.password_hash))) {
+    return res.status(401).json({ error: "Código/correo o contraseña incorrectos." });
   }
-  return res.json({ email: codeToEmail(code) });
+
+  return res.json({
+    accessToken: createAccessToken(user.id),
+    user: { id: user.id, code: user.code, email: user.real_email ?? null, fullName: user.full_name },
+  });
 });
 
 authRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
@@ -28,57 +39,8 @@ authRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
     "SELECT id, code, real_email, full_name, active FROM users WHERE id = $1",
     [req.userId]
   );
-  const d = rows[0];
+  const user = rows[0];
   return res.json({
-    user: { id: d?.id, code: d?.code, email: d?.real_email ?? null, fullName: d?.full_name, active: d?.active },
+    user: { id: user.id, code: user.code, email: user.real_email ?? null, fullName: user.full_name, active: user.active },
   });
-});
-
-// Utilidad administrativa para crear preventistas (protegida en un entorno real por un
-// rol admin; igual que en la versión SQLite, queda simple porque el spec no pide un
-// módulo de administración completo).
-const createUserSchema = z.object({
-  code: z.string().trim().min(2).max(50),
-  email: z.string().email().max(254).optional(), // email real, solo informativo (no se usa para login)
-  password: z.string().min(6).max(128),
-  fullName: z.string().trim().min(2).max(150),
-}).strict();
-
-authRouter.post("/users", async (req, res) => {
-  const parsed = createUserSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-  }
-  const { code, email, password, fullName } = parsed.data;
-
-  const existing = await pool.query("SELECT id FROM users WHERE code = $1 LIMIT 1", [code]);
-  if (existing.rows.length > 0) {
-    return res.status(409).json({ error: "Ese código de preventista ya existe." });
-  }
-
-  let userRecord;
-  try {
-    userRecord = await createAuthUser({ code, password, fullName });
-  } catch (err: any) {
-    if (err?.code === "auth/email-already-exists") {
-      return res.status(409).json({ error: "Ese código de preventista ya existe." });
-    }
-    throw err;
-  }
-
-  const ts = nowIso();
-  await pool.query(
-    `INSERT INTO users (id, code, real_email, full_name, active, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, true, $5, $5)`,
-    [userRecord.uid, code, email || null, fullName, ts]
-  );
-
-  return res.status(201).json({ id: userRecord.uid, code, fullName });
-});
-
-// Desactivar un preventista (soft delete: nunca se borra, para no perder su historial de pedidos).
-authRouter.patch("/users/:id/deactivate", requireAuth, async (req, res) => {
-  await pool.query("UPDATE users SET active = false, updated_at = $2 WHERE id = $1", [req.params.id, nowIso()]);
-  await auth.updateUser(req.params.id, { disabled: true });
-  return res.json({ ok: true });
 });

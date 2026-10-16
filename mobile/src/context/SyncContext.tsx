@@ -160,7 +160,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   // Timer periódico de baja frecuencia. Las mutaciones usan pushSync y al volver
   // a foreground se hace pull inmediato, por lo que no hace falta sondear cada
-  // minuto y castigar Firestore cuando nadie modificó datos.
+  // minuto y consultar el backend cuando nadie modificó datos.
   useEffect(() => {
     refreshPendingCount();
     // Sync inicial al montar

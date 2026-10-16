@@ -4,7 +4,7 @@ import { Pool, types } from "pg";
 // El esquema real de Neon guarda created_at/updated_at/closed_at como
 // `timestamp with time zone`. Por defecto, node-postgres parsea esas columnas
 // como objetos `Date` de JS, lo cual rompería el contrato JSON con el móvil
-// (que espera un string ISO 8601 tal como lo devolvía Firestore con
+// (que espera un string ISO 8601 como el contrato que usaba la app con
 // `toISOString()`) y las comparaciones de string en `routes/sync.ts`
 // (`localeCompare`, `updated_at > since`, etc.).
 //
@@ -34,7 +34,7 @@ pool.on("error", (err) => {
   console.error("Error inesperado en el pool de Postgres:", err);
 });
 
-/** Timestamp ISO consistente para created_at/updated_at (mismo formato que se usaba con Firestore). */
+/** Timestamp ISO consistente para created_at/updated_at. */
 export function nowIso(): string {
   return new Date().toISOString();
 }

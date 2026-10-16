@@ -63,7 +63,7 @@ async function hydrateProducts(db: SQLiteDatabase, products: Product[]): Promise
   const placeholders = allIds.map(() => "?").join(",");
 
   const allPresentations = await db.getAllAsync<Presentation>(
-    `SELECT * FROM product_presentations WHERE product_id IN (${placeholders}) AND active = 1 ORDER BY sort_order ASC`,
+    `SELECT id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active FROM product_presentations WHERE product_id IN (${placeholders}) AND active = 1 ORDER BY sort_order ASC`,
     allIds
   );
   const byProduct = new Map<string, Presentation[]>();
@@ -260,7 +260,6 @@ export interface NewPresentationInput {
   unitEquivalence: number;
   priceCents: number;
   costCents: number;
-  stock?: number;
 }
 
 export interface ComboOptionInput {
@@ -297,7 +296,7 @@ export interface UpdateProductInput {
 }
 
 /** Valida reglas comunes a crear/editar: nombres de presentación no vacíos y únicos. */
-function validatePresentations(presentations: { name: string; unitEquivalence: number; priceCents: number; stock?: number }[]) {
+function validatePresentations(presentations: { name: string; unitEquivalence: number; priceCents: number }[]) {
   if (presentations.length === 0) throw new Error("Configura al menos una presentación.");
   const seen = new Set<string>();
   for (const p of presentations) {
@@ -347,9 +346,9 @@ export async function createProductLocal(input: NewProductInput): Promise<Produc
       const presId = uuid();
       await db.runAsync(
         `INSERT INTO product_presentations
-          (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-        [presId, productId, p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents, p.stock ?? 0]
+          (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+        [presId, productId, p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents]
       );
     }
 
@@ -416,17 +415,17 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
       if (p.id) {
         await db.runAsync(
           `UPDATE product_presentations
-             SET name = ?, sort_order = ?, unit_equivalence = ?, price_cents = ?, cost_cents = ?, quantity_available = ?, active = 1
+             SET name = ?, sort_order = ?, unit_equivalence = ?, price_cents = ?, cost_cents = ?, active = 1
            WHERE id = ?`,
-          [p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents, p.stock ?? 0, p.id]
+          [p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents, p.id]
         );
       } else {
         const presId = uuid();
         await db.runAsync(
           `INSERT INTO product_presentations
-            (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-          [presId, localProdId, p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents, p.stock ?? 0]
+            (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+          [presId, localProdId, p.name.trim(), sortOrder++, p.unitEquivalence, p.priceCents, p.costCents]
         );
       }
     }
@@ -520,7 +519,7 @@ export async function upsertProductFromServer(serverProduct: any) {
   );
 
   const existingPresentations = await db.getAllAsync<any>(
-    `SELECT * FROM product_presentations WHERE product_id = ?`,
+    `SELECT id, server_id, name FROM product_presentations WHERE product_id = ?`,
     [targetId]
   );
 
@@ -537,13 +536,13 @@ export async function upsertProductFromServer(serverProduct: any) {
 
     await db.runAsync(
       `INSERT INTO product_presentations
-        (id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          server_id = excluded.server_id, product_id = excluded.product_id,
          name = excluded.name, sort_order = excluded.sort_order,
          unit_equivalence = excluded.unit_equivalence, price_cents = excluded.price_cents,
-         cost_cents = excluded.cost_cents, quantity_available = excluded.quantity_available, active = excluded.active`,
+         cost_cents = excluded.cost_cents, active = excluded.active`,
       [
         presLocalId,
         pres.id,
@@ -553,7 +552,6 @@ export async function upsertProductFromServer(serverProduct: any) {
         pres.unit_equivalence ?? 1,
         pres.price_cents ?? 0,
         pres.cost_cents ?? 0,
-        pres.quantity_available ?? 0,
         pres.active ?? 1,
       ]
     );
@@ -616,7 +614,7 @@ export async function resolveServerPresentationId(localId: string): Promise<stri
     [localId, localId]
   );
   if (byId) {
-    return byId.server_id || byId.id;
+    return byId.server_id || null;
   }
 
   // 2. Fallback inteligente: buscar por el nombre de la presentación en order_items
@@ -636,7 +634,7 @@ export async function resolveServerPresentationId(localId: string): Promise<stri
       );
       if (presMatch) {
         await db.runAsync(`UPDATE order_items SET presentation_id = ? WHERE presentation_id = ?`, [presMatch.id, localId]);
-        return presMatch.server_id || presMatch.id;
+        return presMatch.server_id || null;
       }
     }
   }

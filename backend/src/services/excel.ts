@@ -19,8 +19,7 @@ const moneyFormat = "#,##0.00";
 async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[]> {
   // JOIN en una sola consulta en vez de N+1 lecturas por orden (cliente + items).
   // receipt_number siempre viene asignado por la secuencia de Postgres al crear
-  // la orden, así que ya no hace falta la asignación perezosa que existía con
-  // Firestore para órdenes legadas.
+  // la orden, así que no hace falta asignar números al generar el reporte.
   const { rows } = await pool.query(
     `SELECT
        c.business_name, c.address,
@@ -84,9 +83,19 @@ export async function generateProductListExcel(workDayId: string, outDir: string
 
 /** Resumen compacto: una fila por cliente sin barrio. */
 export async function generateClientSummaryExcel(workDayId: string, outDir: string): Promise<string> {
-  const lines = await productRowsForWorkDay(workDayId); const totals = new Map<string, number>();
-  lines.forEach(r => totals.set(r.business_name, r.order_total_cents));
-  const rows = [...totals].map(([business_name,total_cents])=>({business_name,total_cents})).sort((a,b)=>a.business_name.localeCompare(b.business_name));
+  const { rows: summaryRows } = await pool.query(
+    `SELECT c.business_name, COALESCE(SUM(o.total_cents), 0)::text AS total_cents
+     FROM orders o
+     JOIN clients c ON c.id = o.client_id
+     WHERE o.work_day_id = $1 AND o.status != 'cancelled'
+     GROUP BY c.business_name
+     ORDER BY c.business_name`,
+    [workDayId]
+  );
+  const rows = summaryRows.map((row: any) => ({
+    business_name: row.business_name,
+    total_cents: Number(row.total_cents),
+  }));
   const wb = new ExcelJS.Workbook();
   const sheet = wb.addWorksheet("Resumen de Clientes");
   sheet.columns = [{ width: 10 }, { width: 35 }, { width: 20 }];

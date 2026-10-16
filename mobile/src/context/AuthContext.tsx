@@ -1,8 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError } from "../services/api";
-import { firebaseAuth } from "../services/firebase";
-import { signInWithEmailAndPassword, signOut } from "firebase/auth";
 
 export interface AuthUser {
   id: string;
@@ -29,40 +27,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     (async () => {
-      const token = await getAccessToken();
-      const storedUser = await AsyncStorage.getItem(USER_KEY);
-      if (token && storedUser) {
-        try {
-          setUser(JSON.parse(storedUser));
-        } catch {
-          await AsyncStorage.removeItem(USER_KEY);
+      try {
+        const [token, storedUser] = await Promise.all([
+          getAccessToken(),
+          AsyncStorage.getItem(USER_KEY),
+        ]);
+        if (token && storedUser) {
+          try {
+            setUser(JSON.parse(storedUser) as AuthUser);
+          } catch {
+            await AsyncStorage.removeItem(USER_KEY);
+            await clearTokens();
+          }
         }
+      } catch {
+        setUser(null);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     })();
   }, []);
 
   const login = useCallback(async (identifier: string, password: string, rememberSession: boolean) => {
     setError(null);
     try {
-      const resolved = await apiFetch<any>(`/auth/resolve-code/${encodeURIComponent(identifier)}`, { authRequired: false });
-      const credential = await signInWithEmailAndPassword(firebaseAuth, resolved.email, password);
-      const idToken = await credential.user.getIdToken();
-      await setTokens(idToken, "");
-      const res = await apiFetch<any>("/auth/me", { authRequired: true });
-      const authedUser: AuthUser = {
-        id: res.user.id,
-        code: res.user.code,
-        email: res.user.email,
-        fullName: res.user.fullName,
-      };
+      const res = await apiFetch<{ accessToken: string; user: AuthUser }>("/auth/login", {
+        method: "POST",
+        authRequired: false,
+        body: { identifier, password },
+      });
+      await setTokens(res.accessToken, rememberSession);
       if (rememberSession) {
-        await AsyncStorage.setItem(USER_KEY, JSON.stringify(authedUser));
+        await AsyncStorage.setItem(USER_KEY, JSON.stringify(res.user));
       } else {
-        // Evita revivir el perfil de una sesión anterior en un teléfono compartido.
         await AsyncStorage.removeItem(USER_KEY);
       }
-      setUser(authedUser);
+      setUser(res.user);
       return true;
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión. Verifica tu conexión.");
@@ -71,7 +71,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await signOut(firebaseAuth);
     await clearTokens();
     await AsyncStorage.removeItem(USER_KEY);
     setUser(null);

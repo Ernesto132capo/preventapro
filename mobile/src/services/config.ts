@@ -1,5 +1,3 @@
-// Ajusta esto a la URL real de tu backend cuando lo despliegues.
-// En desarrollo con Expo Go, usa la IP de tu máquina en la red local (no "localhost",
-// porque el teléfono no puede resolver el localhost de tu computadora).
-// Ejemplo: "http://192.168.1.50:4000/api"
-export const API_BASE_URL = "https://preventapro-backend.onrender.com/api";
+// Expo reemplaza EXPO_PUBLIC_API_URL al iniciar o compilar la aplicación.
+// Si no se define, se usa el backend desplegado de PreventaPro.
+export const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || "https://preventapro-backend.onrender.com/api";

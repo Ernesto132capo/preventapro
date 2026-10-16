@@ -86,7 +86,6 @@ export interface ProductPresentation {
   unit_equivalence: number;
   price_cents: number;
   cost_cents: number;
-  quantity_available?: number;
   active: 0 | 1;
 }
 

@@ -39,12 +39,12 @@ export const colors = {
 };
 
 export const typography = {
-  display: { fontFamily: "PlusJakartaSans_700Bold", fontSize: 22 },
-  title: { fontFamily: "PlusJakartaSans_600SemiBold", fontSize: 16 },
-  value: { fontFamily: "PlusJakartaSans_700Bold", fontSize: 15 },
-  body: { fontFamily: "Inter_400Regular", fontSize: 13 },
-  caption: { fontFamily: "Inter_400Regular", fontSize: 11 },
-  label: { fontFamily: "Inter_500Medium", fontSize: 12 },
+  display: { fontSize: 22, fontWeight: "700" as const },
+  title: { fontSize: 16, fontWeight: "600" as const },
+  value: { fontSize: 15, fontWeight: "700" as const },
+  body: { fontSize: 13, fontWeight: "400" as const },
+  caption: { fontSize: 11, fontWeight: "400" as const },
+  label: { fontSize: 12, fontWeight: "500" as const },
 };
 
 export const spacing = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32 };

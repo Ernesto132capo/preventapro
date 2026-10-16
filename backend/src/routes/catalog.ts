@@ -25,7 +25,6 @@ const presentationInput = z.object({
   unitEquivalence: z.number().int().positive().max(1_000_000),
   priceCents: z.number().int().nonnegative().max(2_000_000_000),
   costCents: z.number().int().nonnegative().max(2_000_000_000).default(0),
-  stock: z.number().int().nonnegative().max(2_000_000_000).default(0),
 }).passthrough();
 
 const productSchema = z.object({
@@ -78,7 +77,6 @@ function serialPresentation(row: any) {
     price_cents: row.price_cents,
     cost_cents: row.cost_cents,
     active: row.active === false ? 0 : 1,
-    quantity_available: row.quantity_available ?? 0,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -86,7 +84,7 @@ function serialPresentation(row: any) {
 
 async function serialProduct(row: any) {
   const pres = await pool.query(
-    "SELECT * FROM product_presentations WHERE product_id = $1 AND active = true ORDER BY sort_order",
+    "SELECT id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at FROM product_presentations WHERE product_id = $1 AND active = true ORDER BY sort_order",
     [row.id]
   );
 
@@ -267,9 +265,9 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
     for (let sortOrder = 0; sortOrder < d.presentations.length; sortOrder++) {
       const p = d.presentations[sortOrder];
       await client.query(
-        `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)`,
-        [uuid(), id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, p.stock, ts]
+        `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)`,
+        [uuid(), id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
       );
     }
 
@@ -344,7 +342,7 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
       [req.params.id, d.name, d.categoryId !== undefined ? targetCategoryId : (old.category_id ?? null), d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
     );
 
-    const current = await client.query("SELECT * FROM product_presentations WHERE product_id = $1", [req.params.id]);
+    const current = await client.query("SELECT id, name FROM product_presentations WHERE product_id = $1", [req.params.id]);
     const names = new Set(d.presentations.map((p) => p.name));
     const byName = new Map(current.rows.map((p: any) => [p.name, p]));
 
@@ -358,14 +356,14 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
       const match = byName.get(p.name);
       if (match) {
         await client.query(
-          `UPDATE product_presentations SET sort_order = $2, unit_equivalence = $3, price_cents = $4, cost_cents = $5, quantity_available = $6, active = true, updated_at = $7 WHERE id = $1`,
-          [match.id, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, p.stock, ts]
+          `UPDATE product_presentations SET sort_order = $2, unit_equivalence = $3, price_cents = $4, cost_cents = $5, active = true, updated_at = $6 WHERE id = $1`,
+          [match.id, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
         );
       } else {
         await client.query(
-          `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, quantity_available, active, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)`,
-          [uuid(), req.params.id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, p.stock, ts]
+          `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)`,
+          [uuid(), req.params.id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
         );
       }
     }
@@ -414,19 +412,6 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
   } finally {
     client.release();
   }
-});
-
-catalogRouter.patch("/presentations/:id/stock", async (req, res) => {
-  const parsed = z.object({ quantityAvailable: z.number().int().nonnegative().max(2_000_000_000) }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "quantityAvailable inválido.", details: parsed.error.flatten() });
-  const { quantityAvailable } = parsed.data;
-  const { rowCount } = await pool.query(
-    "UPDATE product_presentations SET quantity_available = $2, updated_at = $3 WHERE id = $1",
-    [req.params.id, quantityAvailable, nowIso()]
-  );
-  if (rowCount === 0) return res.status(404).json({ error: "Presentación sin registro de inventario." });
-  invalidatePullCache("products");
-  res.json({ ok: true });
 });
 
 catalogRouter.delete("/products/:id", async (req, res) => {

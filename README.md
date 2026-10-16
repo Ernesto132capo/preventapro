@@ -1,124 +1,85 @@
-# PreventaPro — Aplicación móvil de preventas/DSD
+# PreventaPro
 
-Proyecto real (no prototipo): backend Node/Express funcional con base de datos,
-autenticación, cálculo de precios centralizado, jornadas, sincronización y reportes
-Excel reales; app móvil Expo/React Native con capa offline-first (SQLite local +
-cola de sincronización) sobre la misma lógica de negocio.
+Aplicación móvil para que dos preventistas registren preventas en ruta, incluso cuando no tienen conexión. La app conserva los cambios en SQLite y los sincroniza con el backend cuando vuelve Internet.
 
-## Estructura
+## Componentes
 
-```
-preventapro/
-  backend/   API REST (Node + Express + TypeScript + SQLite)
-  mobile/    App móvil (Expo + React Native + TypeScript)
-  docs/      Este roadmap
-```
+- `mobile/`: Expo, React Native y TypeScript. Incluye clientes, catálogo, combos, carrito de preventa, jornadas e historial de reportes.
+- `backend/`: API REST con Express y TypeScript. Guarda los datos compartidos en PostgreSQL de Neon y genera reportes Excel/PDF.
+- Autenticación: código o correo y contraseña contra la tabla `users` de Neon. Las contraseñas se guardan con scrypt y el backend emite tokens JWT. Firebase ya no se utiliza.
+- El acceso está pensado para las dos cuentas existentes de los preventistas; no hay roles ni panel de administración de usuarios.
+- El precio de cada presentación se valida y calcula en el backend. Los importes se guardan en centavos.
+- No se administra inventario ni stock: una preventa registra el pedido del cliente.
 
-## Cómo correrlo
+## Requisitos de configuración
 
-### 1. Backend
+El backend necesita una base Neon con el esquema de PreventaPro ya creado y una conexión `DATABASE_URL`. El repositorio no contiene una migración inicial completa de todas las tablas; `migrate:auth` únicamente agrega la columna para guardar los hashes de contraseña.
 
-```bash
-cd backend
-npm install
-npm run migrate     # crea el esquema SQLite
-npm run seed         # usuario demo + cliente + producto de ejemplo
-npm run dev           # http://localhost:4000
-```
+### Backend
 
-Usuario demo: **código `PV001`**, **contraseña `preventa123`**.
+1. Copia `backend/.env.example` a `backend/.env`.
+2. Completa `DATABASE_URL` con la cadena de conexión de Neon y define `AUTH_TOKEN_SECRET` con un secreto aleatorio de al menos 32 caracteres. Puedes generar uno con:
 
-Prueba rápida:
-```bash
-curl -X POST http://localhost:4000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"identifier":"PV001","password":"preventa123"}'
-```
+   ```bash
+   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+   ```
 
-Correr los tests del módulo de precios:
-```bash
-npm test
-```
+3. Instala dependencias y prepara la columna de contraseña:
 
-### 2. App móvil
+   ```bash
+   cd backend
+   npm ci
+   npm run migrate:auth
+   ```
 
-```bash
-cd mobile
-npm install
-```
+4. Asigna una contraseña a cada cuenta existente en Neon. El comando solicita la contraseña sin mostrarla en pantalla:
 
-Antes de arrancar, edita `src/services/config.ts` (o define `EXPO_PUBLIC_API_URL`)
-con la IP de tu computadora en la red local — **no** `localhost`, porque el teléfono
-no puede resolverlo. Ejemplo: `http://192.168.1.50:4000/api`.
+   ```bash
+   npm run user:set-password -- PV001
+   npm run user:set-password -- PV002
+   ```
 
-```bash
-npx expo start
-```
+   Reemplaza `PV001` y `PV002` por los códigos reales de las cuentas en la tabla `users`. Cada preventista tendrá que iniciar sesión una vez con su nueva contraseña; las contraseñas de Firebase no se pueden recuperar ni migrar.
 
-Escanea el QR con la app **Expo Go** (Android/iOS) o corre en un emulador.
+5. Inicia la API:
 
-Correr los tests del módulo de dominio (misma lógica de precios que el backend):
-```bash
-npm test
-```
+   ```bash
+   npm run dev
+   ```
 
-## Qué está REALMENTE implementado y probado
+La API queda disponible en `http://localhost:4000/api`. El inicio de sesión es `POST /api/auth/login` con `identifier` y `password`; `identifier` acepta el código de preventista o el correo real guardado en Neon.
 
-- **Backend**: auth (bcrypt+JWT), clientes (CRUD + alta rápida + soft delete),
-  catálogo (productos con presentaciones múltiples configurables + stock por
-  presentación), preventas (cálculo centralizado, snapshot inmutable, transacciones
-  atómicas, idempotencia real — probado creando la misma preventa dos veces),
-  jornadas (apertura automática, cierre con validación exacta de `CONFIRMAR`,
-  bloqueo tras cierre), reportes Excel reales generados con datos verdaderos
-  (`lista_de_productos.xlsx`, `resumen_clientes.xlsx`). 7/7 tests unitarios.
-- **Móvil**: SQLite local con el mismo modelo de datos, motor de sincronización
-  (patrón outbox: cola genérica, prioridad clientes/productos antes que preventas,
-  reintentos con backoff simple, resolución de dependencias local→servidor),
-  flujo completo de Nueva Preventa (cliente → productos → carrito → guardar,
-  100% funcional sin conexión), Preventas del día + cierre con `CONFIRMAR`,
-  Clientes (lista + alta rápida + llamar/WhatsApp), Productos (catálogo + registrar
-  producto), Dashboard con datos agregados reales (nunca hardcodeados), Registros
-  Históricos con enlaces a los reportes. 6/6 tests del módulo de dominio, y
-  TypeScript compila limpio en ambos proyectos.
+Para retirar también la columna antigua de stock en Neon, ejecuta una sola vez `npm run migrate:remove-stock`. No es necesaria para que la nueva versión funcione: el backend ya no lee ni escribe esa columna.
 
-## Lo que falta o quedó simplificado (léelo antes de ir a producción)
+### Aplicación móvil
 
-Sé honesto sobre esto para que no haya sorpresas:
+1. Copia `mobile/.env.example` a `mobile/.env`.
+2. En `EXPO_PUBLIC_API_URL`, usa la dirección de tu backend. En un teléfono conectado a la misma red, pon la IP local de la computadora en lugar de `localhost`; para el backend desplegado, usa su URL HTTPS.
+3. Inicia Expo:
 
-1. **Escáner de código de barras**: la arquitectura está lista (el buscador de
-   productos ya filtra por SKU), pero no integré la librería de cámara
-   (`expo-camera` / `expo-barcode-scanner`) ni la probé en un dispositivo físico,
-   porque este entorno no tiene acceso a hardware de cámara para verificarlo.
-2. **Descarga de reportes desde el móvil**: el enlace actual asume que el navegador
-   del dispositivo ya tiene sesión o abre el archivo directo; en producción conviene
-   un endpoint de descarga con token firmado de un solo uso en vez de pasar el JWT
-   por query string.
-3. **Conflictos de sincronización avanzados**: implementé idempotencia (evita
-   duplicados) y dependencia ordenada (clientes/productos antes que preventas),
-   pero no hay una UI de resolución manual de conflictos (ej. si dos preventistas
-   editan el mismo cliente casi al mismo tiempo) — hoy "gana" el último `UPDATE`.
-4. **Roles y administración**: no hay panel de administración para dar de alta
-   preventistas desde la app (existe el endpoint `POST /api/auth/users`, pero se usa
-   por API directamente, no desde una pantalla).
-5. **Pruebas end-to-end en dispositivo real**: verifiqué el backend con `curl`
-   (login, catálogo, preventa, idempotencia, cierre de jornada, generación de Excel)
-   y la lógica de dominio del móvil con Jest, pero no pude correr la app en un
-   emulador/dispositivo real desde este entorno — no hay forma de instalar Android
-   Studio ni Xcode aquí. Antes de usarla en campo, corre `npx expo start` en tu
-   máquina y prueba el flujo completo tú mismo.
-6. **Promociones con fechas**: el modelo de datos soporta `promo_active`,
-   `promo_price_cents`, `promo_starts_at/ends_at`, pero no implementé la lógica de
-   activación automática por fecha (se marca manualmente por ahora).
-7. **Multiidioma/moneda**: fijo en BOB/Bs. como pediste; cambiarlo es sencillo pero
-   no está parametrizado.
+   ```bash
+   cd mobile
+   npm ci
+   npx expo start
+   ```
 
-## Siguientes pasos sugeridos
+En EAS, configura `EXPO_PUBLIC_API_URL` en el entorno del perfil de build para que el APK de pruebas apunte al backend que quieras probar. Si no se define, la app usa el backend desplegado configurado como valor predeterminado.
 
-1. Corre ambos proyectos en tu máquina y prueba el flujo real en tu teléfono con Expo Go.
-2. Ajusta la paleta/tipografía fina si notas diferencias con Figma (usé los valores
-   exactos que pude extraer vía la API de Figma, pero no hice un pixel-diff pantalla
-   por pantalla).
-3. Cuando quieras pasar a producción: cambia SQLite del backend por Postgres (el
-   código usa SQL estándar, la migración es directa), despliega el backend con
-   HTTPS, y genera un build de Expo (`eas build`) para las tiendas.
-4. Dime qué pantalla o flujo quieres que revise/ajuste primero y seguimos iterando.
+## Uso en campo
+
+1. Inicia sesión con el código o correo y contraseña de uno de los preventistas.
+2. Selecciona un cliente, agrega productos y presentaciones al carrito y guarda la preventa.
+3. Sin conexión, los cambios quedan en el teléfono y aparecen como pendientes; se sincronizan cuando vuelve la red.
+4. En **Registros** puedes consultar jornadas cerradas y descargar sus reportes.
+
+## Cambios frente a versiones anteriores
+
+- Firebase Authentication y Firebase Admin fueron retirados. Las cuentas usan contraseñas guardadas como hashes en Neon.
+- El stock fue retirado de productos, presentaciones, formularios, API y sincronización. La migración local de SQLite elimina la columna antigua cuando el motor lo permite.
+- Las credenciales y URLs se configuran mediante archivos `.env`; no guardes esos archivos con valores reales en Git.
+
+## Funciones pendientes
+
+- No hay escáner de código de barras; se puede buscar por nombre o SKU.
+- La activación automática de promociones por fecha no está implementada.
+- No se ha validado el flujo completo en un dispositivo físico en esta versión.

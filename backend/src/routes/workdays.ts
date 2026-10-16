@@ -1,4 +1,6 @@
 import { Router } from "express";
+import fs from "fs";
+import path from "path";
 import { v4 as uuid } from "uuid";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
@@ -25,20 +27,26 @@ async function recalc(id: string) {
 // todos sus pedidos adentro. Esta función la cierra automáticamente, con sus
 // totales reales, justo antes de abrir la jornada del nuevo día.
 async function closeStaleOpenWorkDays(currentDate: string): Promise<boolean> {
-  const { rows } = await pool.query("SELECT * FROM work_days WHERE status = 'open'");
   const ts = nowIso();
-  let closedAny = false;
-  for (const row of rows) {
-    if (row.work_date && row.work_date !== currentDate) {
-      const totals = await recalc(row.id);
-      await pool.query(
-        "UPDATE work_days SET status = 'closed', order_count = $2, total_cents = $3, closed_at = $4, updated_at = $4, auto_closed = true WHERE id = $1",
-        [row.id, totals.orderCount, totals.totalCents, ts]
-      );
-      closedAny = true;
-    }
-  }
-  return closedAny;
+  const { rows } = await pool.query(
+    `WITH stale AS (
+       SELECT wd.id,
+              COUNT(o.id) FILTER (WHERE o.status != 'cancelled')::int AS order_count,
+              COALESCE(SUM(o.total_cents) FILTER (WHERE o.status != 'cancelled'), 0)::int AS total_cents
+       FROM work_days wd
+       LEFT JOIN orders o ON o.work_day_id = wd.id
+       WHERE wd.status = 'open' AND wd.work_date < $1
+       GROUP BY wd.id
+     )
+     UPDATE work_days wd
+     SET status = 'closed', order_count = stale.order_count, total_cents = stale.total_cents,
+         closed_at = $2, updated_at = $2, auto_closed = true
+     FROM stale
+     WHERE wd.id = stale.id
+     RETURNING wd.id`,
+    [currentDate, ts]
+  );
+  return rows.length > 0;
 }
 
 // ─── Caché en memoria para /workdays/current ─────────────────────────────────
@@ -84,7 +92,10 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   // abierta (ver closeStaleOpenWorkDays). Así nunca queda una jornada
   // huérfana sin poder verse ni en "hoy" ni en el Historial.
   const closedStale = await closeStaleOpenWorkDays(date);
-  if (closedStale) invalidatePullCache("workdays");
+  if (closedStale) {
+    invalidateWorkdayCache();
+    invalidatePullCache("workdays");
+  }
 
   const id = uuid();
   const ts = nowIso();
@@ -130,10 +141,16 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const orderIds = await client.query("SELECT id FROM orders WHERE work_day_id = $1", [req.params.id]);
-    for (const o of orderIds.rows) {
-      await client.query("DELETE FROM order_items WHERE order_id = $1", [o.id]);
-    }
+    await client.query(
+      `DELETE FROM order_item_selections
+       WHERE order_item_id IN (
+         SELECT oi.id FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.work_day_id = $1
+       )`,
+      [req.params.id]
+    );
+    await client.query("DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = $1)", [req.params.id]);
     await client.query("DELETE FROM orders WHERE work_day_id = $1", [req.params.id]);
     await client.query("DELETE FROM work_days WHERE id = $1", [req.params.id]);
     await client.query("COMMIT");
@@ -142,6 +159,18 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
     throw err;
   } finally {
     client.release();
+  }
+  invalidateWorkdayCache();
+  invalidatePullCache("workdays");
+
+  const reportRoot = path.resolve(__dirname, "../../reports");
+  const reportDir = path.resolve(reportRoot, path.basename(String(row.id)));
+  if (reportDir.startsWith(`${reportRoot}${path.sep}`)) {
+    try {
+      await fs.promises.rm(reportDir, { recursive: true, force: true });
+    } catch (error) {
+      console.error(`No se pudieron borrar los reportes de la jornada ${row.id}:`, error);
+    }
   }
   res.json({ ok: true });
 });
