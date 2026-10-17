@@ -56,3 +56,16 @@ pool.on("error", (err) => {
 export function nowIso(): string {
   return new Date().toISOString();
 }
+
+/** Asegura idempotentemente que las columnas name y owner_name existan y business_name sea nullable. */
+export async function ensureClientsSchema(clientOrPool: Pool | import("pg").PoolClient = pool): Promise<void> {
+  try {
+    await clientOrPool.query(`
+      ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT;
+      ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT;
+      ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL;
+    `);
+  } catch {
+    // Omitir si la tabla aún no existe
+  }
+}

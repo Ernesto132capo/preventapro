@@ -31,8 +31,8 @@ export function ClientFormScreen() {
     (async () => {
       const client = await getClient(clientId);
       if (client) {
-        setBusinessName(client.business_name || "");
-        setContactName(client.contact_name || "");
+        setBusinessName(client.business_name || client.name || "");
+        setContactName(client.contact_name || client.owner_name || "");
         setPhone(client.phone || "");
         setAddress(client.address || "");
       }
@@ -57,13 +57,17 @@ export function ClientFormScreen() {
       const client = isEditing
         ? await updateClientLocal(clientId!, {
             businessName: trimmedBusinessName || undefined,
+            name: trimmedBusinessName || undefined,
             contactName: trimmedContactName || undefined,
+            ownerName: trimmedContactName || undefined,
             phone: phone.trim() || undefined,
             address: address.trim() || undefined,
           })
         : await createClientLocal({
             businessName: trimmedBusinessName || undefined,
+            name: trimmedBusinessName || undefined,
             contactName: trimmedContactName || undefined,
+            ownerName: trimmedContactName || undefined,
             phone: phone.trim() || undefined,
             address: address.trim() || undefined,
           });

@@ -11,6 +11,7 @@ import {
 import { normalizeOutboxErrors } from "../db/outbox";
 import { formatClientDisplayName } from "../domain/client-display";
 import { getConsolidatedProductsForWorkDay } from "../db/repositories/orders";
+import { migrateClientsTableIfNeeded } from "../db/client-migration";
 
 interface MockCategory {
   id: string;
@@ -24,8 +25,10 @@ interface MockCategory {
 interface MockClient {
   id: string;
   server_id: string | null;
-  business_name: string;
+  business_name: string | null;
+  name?: string | null;
   contact_name: string | null;
+  owner_name?: string | null;
   phone: string | null;
   address: string | null;
   lat: number | null;
@@ -219,12 +222,22 @@ const mockDb = {
 
     // CLIENTS: INSERT
     if (cleanSql.startsWith("INSERT INTO clients")) {
-      const [id, business_name, contact_name, phone, address, lat, lng, created_at, updated_at] = params;
+      let id: string, business_name: string | null, name: string | null, contact_name: string | null, owner_name: string | null;
+      let phone: string | null, address: string | null, lat: number | null, lng: number | null, created_at: string, updated_at: string;
+      if (params.length === 11) {
+        [id, business_name, name, contact_name, owner_name, phone, address, lat, lng, created_at, updated_at] = params;
+      } else {
+        [id, business_name, contact_name, phone, address, lat, lng, created_at, updated_at] = params;
+        name = business_name;
+        owner_name = contact_name;
+      }
       state.clients.push({
         id,
         server_id: null,
         business_name,
+        name,
         contact_name,
+        owner_name,
         phone,
         address,
         lat,
@@ -239,12 +252,22 @@ const mockDb = {
     }
 
     // CLIENTS: UPDATE
-    if (cleanSql.startsWith("UPDATE clients SET business_name = ?")) {
-      const [business_name, contact_name, phone, address, lat, lng, updated_at, id] = params;
+    if (cleanSql.startsWith("UPDATE clients SET business_name = ?") || (cleanSql.startsWith("UPDATE clients SET") && cleanSql.includes("contact_name = ?"))) {
+      let business_name: string | null, name: string | null, contact_name: string | null, owner_name: string | null;
+      let phone: string | null, address: string | null, lat: number | null, lng: number | null, updated_at: string, id: string;
+      if (params.length === 10) {
+        [business_name, name, contact_name, owner_name, phone, address, lat, lng, updated_at, id] = params;
+      } else {
+        [business_name, contact_name, phone, address, lat, lng, updated_at, id] = params;
+        name = business_name;
+        owner_name = contact_name;
+      }
       const c = state.clients.find((cl) => cl.id === id);
       if (c) {
         c.business_name = business_name;
+        c.name = name;
         c.contact_name = contact_name;
+        c.owner_name = owner_name;
         c.phone = phone;
         c.address = address;
         c.lat = lat;
@@ -562,10 +585,17 @@ describe("Repositories & Outbox Atomicity", () => {
     });
 
     it("[Objetivo 2] permite crear cliente solo con tienda o solo con propietario, pero rechaza si ambos están vacíos", async () => {
-      // Solo con propietario
+      // Solo con propietario (contactName)
       const clientOwnerOnly = await createClientLocal({ contactName: "Don Pedro" });
       expect(clientOwnerOnly.contact_name).toBe("Don Pedro");
-      expect(clientOwnerOnly.business_name).toBe("");
+      expect(clientOwnerOnly.owner_name).toBe("Don Pedro");
+      expect(clientOwnerOnly.business_name || "").toBe("");
+
+      // Solo con propietario usando alias ownerName
+      const clientOwnerAlias = await createClientLocal({ ownerName: "Doña Julia" });
+      expect(clientOwnerAlias.contact_name).toBe("Doña Julia");
+      expect(clientOwnerAlias.owner_name).toBe("Doña Julia");
+      expect(clientOwnerAlias.business_name || "").toBe("");
 
       // Solo con tienda
       const clientStoreOnly = await createClientLocal({ businessName: "Almacén Central" });
@@ -581,6 +611,63 @@ describe("Repositories & Outbox Atomicity", () => {
       );
     });
 
+    it("migra tabla clients legacy con business_name NOT NULL a tabla con columnas nullable y owner_name", async () => {
+      const executedSql: string[] = [];
+      const fakeDb: any = {
+        getAllAsync: jest.fn(async (query: string) => {
+          if (query.includes("PRAGMA table_info(clients)")) {
+            return [
+              { cid: 0, name: "id", type: "TEXT", notnull: 1, dflt_value: null, pk: 1 },
+              { cid: 1, name: "server_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+              { cid: 2, name: "business_name", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 }, // legacy NOT NULL
+              { cid: 3, name: "contact_name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+            ];
+          }
+          return [];
+        }),
+        execAsync: jest.fn(async (sql: string) => {
+          executedSql.push(sql);
+        }),
+      };
+
+      await migrateClientsTableIfNeeded(fakeDb);
+
+      expect(executedSql.some((s) => s.includes("PRAGMA foreign_keys = OFF;"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("CREATE TABLE IF NOT EXISTS clients_new"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("INSERT INTO clients_new"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("DROP TABLE clients;"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("ALTER TABLE clients_new RENAME TO clients;"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("PRAGMA foreign_keys = ON;"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("UPDATE clients SET"))).toBe(true);
+    });
+
+    it("no recrea la tabla si clients ya tiene las columnas necesarias y business_name es nullable", async () => {
+      const executedSql: string[] = [];
+      const fakeDb: any = {
+        getAllAsync: jest.fn(async (query: string) => {
+          if (query.includes("PRAGMA table_info(clients)")) {
+            return [
+              { cid: 0, name: "id", type: "TEXT", notnull: 1, dflt_value: null, pk: 1 },
+              { cid: 1, name: "server_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+              { cid: 2, name: "business_name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+              { cid: 3, name: "name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+              { cid: 4, name: "contact_name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+              { cid: 5, name: "owner_name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+            ];
+          }
+          return [];
+        }),
+        execAsync: jest.fn(async (sql: string) => {
+          executedSql.push(sql);
+        }),
+      };
+
+      await migrateClientsTableIfNeeded(fakeDb);
+
+      expect(executedSql.some((s) => s.includes("DROP TABLE clients;"))).toBe(false);
+      expect(executedSql.some((s) => s.includes("UPDATE clients SET"))).toBe(true);
+    });
+
     it("[Objetivo 2] formatClientDisplayName formatea según Casos A, B y C de PreventaPro", () => {
       // Caso A: Ambos
       const a = formatClientDisplayName({ business_name: "Tienda Rosita", contact_name: "Rosa Flores" });
@@ -594,11 +681,23 @@ describe("Repositories & Outbox Atomicity", () => {
       expect(b.secondary).toBeNull();
       expect(b.fullTitle).toBe("Rosa Flores");
 
+      // Caso B con owner_name / ownerName
+      const b2 = formatClientDisplayName({ owner_name: "Rosa Flores" });
+      expect(b2.primary).toBe("Rosa Flores");
+      expect(b2.secondary).toBeNull();
+      expect(b2.fullTitle).toBe("Rosa Flores");
+
       // Caso C: Solo Tienda
       const c = formatClientDisplayName({ business_name: "Tienda Rosita", contact_name: "" });
       expect(c.primary).toBe("Tienda Rosita");
       expect(c.secondary).toBeNull();
       expect(c.fullTitle).toBe("Tienda Rosita");
+
+      // Caso C con name
+      const c2 = formatClientDisplayName({ name: "Tienda Rosita" });
+      expect(c2.primary).toBe("Tienda Rosita");
+      expect(c2.secondary).toBeNull();
+      expect(c2.fullTitle).toBe("Tienda Rosita");
 
       // Fallback
       const fallback = formatClientDisplayName(null);

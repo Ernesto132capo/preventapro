@@ -245,6 +245,22 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    id: "006_clients_owner_name_and_nullable_name",
+    description: "Agregar columnas name y owner_name en tabla clients y asegurar que business_name sea nullable",
+    run: async (client: PoolClient) => {
+      await client.query(`
+        ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT;
+        ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT;
+        ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL;
+        UPDATE clients SET
+          name = COALESCE(NULLIF(name, ''), business_name),
+          business_name = COALESCE(NULLIF(business_name, ''), name),
+          owner_name = COALESCE(NULLIF(owner_name, ''), contact_name),
+          contact_name = COALESCE(NULLIF(contact_name, ''), owner_name);
+      `);
+    },
+  },
 ];
 
 async function ensureMigrationsTable(client: PoolClient): Promise<void> {

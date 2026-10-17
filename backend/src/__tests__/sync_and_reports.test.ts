@@ -1203,7 +1203,9 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
               rows: [{
                 id: params?.[0] || "c-created-1",
                 business_name: params?.[1] || null,
+                name: params?.[1] || null,
                 contact_name: params?.[2] || null,
+                owner_name: params?.[2] || null,
                 phone: params?.[3] || null,
                 address: null,
                 active: true,
@@ -1221,6 +1223,17 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         });
         expect(resOwner.status).toBe(201);
         expect(resOwner.body.client.contact_name).toBe("Don Pedro");
+        expect(resOwner.body.client.owner_name).toBe("Don Pedro");
+
+        // Creación con alias owner_name -> 201 Exitoso
+        const resOwnerAlias = await makeRequest(app, {
+          method: "POST",
+          url: "/clients",
+          body: { owner_name: "Doña Julia", phone: "70099999" },
+        });
+        expect(resOwnerAlias.status).toBe(201);
+        expect(resOwnerAlias.body.client.contact_name).toBe("Doña Julia");
+        expect(resOwnerAlias.body.client.owner_name).toBe("Doña Julia");
 
         // Creación con solo nombre de negocio -> 201 Exitoso
         const resStore = await makeRequest(app, {
@@ -1230,6 +1243,42 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         });
         expect(resStore.status).toBe(201);
         expect(resStore.body.client.business_name).toBe("Pulpería El Carmen");
+      });
+
+      it("sincroniza cliente con solo owner_name a través de /sync exitosamente", async () => {
+        const syncApp = express();
+        syncApp.use(express.json());
+        syncApp.use("/sync", syncRouter);
+
+        mockClient.query.mockImplementation(async (sql: string) => {
+          if (sql === "BEGIN" || sql === "COMMIT") return { rows: [] };
+          if (sql.includes("SELECT id FROM clients")) return { rows: [] };
+          if (sql.includes("INSERT INTO clients")) {
+            return {
+              rows: [{
+                id: "srv-cl-1",
+                business_name: null,
+                name: null,
+                contact_name: "Doña Julia",
+                owner_name: "Doña Julia",
+              }],
+            };
+          }
+          return { rows: [] };
+        });
+
+        const syncRes = await makeRequest(syncApp, {
+          method: "POST",
+          url: "/sync",
+          body: {
+            clients: [{ localId: "loc-cl-1", owner_name: "Doña Julia" }],
+          },
+        });
+        expect(syncRes.status).toBe(200);
+        expect(syncRes.body.results).toBeDefined();
+        const clientRes = syncRes.body.results.find((r: any) => r.entityType === "client");
+        expect(clientRes).toBeDefined();
+        expect(clientRes.status).toBe("synced");
       });
 
       it("[Objetivo 1] generateProductListExcel genera exactamente las 4 columnas requeridas y fila TOTAL GENERAL", async () => {

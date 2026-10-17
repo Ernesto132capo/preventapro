@@ -8,13 +8,18 @@ export async function listActiveClients(search?: string): Promise<Client[]> {
   if (search && search.trim()) {
     const q = `%${search.trim()}%`;
     return db.getAllAsync<Client>(
-      `SELECT * FROM clients WHERE active = 1 AND (business_name LIKE ? OR contact_name LIKE ? OR phone LIKE ?)
-       ORDER BY COALESCE(NULLIF(business_name, ''), contact_name) COLLATE NOCASE ASC`,
+      `SELECT * FROM clients WHERE active = 1 AND (
+         COALESCE(business_name, name, '') LIKE ? OR
+         COALESCE(contact_name, owner_name, '') LIKE ? OR
+         COALESCE(phone, '') LIKE ?
+       )
+       ORDER BY COALESCE(NULLIF(business_name, ''), NULLIF(name, ''), contact_name, owner_name, '') COLLATE NOCASE ASC`,
       [q, q, q]
     );
   }
   return db.getAllAsync<Client>(
-    `SELECT * FROM clients WHERE active = 1 ORDER BY COALESCE(NULLIF(business_name, ''), contact_name) COLLATE NOCASE ASC`
+    `SELECT * FROM clients WHERE active = 1
+     ORDER BY COALESCE(NULLIF(business_name, ''), NULLIF(name, ''), contact_name, owner_name, '') COLLATE NOCASE ASC`
   );
 }
 
@@ -25,7 +30,9 @@ export async function getClient(id: string): Promise<Client | null> {
 
 export interface QuickClientInput {
   businessName?: string;
+  name?: string;
   contactName?: string;
+  ownerName?: string;
   phone?: string;
   address?: string;
   lat?: number;
@@ -34,8 +41,8 @@ export interface QuickClientInput {
 
 /** Alta rápida de cliente (Fase 8) — funciona 100% offline. Se encola para sincronizar. */
 export async function createClientLocal(input: QuickClientInput): Promise<Client> {
-  const bName = (input.businessName || "").trim();
-  const cName = (input.contactName || "").trim();
+  const bName = (input.businessName || input.name || "").trim();
+  const cName = (input.contactName || input.ownerName || "").trim();
   if (!bName && !cName) {
     throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
   }
@@ -46,9 +53,21 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
   await db.withTransactionAsync(async () => {
     await db.runAsync(
       `INSERT INTO clients
-        (id, business_name, contact_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'pending', ?, ?)`,
-      [id, bName, cName || null, input.phone?.trim() || null, input.address?.trim() || null, input.lat ?? null, input.lng ?? null, ts, ts]
+        (id, business_name, name, contact_name, owner_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'pending', ?, ?)`,
+      [
+        id,
+        bName || null,
+        bName || null,
+        cName || null,
+        cName || null,
+        input.phone?.trim() || null,
+        input.address?.trim() || null,
+        input.lat ?? null,
+        input.lng ?? null,
+        ts,
+        ts,
+      ]
     );
     await enqueue("client", id, 1, "create");
   });
@@ -59,8 +78,8 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
 
 /** Edita un cliente ya existente (creado offline o ya sincronizado). Se re-encola para reflejar el cambio en el servidor. */
 export async function updateClientLocal(id: string, input: QuickClientInput): Promise<Client> {
-  const bName = (input.businessName || "").trim();
-  const cName = (input.contactName || "").trim();
+  const bName = (input.businessName || input.name || "").trim();
+  const cName = (input.contactName || input.ownerName || "").trim();
   if (!bName && !cName) {
     throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
   }
@@ -71,11 +90,13 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
   await db.withTransactionAsync(async () => {
     await db.runAsync(
       `UPDATE clients SET
-         business_name = ?, contact_name = ?, phone = ?, address = ?, lat = ?, lng = ?,
+         business_name = ?, name = ?, contact_name = ?, owner_name = ?, phone = ?, address = ?, lat = ?, lng = ?,
          sync_status = 'pending', updated_at = ?
        WHERE id = ?`,
       [
-        bName,
+        bName || null,
+        bName || null,
+        cName || null,
         cName || null,
         input.phone?.trim() || null,
         input.address?.trim() || null,
@@ -111,22 +132,37 @@ export async function upsertFromServer(serverClient: any) {
     : null;
 
   const targetId = localMatch ? localMatch.id : serverClient.id;
+  const bName = (serverClient.business_name || serverClient.businessName || serverClient.name || "").trim() || null;
+  const cName = (serverClient.contact_name || serverClient.contactName || serverClient.owner_name || serverClient.ownerName || "").trim() || null;
 
   await db.runAsync(
     `INSERT INTO clients
-      (id, server_id, business_name, contact_name, phone, neighborhood_id, neighborhood_name, address, lat, lng,
+      (id, server_id, business_name, name, contact_name, owner_name, phone, neighborhood_id, neighborhood_name, address, lat, lng,
        visit_status, active, sync_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)
      ON CONFLICT(id) DO UPDATE SET
-       server_id = excluded.server_id, business_name = excluded.business_name, contact_name = excluded.contact_name,
-       phone = excluded.phone, neighborhood_id = excluded.neighborhood_id, neighborhood_name = excluded.neighborhood_name,
-       address = excluded.address, lat = excluded.lat, lng = excluded.lng, visit_status = excluded.visit_status,
-       active = excluded.active, sync_status = 'synced', updated_at = excluded.updated_at`,
+       server_id = excluded.server_id,
+       business_name = excluded.business_name,
+       name = excluded.name,
+       contact_name = excluded.contact_name,
+       owner_name = excluded.owner_name,
+       phone = excluded.phone,
+       neighborhood_id = excluded.neighborhood_id,
+       neighborhood_name = excluded.neighborhood_name,
+       address = excluded.address,
+       lat = excluded.lat,
+       lng = excluded.lng,
+       visit_status = excluded.visit_status,
+       active = excluded.active,
+       sync_status = 'synced',
+       updated_at = excluded.updated_at`,
     [
       targetId,
       serverClient.id,
-      serverClient.business_name || "",
-      serverClient.contact_name ?? null,
+      bName,
+      bName,
+      cName,
+      cName,
       serverClient.phone ?? null,
       serverClient.neighborhood_id ?? null,
       serverClient.neighborhood_name ?? null,

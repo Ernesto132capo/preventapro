@@ -1,11 +1,14 @@
 import * as SQLite from "expo-sqlite";
 import { LOCAL_INDEXES, LOCAL_SCHEMA } from "./schema";
+import { migrateClientsTableIfNeeded } from "./client-migration";
+
+export { migrateClientsTableIfNeeded };
 
 let dbInstance: SQLite.SQLiteDatabase | null = null;
 let dbInitialization: Promise<SQLite.SQLiteDatabase> | null = null;
 
-// v1: columnas de sincronización; v2: tablas de combos/selecciones; v3: retiro de stock.
-const DATABASE_SCHEMA_VERSION = 3;
+// v1: columnas de sincronización; v2: tablas de combos/selecciones; v3: retiro de stock; v4: flexibilidad nombre/propietario cliente.
+const DATABASE_SCHEMA_VERSION = 4;
 
 type ColumnMigration = { name: string; definition: string };
 
@@ -25,7 +28,25 @@ const REQUIRED_ADDITIVE_COLUMNS: Record<string, ColumnMigration[]> = {
 const REQUIRED_COLUMNS: Record<string, string[]> = {
   meta: ["key", "value"],
   categories: ["id", "server_id", "name", "active", "sync_status", "updated_at"],
-  clients: ["id", "server_id", "business_name", "contact_name", "phone", "neighborhood_id", "neighborhood_name", "address", "lat", "lng", "visit_status", "active", "sync_status", "created_at", "updated_at"],
+  clients: [
+    "id",
+    "server_id",
+    "business_name",
+    "name",
+    "contact_name",
+    "owner_name",
+    "phone",
+    "neighborhood_id",
+    "neighborhood_name",
+    "address",
+    "lat",
+    "lng",
+    "visit_status",
+    "active",
+    "sync_status",
+    "created_at",
+    "updated_at",
+  ],
   products: ["id", "server_id", "sku", "name", "category_id", "base_cost_cents", "base_unit_name", "active", "promo_active", "product_type", "sync_status"],
   combo_definitions: ["id", "server_id", "product_id", "selection_min", "selection_max", "active", "sync_status"],
   combo_options: ["id", "server_id", "combo_id", "presentation_id", "max_quantity", "sort_order", "active", "sync_status"],
@@ -81,6 +102,8 @@ async function removeLegacyStockColumn(db: SQLite.SQLiteDatabase): Promise<boole
 async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
   const db = await SQLite.openDatabaseAsync("preventapro.db");
   await db.execAsync(LOCAL_SCHEMA);
+
+  await migrateClientsTableIfNeeded(db);
 
   const versionRows = await db.getAllAsync<{ user_version: number }>("PRAGMA user_version");
   const currentVersion = Number(versionRows[0]?.user_version ?? 0);

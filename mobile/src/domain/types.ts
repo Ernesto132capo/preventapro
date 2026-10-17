@@ -8,8 +8,10 @@ export interface Client {
   id: string;
   client_local_id: string | null;
   client_code: string | null;
-  business_name: string;
+  business_name: string | null;
+  name?: string | null;
   contact_name: string | null;
+  owner_name?: string | null;
   phone: string | null;
   neighborhood_id: string | null;
   neighborhood_name: string | null;

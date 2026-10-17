@@ -248,10 +248,18 @@ async function pushClient(row: OutboxRow) {
     return markDone(row.id);
   }
 
+  const effectiveBusinessName = (client.business_name || client.name || "").trim() || undefined;
+  const effectiveContactName = (client.contact_name || client.owner_name || "").trim() || undefined;
+
   const body = {
     clientLocalId: client.id,
-    businessName: client.business_name,
-    contactName: client.contact_name ?? undefined,
+    businessName: effectiveBusinessName,
+    business_name: effectiveBusinessName,
+    name: effectiveBusinessName,
+    contactName: effectiveContactName,
+    contact_name: effectiveContactName,
+    ownerName: effectiveContactName,
+    owner_name: effectiveContactName,
     phone: client.phone ?? undefined,
     address: client.address ?? undefined,
     lat: client.lat ?? undefined,

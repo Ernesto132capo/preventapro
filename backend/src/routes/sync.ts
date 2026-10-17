@@ -12,11 +12,15 @@ export const syncRouter = Router();
 syncRouter.use(requireAuth);
 
 function client(row: any) {
+  const bName = row.business_name ?? row.name ?? "";
+  const oName = row.contact_name ?? row.owner_name ?? null;
   return {
     id: row.id,
     client_local_id: row.client_local_id ?? null,
-    business_name: row.business_name ?? "",
-    contact_name: row.contact_name ?? null,
+    business_name: bName,
+    name: bName,
+    contact_name: oName,
+    owner_name: oName,
     phone: row.phone ?? null,
     neighborhood_id: row.neighborhood_id ?? null,
     address: row.address ?? null,
@@ -373,7 +377,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
         const clientMap = new Map<string, string>();
         for (const row of clientRows) {
-          const name = row.business_name || row.contact_name || "Cliente";
+          const name = row.business_name || row.name || row.contact_name || row.owner_name || "Cliente";
           clientMap.set(row.id, name);
           setBoundedCacheEntry(clientNameCache, row.id, name, MAX_CLIENT_NAME_CACHE_ENTRIES);
         }
@@ -382,11 +386,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           const uncachedIds = missingClientIds.filter((cid) => !clientNameCache.has(cid));
           if (uncachedIds.length > 0) {
             const { rows: fetchedClients } = await pool.query(
-              "SELECT id, business_name, contact_name FROM clients WHERE id = ANY($1)",
+              "SELECT id, business_name, contact_name, name, owner_name FROM clients WHERE id = ANY($1)",
               [uncachedIds]
             );
             for (const c of fetchedClients) {
-              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || c.contact_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
+              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || c.name || c.contact_name || c.owner_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
             }
           }
           for (const cid of missingClientIds) {
@@ -771,8 +775,8 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
 async function processClientSync(client: PoolClient, op: SyncOperationItem, userId: string): Promise<SyncOperationResult> {
   const localId = op.id || op.local_entity_id || op.localId || uuid();
   const data = op.data || op;
-  const businessName = String(data.businessName || data.business_name || "").trim();
-  const contactName = String(data.contactName || data.contact_name || "").trim();
+  const businessName = String(data.businessName || data.business_name || data.name || "").trim();
+  const contactName = String(data.contactName || data.contact_name || data.ownerName || data.owner_name || "").trim();
   if (!businessName && !contactName) {
     throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
   }
@@ -787,7 +791,9 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
   if (existing.length > 0) {
     const serverId = existing[0].id;
     await client.query(
-      `UPDATE clients SET business_name = $1, contact_name = $2, phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $8, updated_at = now()
+      `UPDATE clients SET
+         business_name = $1, name = $1, contact_name = $2, owner_name = $2,
+         phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $8, updated_at = now()
        WHERE id = $7`,
       [businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId, neighborhoodId]
     );
@@ -797,8 +803,9 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
   const serverId = uuid();
   await client.query(
     `INSERT INTO clients (
-       id, client_local_id, business_name, contact_name, phone, address, lat, lng, neighborhood_id, visit_status, active, created_by, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
+       id, client_local_id, business_name, name, contact_name, owner_name, phone, address, lat, lng,
+       neighborhood_id, visit_status, active, created_by, created_at, updated_at
+     ) VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
     [serverId, clientLocalId, businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, userId]
   );
   return { id: localId, serverId, entityType: "client", status: "synced" };

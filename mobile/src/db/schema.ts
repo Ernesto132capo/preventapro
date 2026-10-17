@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS clients (
   id TEXT PRIMARY KEY,
   server_id TEXT,
   business_name TEXT,
+  name TEXT,
   contact_name TEXT,
+  owner_name TEXT,
   phone TEXT,
   neighborhood_id TEXT,
   neighborhood_name TEXT,
@@ -169,9 +171,11 @@ CREATE INDEX IF NOT EXISTS idx_categories_name ON categories (name COLLATE NOCAS
 CREATE INDEX IF NOT EXISTS idx_categories_name_lower ON categories (lower(name));
 CREATE INDEX IF NOT EXISTS idx_categories_server_id ON categories (server_id);
 CREATE INDEX IF NOT EXISTS idx_clients_name ON clients (business_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_clients_name_alias ON clients (name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_clients_server_id ON clients (server_id);
 CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
 CREATE INDEX IF NOT EXISTS idx_clients_contact_name ON clients (contact_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_clients_owner_name ON clients (owner_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_clients_neighborhood ON clients (neighborhood_id);
 CREATE INDEX IF NOT EXISTS idx_products_name ON products (name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_products_sku ON products (sku);

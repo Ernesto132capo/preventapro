@@ -134,7 +134,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
   return row as LocalOrder;
 }
 
-export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(LocalOrder & { business_name?: string | null; contact_name?: string | null })[]> {
+export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(LocalOrder & { business_name?: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null })[]> {
   const db = await getDb();
   const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
     `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
@@ -142,7 +142,7 @@ export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(Loc
   );
   if (wd?.server_id) {
     return db.getAllAsync<any>(
-      `SELECT o.*, c.business_name, c.contact_name
+      `SELECT o.*, c.business_name, c.name, c.contact_name, c.owner_name
        FROM orders o
        LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
        WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?))
@@ -152,7 +152,7 @@ export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(Loc
     );
   }
   return db.getAllAsync<any>(
-    `SELECT o.*, c.business_name, c.contact_name
+    `SELECT o.*, c.business_name, c.name, c.contact_name, c.owner_name
      FROM orders o
      LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
      WHERE o.work_day_id = ? AND o.status = 'active'
@@ -234,7 +234,7 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
 export async function getOrderWithItems(orderId: string) {
   const db = await getDb();
   const order = await db.getFirstAsync<any>(
-    `SELECT o.*, c.business_name, c.contact_name
+    `SELECT o.*, c.business_name, c.name, c.contact_name, c.owner_name
      FROM orders o
      LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
      WHERE o.id = ? OR o.server_id = ?`,
@@ -288,12 +288,12 @@ export async function upsertOrderFromServer(serverOrder: any) {
     }
     const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
 
-    const localClient = await db.getFirstAsync<{ id: string; business_name: string }>(
-      `SELECT id, business_name FROM clients WHERE server_id = ? OR id = ?`,
+    const localClient = await db.getFirstAsync<{ id: string; business_name: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null }>(
+      `SELECT id, business_name, name, contact_name, owner_name FROM clients WHERE server_id = ? OR id = ?`,
       [serverOrder.client_id, serverOrder.client_id]
     );
     const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
-    const clientName = serverOrder.client_name || localClient?.business_name || "Cliente";
+    const clientName = serverOrder.client_name || (localClient ? formatClientDisplayName(localClient).primary : "Cliente");
 
     const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
       `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,

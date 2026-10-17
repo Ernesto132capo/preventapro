@@ -9,12 +9,28 @@ export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
 
 function serializeClient(row: any) {
+  const bName = row.business_name ?? row.name ?? "";
+  const oName = row.contact_name ?? row.owner_name ?? null;
   return {
-    id: row.id, server_id: row.id, client_local_id: row.client_local_id ?? null, client_code: row.client_code ?? null,
-    business_name: row.business_name ?? "", contact_name: row.contact_name ?? null, phone: row.phone ?? null,
-    neighborhood_id: row.neighborhood_id ?? null, neighborhood_name: row.neighborhood_name ?? null, address: row.address ?? null,
-    lat: row.lat ?? null, lng: row.lng ?? null, visit_status: row.visit_status ?? "pending", active: row.active === false ? 0 : 1,
-    sync_status: "synced", created_at: row.created_at, updated_at: row.updated_at,
+    id: row.id,
+    server_id: row.id,
+    client_local_id: row.client_local_id ?? null,
+    client_code: row.client_code ?? null,
+    business_name: bName,
+    name: bName,
+    contact_name: oName,
+    owner_name: oName,
+    phone: row.phone ?? null,
+    neighborhood_id: row.neighborhood_id ?? null,
+    neighborhood_name: row.neighborhood_name ?? null,
+    address: row.address ?? null,
+    lat: row.lat ?? null,
+    lng: row.lng ?? null,
+    visit_status: row.visit_status ?? "pending",
+    active: row.active === false ? 0 : 1,
+    sync_status: "synced",
+    created_at: row.created_at,
+    updated_at: row.updated_at,
   };
 }
 
@@ -23,8 +39,11 @@ const clientSchema = z.object({
   clientLocalId: z.string().uuid().optional(),
   businessName: z.string().trim().max(250).optional().nullable(),
   business_name: z.string().trim().max(250).optional().nullable(),
+  name: z.string().trim().max(250).optional().nullable(),
   contactName: optionalText,
   contact_name: optionalText,
+  ownerName: optionalText,
+  owner_name: optionalText,
   phone: z.string().trim().max(50).optional().nullable(),
   neighborhoodId: z.string().uuid().optional().nullable(),
   neighborhood_id: z.string().uuid().optional().nullable(),
@@ -33,8 +52,8 @@ const clientSchema = z.object({
   lng: z.number().finite().min(-180).max(180).optional().nullable(),
 }).refine(
   (data) => {
-    const b = (data.businessName || data.business_name || "").trim();
-    const c = (data.contactName || data.contact_name || "").trim();
+    const b = (data.businessName || data.business_name || data.name || "").trim();
+    const c = (data.contactName || data.contact_name || data.ownerName || data.owner_name || "").trim();
     return b.length > 0 || c.length > 0;
   },
   { message: "Debes ingresar al menos el nombre del negocio o el nombre del propietario", path: ["businessName"] }
@@ -55,7 +74,7 @@ clientsRouter.get("/", async (_req, res, next) => {
        FROM clients c
        LEFT JOIN neighborhoods n ON n.id = c.neighborhood_id
        WHERE c.active = true
-       ORDER BY COALESCE(NULLIF(c.business_name, ''), c.contact_name) ASC`
+       ORDER BY COALESCE(NULLIF(c.business_name, ''), NULLIF(c.name, ''), c.contact_name, c.owner_name, '') ASC`
     );
     res.json({ clients: rows.map(serializeClient) });
   } catch (err) {
@@ -70,8 +89,8 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
     return res.status(400).json({ error: errorMsg, details: parsed.error.flatten() });
   }
   const d = parsed.data;
-  const bName = (d.businessName || d.business_name || "").trim() || null;
-  const cName = (d.contactName || d.contact_name || "").trim() || null;
+  const bName = (d.businessName || d.business_name || d.name || "").trim() || null;
+  const cName = (d.contactName || d.contact_name || d.ownerName || d.owner_name || "").trim() || null;
   const phone = (d.phone || "").trim() || null;
   const nId = d.neighborhoodId || d.neighborhood_id || null;
 
@@ -96,9 +115,9 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
     const id = uuid(), ts = nowIso();
     const { rows } = await client.query(
       `INSERT INTO clients (
-         id, client_code, business_name, contact_name, phone, neighborhood_id, address, lat, lng,
+         id, client_code, business_name, name, contact_name, owner_name, phone, neighborhood_id, address, lat, lng,
          visit_status, active, assigned_user_id, created_by, client_local_id, created_at, updated_at
-       ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
+       ) VALUES ($1, NULL, $2, $2, $3, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
        RETURNING *`,
       [
         id, bName, cName, phone, nId,
@@ -129,8 +148,11 @@ clientsRouter.put("/:id", async (req, res, next) => {
       clientLocalId: z.string().uuid().optional(),
       businessName: z.string().trim().max(250).optional().nullable(),
       business_name: z.string().trim().max(250).optional().nullable(),
+      name: z.string().trim().max(250).optional().nullable(),
       contactName: optionalText,
       contact_name: optionalText,
+      ownerName: optionalText,
+      owner_name: optionalText,
       phone: z.string().trim().max(50).optional().nullable(),
       neighborhoodId: z.string().uuid().optional().nullable(),
       neighborhood_id: z.string().uuid().optional().nullable(),
@@ -146,13 +168,16 @@ clientsRouter.put("/:id", async (req, res, next) => {
     if (!current || current.active === false) return res.status(404).json({ error: "Cliente no encontrado." });
 
     const d = parsed.data;
-    const bGiven = d.businessName !== undefined ? d.businessName : d.business_name;
-    const cGiven = d.contactName !== undefined ? d.contactName : d.contact_name;
+    const bGiven = d.businessName !== undefined ? d.businessName : (d.business_name !== undefined ? d.business_name : d.name);
+    const cGiven = d.contactName !== undefined ? d.contactName : (d.contact_name !== undefined ? d.contact_name : (d.ownerName !== undefined ? d.ownerName : d.owner_name));
     const nGiven = d.neighborhoodId !== undefined ? d.neighborhoodId : d.neighborhood_id;
 
+    const currentBName = current.business_name || current.name;
+    const currentCName = current.contact_name || current.owner_name;
+
     const merged = {
-      business_name: bGiven !== undefined ? (bGiven?.trim() || null) : current.business_name,
-      contact_name: cGiven !== undefined ? (cGiven?.trim() || null) : current.contact_name,
+      business_name: bGiven !== undefined ? (bGiven?.trim() || null) : currentBName,
+      contact_name: cGiven !== undefined ? (cGiven?.trim() || null) : currentCName,
       phone: d.phone !== undefined ? (d.phone?.trim() || null) : current.phone,
       neighborhood_id: nGiven !== undefined ? nGiven : current.neighborhood_id,
       address: d.address !== undefined ? (d.address?.trim() || null) : current.address,
@@ -164,8 +189,9 @@ clientsRouter.put("/:id", async (req, res, next) => {
     }
     const ts = nowIso();
     const { rows } = await pool.query(
-      `UPDATE clients SET business_name = $2, contact_name = $3, phone = $4, neighborhood_id = $5,
-         address = $6, lat = $7, lng = $8, updated_at = $9
+      `UPDATE clients SET
+         business_name = $2, name = $2, contact_name = $3, owner_name = $3,
+         phone = $4, neighborhood_id = $5, address = $6, lat = $7, lng = $8, updated_at = $9
        WHERE id = $1
        RETURNING *`,
       [req.params.id, merged.business_name, merged.contact_name, merged.phone, merged.neighborhood_id, merged.address, merged.lat, merged.lng, ts]

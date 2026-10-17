@@ -1,8 +1,11 @@
 export interface ClientNameInfo {
   business_name?: string | null;
+  name?: string | null;
   contact_name?: string | null;
+  owner_name?: string | null;
   businessName?: string | null;
   contactName?: string | null;
+  ownerName?: string | null;
 }
 
 export interface FormattedClientName {
@@ -24,8 +27,8 @@ export interface FormattedClientName {
  *   secondary: null (sin líneas vacías)
  */
 export function formatClientDisplayName(client?: ClientNameInfo | null): FormattedClientName {
-  const bName = (client?.business_name || client?.businessName || "").trim();
-  const cName = (client?.contact_name || client?.contactName || "").trim();
+  const bName = (client?.business_name || client?.businessName || client?.name || "").trim();
+  const cName = (client?.contact_name || client?.contactName || client?.owner_name || client?.ownerName || "").trim();
 
   if (bName && cName) {
     return {
