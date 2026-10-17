@@ -99,76 +99,39 @@ async function removeLegacyStockColumn(db: SQLite.SQLiteDatabase): Promise<boole
   }
 }
 
-let txQueue: Promise<unknown> = Promise.resolve();
+let txQueue: Promise<void> = Promise.resolve();
 
-/**
- * Cola global serializada para transacciones SQLite (evita "cannot rollback - no transaction is active"
- * cuando dos tareas asíncronas ejecutan transacciones simultáneamente).
- * Soporta llamadas reentrantes mediante SAVEPOINT para evitar deadlocks cuando una función dentro
- * de un withTx invoca a otra que también usa withTx.
- */
 export async function withTx<T>(
   task: (db: SQLite.SQLiteDatabase) => Promise<T>,
   existingDb?: SQLite.SQLiteDatabase
 ): Promise<T> {
   const db = existingDb || (await getDb());
+  const prev = txQueue;
+  let release!: () => void;
+  txQueue = new Promise<void>((resolve) => (release = resolve));
 
-  // Compatibilidad con mocks de pruebas unitarias (Jest)
-  if (typeof (db as any).withTransactionAsync === "function" && typeof db.execAsync !== "function") {
-    return (db as any).withTransactionAsync(async () => task(db));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (typeof __DEV__ !== "undefined" && __DEV__) {
+    timer = setTimeout(() => {
+      console.warn("withTx: Espera por la cola de transacciones superó 10 segundos. Posible anidamiento o transacción bloqueada.");
+    }, 10000);
   }
 
-  // Soporte reentrante: si la conexión ya está en una transacción activa en este hilo
-  if ((db as any).__inTx) {
-    const depth = ((db as any).__txDepth || 0) + 1;
-    (db as any).__txDepth = depth;
-    const sp = `sp_${depth}`;
-    await db.execAsync(`SAVEPOINT ${sp}`);
-    try {
-      const res = await task(db);
-      await db.execAsync(`RELEASE SAVEPOINT ${sp}`);
-      return res;
-    } catch (err) {
-      try {
-        await db.execAsync(`ROLLBACK TO SAVEPOINT ${sp}`);
-      } catch {}
-      throw err;
-    } finally {
-      (db as any).__txDepth = depth - 1;
-    }
-  }
-
-  // Nivel superior: serialización en cola global
-  let releaseLock: () => void;
-  const lockPromise = new Promise<void>((resolve) => {
-    releaseLock = resolve;
-  });
-
-  const prevQueue = txQueue;
-  txQueue = txQueue.then(() => lockPromise, () => lockPromise);
-
-  await prevQueue;
+  await prev;
+  if (timer) clearTimeout(timer);
 
   try {
-    (db as any).__inTx = true;
-    (db as any).__txDepth = 0;
     await db.execAsync("BEGIN IMMEDIATE");
-    let result: T;
     try {
-      result = await task(db);
+      const result = await task(db);
       await db.execAsync("COMMIT");
       return result;
     } catch (err) {
-      try {
-        await db.execAsync("ROLLBACK");
-      } catch {}
+      try { await db.execAsync("ROLLBACK"); } catch {}
       throw err;
-    } finally {
-      (db as any).__inTx = false;
-      (db as any).__txDepth = 0;
     }
   } finally {
-    releaseLock!();
+    release();
   }
 }
 

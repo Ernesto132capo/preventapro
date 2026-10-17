@@ -266,146 +266,146 @@ export async function getOrderWithItems(orderId: string) {
   return { order, items: itemsWithSelections };
 }
 
-export async function upsertOrderFromServer(serverOrder: any, existingDb?: SQLiteDatabase) {
-  const db = existingDb || (await getDb());
-
-  await withTx(async () => {
-    let localWorkDay = await db.getFirstAsync<{ id: string }>(
-      `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
-      [serverOrder.work_day_id, serverOrder.work_day_id]
+export async function upsertOrderFromServerInTx(db: SQLiteDatabase, serverOrder: any): Promise<void> {
+  let localWorkDay = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
+    [serverOrder.work_day_id, serverOrder.work_day_id]
+  );
+  if (!localWorkDay) {
+    localWorkDay = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
     );
-    if (!localWorkDay) {
-      localWorkDay = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
-      );
-    }
-    const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
+  }
+  const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
 
-    const localClient = await db.getFirstAsync<{ id: string; business_name: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null }>(
-      `SELECT id, business_name, name, contact_name, owner_name FROM clients WHERE server_id = ? OR id = ?`,
-      [serverOrder.client_id, serverOrder.client_id]
+  const localClient = await db.getFirstAsync<{ id: string; business_name: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null }>(
+    `SELECT id, business_name, name, contact_name, owner_name FROM clients WHERE server_id = ? OR id = ?`,
+    [serverOrder.client_id, serverOrder.client_id]
+  );
+  const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
+  const clientName = serverOrder.client_name || (localClient ? formatClientDisplayName(localClient).primary : "Cliente");
+
+  const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
+    `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
+    [serverOrder.id, serverOrder.id]
+  );
+
+  if (existing && existing.sync_status === "pending") {
+    return;
+  }
+
+  const targetOrderId = existing ? existing.id : serverOrder.id;
+  await db.runAsync(
+    `INSERT INTO orders
+      (id, server_id, work_day_id, client_id, client_name, payment_condition,
+       subtotal_cents, tax_cents, total_cents, item_count, status, sync_status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       server_id = excluded.server_id,
+       work_day_id = excluded.work_day_id,
+       client_id = excluded.client_id,
+       client_name = excluded.client_name,
+       payment_condition = excluded.payment_condition,
+       subtotal_cents = excluded.subtotal_cents,
+       tax_cents = excluded.tax_cents,
+       total_cents = excluded.total_cents,
+       item_count = excluded.item_count,
+       status = excluded.status,
+       sync_status = 'synced',
+       updated_at = excluded.updated_at`,
+    [
+      targetOrderId,
+      serverOrder.id,
+      workDayLocalId,
+      clientLocalId,
+      clientName,
+      serverOrder.payment_condition || "Contado 48h",
+      serverOrder.subtotal_cents ?? 0,
+      serverOrder.tax_cents ?? 0,
+      serverOrder.total_cents ?? 0,
+      serverOrder.item_count ?? 0,
+      serverOrder.status || "active",
+      serverOrder.created_at || nowIso(),
+      serverOrder.updated_at || nowIso(),
+    ]
+  );
+
+  await db.runAsync(
+    `DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`,
+    [targetOrderId]
+  );
+  await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [targetOrderId]);
+
+  for (const it of serverOrder.items || []) {
+    const localProd = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM products WHERE server_id = ? OR id = ?`,
+      [it.product_id, it.product_id]
     );
-    const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
-    const clientName = serverOrder.client_name || (localClient ? formatClientDisplayName(localClient).primary : "Cliente");
-
-    const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
-      `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
-      [serverOrder.id, serverOrder.id]
+    const localPres = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+      [it.presentation_id, it.presentation_id]
     );
 
-    if (existing && existing.sync_status === "pending") {
-      return;
-    }
+    const targetItemId = it.id || uuid();
 
-    const targetOrderId = existing ? existing.id : serverOrder.id;
     await db.runAsync(
-      `INSERT INTO orders
-        (id, server_id, work_day_id, client_id, client_name, payment_condition,
-         subtotal_cents, tax_cents, total_cents, item_count, status, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         server_id = excluded.server_id,
-         work_day_id = excluded.work_day_id,
-         client_id = excluded.client_id,
-         client_name = excluded.client_name,
-         payment_condition = excluded.payment_condition,
-         subtotal_cents = excluded.subtotal_cents,
-         tax_cents = excluded.tax_cents,
-         total_cents = excluded.total_cents,
-         item_count = excluded.item_count,
-         status = excluded.status,
-         sync_status = 'synced',
-         updated_at = excluded.updated_at`,
+      `INSERT INTO order_items
+        (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
+         presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot,
+         quantity, subtotal_cents)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
+        targetItemId,
         targetOrderId,
-        serverOrder.id,
-        workDayLocalId,
-        clientLocalId,
-        clientName,
-        serverOrder.payment_condition || "Contado 48h",
-        serverOrder.subtotal_cents ?? 0,
-        serverOrder.tax_cents ?? 0,
-        serverOrder.total_cents ?? 0,
-        serverOrder.item_count ?? 0,
-        serverOrder.status || "active",
-        serverOrder.created_at || nowIso(),
-        serverOrder.updated_at || nowIso(),
+        localProd ? localProd.id : it.product_id,
+        localPres ? localPres.id : it.presentation_id,
+        it.product_name_snapshot || "",
+        it.sku_snapshot || "",
+        it.presentation_name_snapshot || "",
+        it.unit_equivalence_snapshot ?? 1,
+        it.unit_price_cents_snapshot ?? 0,
+        it.quantity ?? 0,
+        it.subtotal_cents ?? 0,
       ]
     );
 
-    await db.runAsync(
-      `DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`,
-      [targetOrderId]
-    );
-    await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [targetOrderId]);
+    if (it.selections && Array.isArray(it.selections)) {
+      for (let sIdx = 0; sIdx < it.selections.length; sIdx++) {
+        const sel = it.selections[sIdx];
+        const selLocalProd = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM products WHERE server_id = ? OR id = ?`,
+          [sel.selected_product_id, sel.selected_product_id]
+        );
+        const selLocalPres = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+          [sel.selected_presentation_id, sel.selected_presentation_id]
+        );
 
-    for (const it of serverOrder.items || []) {
-      const localProd = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM products WHERE server_id = ? OR id = ?`,
-        [it.product_id, it.product_id]
-      );
-      const localPres = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
-        [it.presentation_id, it.presentation_id]
-      );
-
-      const targetItemId = it.id || uuid();
-
-      await db.runAsync(
-        `INSERT INTO order_items
-          (id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
-           presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot,
-           quantity, subtotal_cents)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          targetItemId,
-          targetOrderId,
-          localProd ? localProd.id : it.product_id,
-          localPres ? localPres.id : it.presentation_id,
-          it.product_name_snapshot || "",
-          it.sku_snapshot || "",
-          it.presentation_name_snapshot || "",
-          it.unit_equivalence_snapshot ?? 1,
-          it.unit_price_cents_snapshot ?? 0,
-          it.quantity ?? 0,
-          it.subtotal_cents ?? 0,
-        ]
-      );
-
-      if (it.selections && Array.isArray(it.selections)) {
-        for (let sIdx = 0; sIdx < it.selections.length; sIdx++) {
-          const sel = it.selections[sIdx];
-          const selLocalProd = await db.getFirstAsync<{ id: string }>(
-            `SELECT id FROM products WHERE server_id = ? OR id = ?`,
-            [sel.selected_product_id, sel.selected_product_id]
-          );
-          const selLocalPres = await db.getFirstAsync<{ id: string }>(
-            `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
-            [sel.selected_presentation_id, sel.selected_presentation_id]
-          );
-
-          await db.runAsync(
-            `INSERT INTO order_item_selections
-              (id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
-               presentation_name_snapshot, quantity, sort_order)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              sel.id || uuid(),
-              targetItemId,
-              selLocalProd ? selLocalProd.id : sel.selected_product_id,
-              selLocalPres ? selLocalPres.id : sel.selected_presentation_id,
-              sel.product_name_snapshot || "",
-              sel.presentation_name_snapshot || "",
-              sel.quantity ?? 1,
-              sel.sort_order ?? sIdx,
-            ]
-          );
-        }
+        await db.runAsync(
+          `INSERT INTO order_item_selections
+            (id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
+             presentation_name_snapshot, quantity, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            sel.id || uuid(),
+            targetItemId,
+            selLocalProd ? selLocalProd.id : sel.selected_product_id,
+            selLocalPres ? selLocalPres.id : sel.selected_presentation_id,
+            sel.product_name_snapshot || "",
+            sel.presentation_name_snapshot || "",
+            sel.quantity ?? 1,
+            sel.sort_order ?? sIdx,
+          ]
+        );
       }
     }
+  }
 
-    await refreshWorkDayTotals(db, workDayLocalId);
-  });
+  await refreshWorkDayTotals(db, workDayLocalId);
+}
+
+export async function upsertOrderFromServer(serverOrder: any): Promise<void> {
+  await withTx((db) => upsertOrderFromServerInTx(db, serverOrder));
 }
 
 /** Reemplaza los artículos de una preventa abierta. */

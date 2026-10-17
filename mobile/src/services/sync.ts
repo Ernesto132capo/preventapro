@@ -20,7 +20,7 @@ import {
   remapProductReferences,
   remapCategoryReferences,
 } from "../db/repositories/products";
-import { markOrderSynced, markOrderFailed, upsertOrderFromServer } from "../db/repositories/orders";
+import { markOrderSynced, markOrderFailed, upsertOrderFromServerInTx } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay, markWorkDayClosed } from "../db/repositories/workdays";
 
 export interface SyncResult {
@@ -52,105 +52,140 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
     }
   }
 
+function chunkArray(items: any[], size = 200): any[][] {
+  const chunks: any[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
   const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}${force ? "&force=1" : ""}`);
 
-  // Agrupar todas las inserciones del pull en una sola transacción atómica serializada
-  await withTx(async (txDb) => {
-    if (data.categories && Array.isArray(data.categories)) {
-      for (const cat of data.categories) {
-        await upsertCategoryFromServer(cat);
-      }
+  // 1. Actualizar la jornada local de hoy y las jornadas compartidas FUERA de withTx (antes del catálogo)
+  // para que upsertOrderFromServerInTx encuentre siempre su jornada local sin deadlocks de candado.
+  if (data.workDay) {
+    const todayLocal = await getTodayWorkDay(userId);
+    await upsertServerWorkDay(todayLocal.id, data.workDay);
+  }
+
+  if (data.workDays && Array.isArray(data.workDays)) {
+    for (const wd of data.workDays) {
+      await upsertServerWorkDay(wd.id, wd);
     }
+  }
 
-    for (const c of data.clients) await upsertClientFromServer(c);
+  // 2. Procesar entidades en lotes de hasta 200 filas por transacción para no bloquear escrituras
+  if (data.categories && Array.isArray(data.categories)) {
+    for (const chunk of chunkArray(data.categories, 200)) {
+      await withTx(async () => {
+        for (const cat of chunk) {
+          await upsertCategoryFromServer(cat);
+        }
+      });
+    }
+  }
 
-    // Agrupar presentaciones por producto para reusar upsertProductFromServer
+  if (data.clients && Array.isArray(data.clients)) {
+    for (const chunk of chunkArray(data.clients, 200)) {
+      await withTx(async () => {
+        for (const c of chunk) {
+          await upsertClientFromServer(c);
+        }
+      });
+    }
+  }
+
+  if (data.products && Array.isArray(data.products)) {
     const presByProduct: Record<string, any[]> = {};
-    for (const p of data.presentations) {
+    for (const p of data.presentations || []) {
       presByProduct[p.product_id] = presByProduct[p.product_id] || [];
       presByProduct[p.product_id].push(p);
     }
-    for (const prod of data.products) {
-      const presentations = presByProduct[prod.id] || [];
-      await upsertProductFromServer({ ...prod, presentations });
-    }
-
-    // Integrar definiciones y opciones de combos
-    if (data.comboDefinitions && Array.isArray(data.comboDefinitions)) {
-      for (const cd of data.comboDefinitions) {
-        const localProd = await txDb.getFirstAsync<{ id: string; sync_status: string }>(
-          `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
-          [cd.product_id, cd.product_id]
-        );
-        if (localProd && localProd.sync_status === "pending") {
-          continue;
+    for (const chunk of chunkArray(data.products, 200)) {
+      await withTx(async () => {
+        for (const prod of chunk) {
+          const presentations = presByProduct[prod.id] || [];
+          await upsertProductFromServer({ ...prod, presentations });
         }
-        const targetProdId = localProd ? localProd.id : cd.product_id;
-        const existingDef = await txDb.getFirstAsync<{ id: string }>(
-          `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
-          [cd.id, targetProdId, cd.id]
-        );
-        const targetDefId = existingDef ? existingDef.id : cd.id;
-        await txDb.runAsync(
-          `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
-           VALUES (?, ?, ?, ?, ?, ?, 'synced')
-           ON CONFLICT(id) DO UPDATE SET
-             server_id = excluded.server_id, product_id = excluded.product_id,
-             selection_min = excluded.selection_min, selection_max = excluded.selection_max,
-             active = excluded.active, sync_status = 'synced'`,
-          [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
-        );
-      }
+      });
     }
+  }
 
-    if (data.comboOptions && Array.isArray(data.comboOptions)) {
-      for (const co of data.comboOptions) {
-        const localPres = await txDb.getFirstAsync<{ id: string }>(
-          `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
-          [co.presentation_id, co.presentation_id]
-        );
-        const targetPresId = localPres ? localPres.id : co.presentation_id;
-        const localDef = await txDb.getFirstAsync<{ id: string }>(
-          `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
-          [co.combo_id, co.combo_id]
-        );
-        const targetComboId = localDef ? localDef.id : co.combo_id;
-        const existingOpt = await txDb.getFirstAsync<{ id: string }>(
-          `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
-          [co.id, co.id, targetComboId, targetPresId]
-        );
-        const targetOptId = existingOpt ? existingOpt.id : co.id;
-        await txDb.runAsync(
-          `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
-           ON CONFLICT(id) DO UPDATE SET
-             server_id = excluded.server_id, combo_id = excluded.combo_id,
-             presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
-             sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
-          [targetOptId, co.id, targetComboId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
-        );
-      }
+  if (data.comboDefinitions && Array.isArray(data.comboDefinitions)) {
+    for (const chunk of chunkArray(data.comboDefinitions, 200)) {
+      await withTx(async (txDb) => {
+        for (const cd of chunk) {
+          const localProd = await txDb.getFirstAsync<{ id: string; sync_status: string }>(
+            `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
+            [cd.product_id, cd.product_id]
+          );
+          if (localProd && localProd.sync_status === "pending") {
+            continue;
+          }
+          const targetProdId = localProd ? localProd.id : cd.product_id;
+          const existingDef = await txDb.getFirstAsync<{ id: string }>(
+            `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
+            [cd.id, targetProdId, cd.id]
+          );
+          const targetDefId = existingDef ? existingDef.id : cd.id;
+          await txDb.runAsync(
+            `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
+             VALUES (?, ?, ?, ?, ?, ?, 'synced')
+             ON CONFLICT(id) DO UPDATE SET
+               server_id = excluded.server_id, product_id = excluded.product_id,
+               selection_min = excluded.selection_min, selection_max = excluded.selection_max,
+               active = excluded.active, sync_status = 'synced'`,
+            [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
+          );
+        }
+      });
     }
+  }
 
-    // Descargar e integrar preventas de la jornada del preventista autenticado.
-    if (data.orders && Array.isArray(data.orders)) {
-      for (const o of data.orders) {
-        await upsertOrderFromServer(o, txDb);
-      }
+  if (data.comboOptions && Array.isArray(data.comboOptions)) {
+    for (const chunk of chunkArray(data.comboOptions, 200)) {
+      await withTx(async (txDb) => {
+        for (const co of chunk) {
+          const localPres = await txDb.getFirstAsync<{ id: string }>(
+            `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+            [co.presentation_id, co.presentation_id]
+          );
+          const targetPresId = localPres ? localPres.id : co.presentation_id;
+          const localDef = await txDb.getFirstAsync<{ id: string }>(
+            `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
+            [co.combo_id, co.combo_id]
+          );
+          const targetComboId = localDef ? localDef.id : co.combo_id;
+          const existingOpt = await txDb.getFirstAsync<{ id: string }>(
+            `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+            [co.id, co.id, targetComboId, targetPresId]
+          );
+          const targetOptId = existingOpt ? existingOpt.id : co.id;
+          await txDb.runAsync(
+            `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
+             ON CONFLICT(id) DO UPDATE SET
+               server_id = excluded.server_id, combo_id = excluded.combo_id,
+               presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
+               sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
+            [targetOptId, co.id, targetComboId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
+          );
+        }
+      });
     }
+  }
 
-    // Actualizar la jornada local de hoy y las jornadas compartidas si vinieron en el pull.
-    if (data.workDay) {
-      const todayLocal = await getTodayWorkDay(userId);
-      await upsertServerWorkDay(todayLocal.id, data.workDay);
+  // Descargar e integrar preventas de la jornada usando upsertOrderFromServerInTx
+  if (data.orders && Array.isArray(data.orders)) {
+    for (const chunk of chunkArray(data.orders, 200)) {
+      await withTx(async (txDb) => {
+        for (const o of chunk) {
+          await upsertOrderFromServerInTx(txDb, o);
+        }
+      });
     }
-
-    if (data.workDays && Array.isArray(data.workDays)) {
-      for (const wd of data.workDays) {
-        await upsertServerWorkDay(wd.id, wd);
-      }
-    }
-  });
+  }
 
   // Guardar siempre el cursor real del servidor (timestamp más fresco)
   // para que las próximas recargas usen el since incremental y no 1970.
@@ -158,7 +193,7 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
   if (newCursor) {
     await setMeta("last_pull_at", newCursor);
   }
-  return { clients: data.clients.length, products: data.products.length };
+  return { clients: data.clients ? data.clients.length : 0, products: data.products ? data.products.length : 0 };
 }
 
 /**

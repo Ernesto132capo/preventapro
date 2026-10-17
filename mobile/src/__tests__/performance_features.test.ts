@@ -462,17 +462,15 @@ const mockDb = {
     return null;
   }),
 
-  withTransactionAsync: jest.fn(async (callback: () => Promise<any>) => {
-    return await callback();
-  }),
-
   execAsync: jest.fn(async () => {}),
 };
+
+const mockWithTx = jest.fn(async (cb: (db: any) => Promise<any>) => cb(mockDb));
 
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: jest.fn(() => new Date().toISOString()),
-  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
+  withTx: (cb: any) => mockWithTx(cb),
 }));
 
 describe("Performance utilities & enhancements", () => {

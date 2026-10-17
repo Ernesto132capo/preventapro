@@ -32,29 +32,6 @@ export async function migrateClientsTableIfNeeded(db: SqliteDbLike): Promise<voi
   const nameNotNull = nameCol?.notnull === 1;
 
   if (businessNameNotNull || nameNotNull || !hasOwnerName || !hasName) {
-    await db.execAsync("PRAGMA foreign_keys = OFF;");
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS clients_new (
-        id TEXT PRIMARY KEY,
-        server_id TEXT,
-        business_name TEXT,
-        name TEXT,
-        contact_name TEXT,
-        owner_name TEXT,
-        phone TEXT,
-        neighborhood_id TEXT,
-        neighborhood_name TEXT,
-        address TEXT,
-        lat REAL,
-        lng REAL,
-        visit_status TEXT NOT NULL DEFAULT 'pending',
-        active INTEGER NOT NULL DEFAULT 1,
-        sync_status TEXT NOT NULL DEFAULT 'synced',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-
     const bNameExpr = colMap.has("business_name")
       ? (colMap.has("name") ? "COALESCE(business_name, name)" : "business_name")
       : (colMap.has("name") ? "name" : "NULL");
@@ -84,9 +61,30 @@ export async function migrateClientsTableIfNeeded(db: SqliteDbLike): Promise<voi
     const updatedExpr = colMap.has("updated_at") ? "updated_at" : "datetime('now')";
     const serverIdExpr = colMap.has("server_id") ? "server_id" : "NULL";
 
+    await db.execAsync("PRAGMA foreign_keys = OFF;");
     try {
       await db.execAsync(`
         BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS clients_new;
+        CREATE TABLE clients_new (
+          id TEXT PRIMARY KEY,
+          server_id TEXT,
+          business_name TEXT,
+          name TEXT,
+          contact_name TEXT,
+          owner_name TEXT,
+          phone TEXT,
+          neighborhood_id TEXT,
+          neighborhood_name TEXT,
+          address TEXT,
+          lat REAL,
+          lng REAL,
+          visit_status TEXT NOT NULL DEFAULT 'pending',
+          active INTEGER NOT NULL DEFAULT 1,
+          sync_status TEXT NOT NULL DEFAULT 'synced',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         INSERT INTO clients_new (
           id, server_id, business_name, name, contact_name, owner_name,
           phone, neighborhood_id, neighborhood_name, address, lat, lng,
@@ -100,16 +98,16 @@ export async function migrateClientsTableIfNeeded(db: SqliteDbLike): Promise<voi
         DROP TABLE clients;
         ALTER TABLE clients_new RENAME TO clients;
         COMMIT;
-        PRAGMA foreign_keys = ON;
       `);
     } catch (migErr) {
       try {
         await db.execAsync("ROLLBACK;");
       } catch {}
+      throw migErr;
+    } finally {
       try {
         await db.execAsync("PRAGMA foreign_keys = ON;");
       } catch {}
-      throw migErr;
     }
   }
 

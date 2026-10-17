@@ -459,15 +459,15 @@ const mockDb = {
     return [];
   }),
 
-  withTransactionAsync: jest.fn(async (callback: () => Promise<any>) => {
-    return await callback();
-  }),
+  execAsync: jest.fn(async (_sql: string) => {}),
 };
+
+const mockWithTx = jest.fn(async (cb: (db: any) => Promise<any>) => cb(mockDb));
 
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: jest.fn(() => "2026-10-16T12:00:00.000Z"),
-  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
+  withTx: (cb: any) => mockWithTx(cb),
 }));
 
 describe("Repositories & Outbox Atomicity", () => {
@@ -479,7 +479,7 @@ describe("Repositories & Outbox Atomicity", () => {
   describe("Categories Repository", () => {
     it("crea categoría y encola en outbox de manera atómica con transacción", async () => {
       const cat = await createCategoryLocal("Bebidas");
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(cat.name).toBe("Bebidas");
       expect(cat.active).toBe(1);
 
@@ -494,7 +494,7 @@ describe("Repositories & Outbox Atomicity", () => {
       jest.clearAllMocks();
 
       const updated = await updateCategoryLocal(created.id, "Lácteos y Derivados");
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(updated.name).toBe("Lácteos y Derivados");
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === created.id && o.operation === "update");
@@ -534,7 +534,7 @@ describe("Repositories & Outbox Atomicity", () => {
       jest.clearAllMocks();
       await deleteCategoryLocal(cat.id);
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
 
       // La categoría queda inactiva
       const deletedCat = state.categories.find((c) => c.id === cat.id);
@@ -560,7 +560,7 @@ describe("Repositories & Outbox Atomicity", () => {
         phone: "70012345",
       });
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(client.business_name).toBe("Abarrotes Don Pepe");
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === client.id);
@@ -578,7 +578,7 @@ describe("Repositories & Outbox Atomicity", () => {
         phone: "77788899",
       });
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(updated.business_name).toBe("Tienda Renombrada");
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "update");
@@ -593,7 +593,7 @@ describe("Repositories & Outbox Atomicity", () => {
 
       await deleteClientLocal(client.id);
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       const local = state.clients.find((c) => c.id === client.id);
       expect(local?.active).toBe(0);
 
@@ -610,7 +610,7 @@ describe("Repositories & Outbox Atomicity", () => {
 
       await deleteClientLocal(client.id);
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       const local = state.clients.find((c) => c.id === client.id);
       expect(local?.active).toBe(0);
 
@@ -670,7 +670,7 @@ describe("Repositories & Outbox Atomicity", () => {
       await migrateClientsTableIfNeeded(fakeDb);
 
       expect(executedSql.some((s) => s.includes("PRAGMA foreign_keys = OFF;"))).toBe(true);
-      expect(executedSql.some((s) => s.includes("CREATE TABLE IF NOT EXISTS clients_new"))).toBe(true);
+      expect(executedSql.some((s) => s.includes("CREATE TABLE clients_new"))).toBe(true);
       expect(executedSql.some((s) => s.includes("INSERT INTO clients_new"))).toBe(true);
       expect(executedSql.some((s) => s.includes("DROP TABLE clients;"))).toBe(true);
       expect(executedSql.some((s) => s.includes("ALTER TABLE clients_new RENAME TO clients;"))).toBe(true);
@@ -771,7 +771,7 @@ describe("Repositories & Outbox Atomicity", () => {
         presentations: [{ name: "Unidad", unitEquivalence: 1, priceCents: 1500, costCents: 1200 }],
       });
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(product.name).toBe("Aceite 1L");
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === product.id);
@@ -789,7 +789,7 @@ describe("Repositories & Outbox Atomicity", () => {
 
       await deleteProductLocal(product.id);
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       const local = state.products.find((p) => p.id === product.id);
       expect(local?.active).toBe(0);
 

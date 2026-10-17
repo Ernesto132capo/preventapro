@@ -9,9 +9,7 @@ const mockState = {
 };
 
 const mockDb = {
-  withTransactionAsync: jest.fn(async (cb: () => Promise<any>) => {
-    return await cb();
-  }),
+  execAsync: jest.fn(async () => {}),
   runAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
@@ -98,10 +96,12 @@ const mockDb = {
   }),
 };
 
+const mockWithTx = jest.fn(async (cb: (db: any) => Promise<any>) => cb(mockDb));
+
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: () => "2026-10-16T12:00:00.000Z",
-  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
+  withTx: (cb: any) => mockWithTx(cb),
 }));
 
 jest.mock("../db/outbox", () => ({
@@ -141,7 +141,7 @@ describe("Hardenings Batch Suite (M-15, M-19, A-14)", () => {
   });
 
   describe("[M-19] mergeDuplicateClients Transactional Safety", () => {
-    it("should merge duplicate clients inside withTransactionAsync atomically", async () => {
+    it("should merge duplicate clients inside withTx atomically", async () => {
       // Two client rows with same server_id
       mockState.clients.push(
         { id: "local-1", server_id: "srv-client-99", business_name: "Tienda A", active: 1, created_at: "2026-10-10" },
@@ -152,7 +152,7 @@ describe("Hardenings Batch Suite (M-15, M-19, A-14)", () => {
 
       const removedCount = await mergeDuplicateClients();
 
-      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      expect(mockWithTx).toHaveBeenCalled();
       expect(removedCount).toBe(1);
       // Order should now point to canonical client local-2 (which had orders)
       expect(mockState.orders[0].client_id).toBe("local-2");
