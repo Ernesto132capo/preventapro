@@ -6,6 +6,7 @@ export interface AuthedRequest extends Request {
   userId?: string; // id de la fila en la tabla "users" de Neon
   userCode?: string;
   userRole?: string;
+  sessionId?: string;
 }
 
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -14,7 +15,7 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
     return res.status(401).json({ error: "No autenticado. Token faltante." });
   }
   const idToken = header.slice("Bearer ".length);
-  let decoded: { uid: string };
+  let decoded: { uid: string; sid?: string };
   try {
     decoded = verifyAccessToken(idToken);
   } catch {
@@ -22,18 +23,41 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
   }
 
   try {
-    const { rows } = await pool.query(
-      "SELECT active, code, COALESCE(role, 'preventista') AS role FROM users WHERE id = $1",
-      [decoded.uid]
-    );
-    const user = rows[0];
-    if (!user || user.active === false) {
-      return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
+    if (decoded.sid) {
+      const { rows } = await pool.query(
+        `SELECT u.active, u.code, COALESCE(u.role, 'preventista') AS role,
+                s.active AS session_active
+         FROM users u
+         LEFT JOIN user_sessions s ON s.id = $2 AND s.user_id = u.id
+         WHERE u.id = $1`,
+        [decoded.uid, decoded.sid]
+      );
+      const row = rows[0];
+      if (!row || row.active === false) {
+        return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
+      }
+      if (row.session_active === false) {
+        return res.status(401).json({ error: "Sesión revocada o cerrada." });
+      }
+      req.userId = decoded.uid;
+      req.userCode = row.code;
+      req.userRole = row.role || "preventista";
+      req.sessionId = decoded.sid;
+      next();
+    } else {
+      const { rows } = await pool.query(
+        "SELECT active, code, COALESCE(role, 'preventista') AS role FROM users WHERE id = $1",
+        [decoded.uid]
+      );
+      const user = rows[0];
+      if (!user || user.active === false) {
+        return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
+      }
+      req.userId = decoded.uid;
+      req.userCode = user.code;
+      req.userRole = user.role || "preventista";
+      next();
     }
-    req.userId = decoded.uid;
-    req.userCode = user.code;
-    req.userRole = user.role || "preventista";
-    next();
   } catch (dbErr) {
     console.error("Error de base de datos en requireAuth:", dbErr);
     return res.status(503).json({ error: "Error de conexión con la base de datos. Intente más tarde." });

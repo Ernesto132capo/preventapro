@@ -291,6 +291,23 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    id: "008_user_sessions",
+    description: "Crear tabla user_sessions para sesiones activas y revocables por dispositivo",
+    run: async (client: PoolClient) => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS user_sessions (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_name TEXT NOT NULL DEFAULT 'Dispositivo Móvil',
+          active BOOLEAN NOT NULL DEFAULT true,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_user_active ON user_sessions(user_id, active);
+      `);
+    },
+  },
 ];
 
 async function ensureMigrationsTable(client: PoolClient): Promise<void> {

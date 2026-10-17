@@ -1103,6 +1103,175 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       expect(resBlocked.status).toBe(429);
       expect(resBlocked.body.error).toContain("Demasiados intentos");
     });
+
+    it("POST /auth/login crea sesión en user_sessions y emite token con sid", async () => {
+      const authApp = express();
+      authApp.use(express.json());
+      authApp.use("/auth", authRouter);
+
+      const passHash = await hashPassword("secreto123");
+      let sessionInserted: any = null;
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users")) {
+          return {
+            rows: [
+              {
+                id: "usr-david",
+                code: "david",
+                real_email: "david@preventapro.bo",
+                full_name: "David",
+                active: true,
+                password_hash: passHash,
+              },
+            ],
+          };
+        }
+        if (sql.includes("INSERT INTO user_sessions")) {
+          sessionInserted = {
+            id: params[0],
+            userId: params[1],
+            deviceName: params[2],
+          };
+          return { rows: [] };
+        }
+        return { rows: [] };
+      });
+
+      const res = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "david", password: "secreto123", deviceName: "Samsung Galaxy S22" },
+        ip: "10.30.1.1",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.sessionId).toBeDefined();
+      expect(sessionInserted).toBeDefined();
+      expect(sessionInserted.id).toBe(res.body.sessionId);
+      expect(sessionInserted.deviceName).toBe("Samsung Galaxy S22");
+
+      const { verifyAccessToken } = await vi.importActual<any>("../services/auth");
+      const decoded = verifyAccessToken(res.body.accessToken);
+      expect(decoded.uid).toBe("usr-david");
+      expect(decoded.sid).toBe(res.body.sessionId);
+    });
+
+    it("requireAuth valida que la sesión esté activa y rechaza con 401 si fue revocada", async () => {
+      const { requireAuth: realRequireAuth } = await vi.importActual<any>("../middleware/auth");
+      const { createAccessToken } = await vi.importActual<any>("../services/auth");
+
+      const activeToken = createAccessToken("usr-david", "sess-1");
+      const revokedToken = createAccessToken("usr-david", "sess-revoked");
+
+      // 1. Sesión activa
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users u") && sql.includes("user_sessions s")) {
+          const sessId = params[1];
+          if (sessId === "sess-1") {
+            return {
+              rows: [{ id: "usr-david", active: true, code: "david", role: "preventista", session_active: true }],
+            };
+          }
+          if (sessId === "sess-revoked") {
+            return {
+              rows: [{ id: "usr-david", active: true, code: "david", role: "preventista", session_active: false }],
+            };
+          }
+        }
+        return { rows: [] };
+      });
+
+      const fakeReqActive = { headers: { authorization: `Bearer ${activeToken}` } } as any;
+      const fakeResActive = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+      const nextActive = vi.fn();
+
+      await realRequireAuth(fakeReqActive, fakeResActive, nextActive);
+      expect(nextActive).toHaveBeenCalled();
+      expect(fakeReqActive.userId).toBe("usr-david");
+      expect(fakeReqActive.sessionId).toBe("sess-1");
+
+      // 2. Sesión revocada
+      let revokedStatus = 0;
+      let revokedJson: any = null;
+      const fakeReqRevoked = { headers: { authorization: `Bearer ${revokedToken}` } } as any;
+      const fakeResRevoked = {
+        status(code: number) {
+          revokedStatus = code;
+          return fakeResRevoked;
+        },
+        json(data: any) {
+          revokedJson = data;
+          return fakeResRevoked;
+        },
+      } as any;
+      const nextRevoked = vi.fn();
+
+      await realRequireAuth(fakeReqRevoked, fakeResRevoked, nextRevoked);
+      expect(nextRevoked).not.toHaveBeenCalled();
+      expect(revokedStatus).toBe(401);
+      expect(revokedJson.error).toContain("Sesión revocada o cerrada");
+    });
+
+    it("endpoints de sesiones: GET /sessions, POST /revoke-others y POST /logout funcionan", async () => {
+      let revokedOthers = false;
+      let loggedOut = false;
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM user_sessions") && !sql.includes("UPDATE") && !sql.includes("INSERT")) {
+          return {
+            rows: [
+              { id: "sess-curr", device_name: "Pixel 7", active: true, created_at: "2026-10-17T12:00:00Z", last_seen_at: "2026-10-17T12:00:00Z" },
+              { id: "sess-old", device_name: "Tablet", active: true, created_at: "2026-10-15T10:00:00Z", last_seen_at: "2026-10-16T10:00:00Z" },
+            ],
+          };
+        }
+        if (sql.includes("UPDATE user_sessions SET active = false") && sql.includes("id != $2")) {
+          revokedOthers = true;
+          return { rowCount: 1 };
+        }
+        if (sql.includes("UPDATE user_sessions SET active = false") && sql.includes("id = $1")) {
+          loggedOut = true;
+          return { rowCount: 1 };
+        }
+        return { rows: [] };
+      });
+
+      const appWithSession = express();
+      appWithSession.use(express.json());
+      appWithSession.use((req: any, _res: any, next: any) => {
+        req.userId = "usr-david";
+        req.sessionId = "sess-curr";
+        next();
+      });
+      appWithSession.use("/auth", authRouter);
+
+      // GET /auth/sessions
+      const resSessions = await makeRequest(appWithSession, {
+        method: "GET",
+        url: "/auth/sessions",
+      });
+      expect(resSessions.status).toBe(200);
+      expect(resSessions.body.sessions).toHaveLength(2);
+      expect(resSessions.body.sessions[0].isCurrent).toBe(true);
+      expect(resSessions.body.sessions[1].isCurrent).toBe(false);
+
+      // POST /auth/sessions/revoke-others
+      const resRevoke = await makeRequest(appWithSession, {
+        method: "POST",
+        url: "/auth/sessions/revoke-others",
+      });
+      expect(resRevoke.status).toBe(200);
+      expect(revokedOthers).toBe(true);
+
+      // POST /auth/logout
+      const resLogout = await makeRequest(appWithSession, {
+        method: "POST",
+        url: "/auth/logout",
+      });
+      expect(resLogout.status).toBe(200);
+      expect(loggedOut).toBe(true);
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────────

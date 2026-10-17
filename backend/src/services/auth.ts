@@ -75,17 +75,29 @@ function verifySignedToken(token: string): Record<string, any> {
   return payload;
 }
 
-export function createAccessToken(userId: string): string {
+export function createAccessToken(userId: string, sessionId?: string): string {
   const now = Math.floor(Date.now() / 1000);
-  return createSignedToken({ typ: "access", sub: userId, iat: now, exp: now + ACCESS_TOKEN_TTL_SECONDS });
+  const payload: Record<string, unknown> = {
+    typ: "access",
+    sub: userId,
+    iat: now,
+    exp: now + ACCESS_TOKEN_TTL_SECONDS,
+  };
+  if (sessionId) {
+    payload.sid = sessionId;
+  }
+  return createSignedToken(payload);
 }
 
-export function verifyAccessToken(token: string): { uid: string } {
+export function verifyAccessToken(token: string): { uid: string; sid?: string } {
   const payload = verifySignedToken(token);
   if (payload.typ !== "access" || typeof payload.sub !== "string" || !payload.sub) {
     throw new Error("Token inválido.");
   }
-  return { uid: payload.sub };
+  return {
+    uid: payload.sub,
+    sid: typeof payload.sid === "string" ? payload.sid : undefined,
+  };
 }
 
 export function createReportDownloadToken(workDayId: string): string {
