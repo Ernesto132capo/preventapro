@@ -342,7 +342,9 @@ export function NewSaleScreen() {
       if (editingOrderId) navigation.goBack();
       else navigation.navigate("Registros");
     } catch (err: any) {
-      setError(err.message || "No se pudo guardar la preventa.");
+      const msg = err.message || "No se pudo guardar la preventa.";
+      setError(msg);
+      Alert.alert("Error al guardar", msg);
     } finally {
       saveInFlightRef.current = false;
       setSaving(false);
@@ -563,35 +565,6 @@ export function NewSaleScreen() {
         windowSize={5}
         removeClippedSubviews={true}
         ListEmptyComponent={<EmptyState message="No hay productos disponibles para este filtro." />}
-        ListFooterComponent={
-          cart.length > 0 ? (
-            <Card style={styles.cartSummary}>
-              <Text style={styles.cartTitle}>Pedido ({totals.itemCount} items)</Text>
-              {cart.map((line, idx) => (
-                <CartLineItemRow
-                  key={`${line.presentationId}-${idx}`}
-                  line={line}
-                  index={idx}
-                  onChangeQty={changeLineQuantity}
-                />
-              ))}
-
-              <View style={styles.totalsBlock}>
-                <TotalRow label="Subtotal bruto" value={centsToBs(totals.subtotalCents)} />
-                <TotalRow label="Total" value={centsToBs(totals.totalCents)} bold />
-              </View>
-
-              {error && <Text style={styles.error}>{error}</Text>}
-              <Button
-                label={editingOrderId ? "GUARDAR CAMBIOS" : "GUARDAR PREVENTA"}
-                onPress={handleSaveOrder}
-                loading={saving}
-                disabled={saving}
-                style={{ marginTop: spacing.md }}
-              />
-            </Card>
-          ) : null
-        }
       />
 
       {/* Barra fija inferior cuando hay productos en el carrito */}
@@ -638,20 +611,26 @@ export function NewSaleScreen() {
             </View>
 
             <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-              <Text style={styles.cartTitle}>Productos añadidos ({totals.itemCount} items)</Text>
-              {cart.map((line, idx) => (
-                <CartLineItemRow
-                  key={`${line.presentationId}-${idx}`}
-                  line={line}
-                  index={idx}
-                  onChangeQty={changeLineQuantity}
-                />
-              ))}
+              {cart.length > 0 ? (
+                <>
+                  <Text style={styles.cartTitle}>Productos añadidos ({totals.itemCount} items)</Text>
+                  {cart.map((line, idx) => (
+                    <CartLineItemRow
+                      key={`${line.presentationId}-${idx}`}
+                      line={line}
+                      index={idx}
+                      onChangeQty={changeLineQuantity}
+                    />
+                  ))}
 
-              <View style={styles.totalsBlock}>
-                <TotalRow label="Subtotal bruto" value={centsToBs(totals.subtotalCents)} />
-                <TotalRow label="Total" value={centsToBs(totals.totalCents)} bold />
-              </View>
+                  <View style={styles.totalsBlock}>
+                    <TotalRow label="Subtotal bruto" value={centsToBs(totals.subtotalCents)} />
+                    <TotalRow label="Total" value={centsToBs(totals.totalCents)} bold />
+                  </View>
+                </>
+              ) : (
+                <EmptyState message="El carrito está vacío. Agrega productos desde el catálogo." />
+              )}
 
               {error && <Text style={styles.error}>{error}</Text>}
             </ScrollView>
@@ -661,7 +640,7 @@ export function NewSaleScreen() {
                 label={editingOrderId ? "GUARDAR CAMBIOS" : "GUARDAR PREVENTA"}
                 onPress={handleSaveOrder}
                 loading={saving}
-                disabled={saving}
+                disabled={saving || cart.length === 0}
               />
               <Button
                 label="Volver al catálogo"
