@@ -74,7 +74,7 @@ clientsRouter.get("/", async (_req, res, next) => {
        FROM clients c
        LEFT JOIN neighborhoods n ON n.id = c.neighborhood_id
        WHERE c.active = true
-       ORDER BY COALESCE(NULLIF(c.business_name, ''), NULLIF(c.name, ''), c.contact_name, c.owner_name, '') ASC`
+       ORDER BY COALESCE(NULLIF(c.business_name, ''), c.contact_name, '') ASC`
     );
     res.json({ clients: rows.map(serializeClient) });
   } catch (err) {
@@ -115,9 +115,9 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
     const id = uuid(), ts = nowIso();
     const { rows } = await client.query(
       `INSERT INTO clients (
-         id, client_code, business_name, name, contact_name, owner_name, phone, neighborhood_id, address, lat, lng,
+         id, client_code, business_name, contact_name, phone, neighborhood_id, address, lat, lng,
          visit_status, active, assigned_user_id, created_by, client_local_id, created_at, updated_at
-       ) VALUES ($1, NULL, $2, $2, $3, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
+       ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
        RETURNING *`,
       [
         id, bName, cName, phone, nId,
@@ -190,7 +190,7 @@ clientsRouter.put("/:id", async (req, res, next) => {
     const ts = nowIso();
     const { rows } = await pool.query(
       `UPDATE clients SET
-         business_name = $2, name = $2, contact_name = $3, owner_name = $3,
+         business_name = $2, contact_name = $3,
          phone = $4, neighborhood_id = $5, address = $6, lat = $7, lng = $8, updated_at = $9
        WHERE id = $1
        RETURNING *`,

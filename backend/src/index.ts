@@ -10,6 +10,7 @@ import { ordersRouter } from "./routes/orders";
 import { syncRouter } from "./routes/sync";
 import { reportsRouter } from "./routes/reports";
 import { settingsRouter } from "./routes/settings";
+import { ensureClientsSchema } from "./db/pg";
 
 const app = express();
 app.use(helmet());
@@ -57,6 +58,7 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 const PORT = Number(process.env.PORT) || 4000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ PreventaPro backend escuchando en http://0.0.0.0:${PORT}`);
+  ensureClientsSchema().catch((err) => console.warn("Aviso al verificar esquema de clientes:", err));
 });
 
 // Protección contra excepciones y rechazos no capturados

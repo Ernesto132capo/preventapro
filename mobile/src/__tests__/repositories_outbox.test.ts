@@ -174,6 +174,20 @@ const mockDb = {
       return { changes: count };
     }
 
+    // OUTBOX: UPDATE status = 'done'
+    if (cleanSql.includes("UPDATE outbox SET status = 'done'")) {
+      const [entityType, localId] = params;
+      let count = 0;
+      for (const row of state.outbox) {
+        if ((!entityType || row.entity_type === entityType) && (!localId || row.local_entity_id === localId)) {
+          row.status = "done";
+          row.last_error = null;
+          count++;
+        }
+      }
+      return { changes: count };
+    }
+
     // PRODUCTS: UPDATE category_id
     if (cleanSql.startsWith("UPDATE products SET category_id = ? WHERE category_id = ?")) {
       const [newCatId, oldCatId] = params;
@@ -570,8 +584,10 @@ describe("Repositories & Outbox Atomicity", () => {
       expect(outboxRow).toBeDefined();
     });
 
-    it("soft-delete de cliente y outbox delete atómico", async () => {
+    it("soft-delete de cliente y outbox delete atómico cuando tiene server_id", async () => {
       const client = await createClientLocal({ businessName: "Cliente A Borrar" });
+      const dbClient = state.clients.find((c) => c.id === client.id)!;
+      dbClient.server_id = "srv-cl-to-delete";
       jest.clearAllMocks();
 
       await deleteClientLocal(client.id);
@@ -582,6 +598,26 @@ describe("Repositories & Outbox Atomicity", () => {
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "delete");
       expect(outboxRow).toBeDefined();
+
+      const createRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "create");
+      expect(createRow?.status).toBe("done");
+    });
+
+    it("soft-delete de cliente puramente local purga outbox y NO encola delete remoto", async () => {
+      const client = await createClientLocal({ businessName: "Cliente Solo Local" });
+      jest.clearAllMocks();
+
+      await deleteClientLocal(client.id);
+
+      expect(mockDb.withTransactionAsync).toHaveBeenCalled();
+      const local = state.clients.find((c) => c.id === client.id);
+      expect(local?.active).toBe(0);
+
+      const deleteRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "delete");
+      expect(deleteRow).toBeUndefined();
+
+      const createRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "create");
+      expect(createRow?.status).toBe("done");
     });
 
     it("[Objetivo 2] permite crear cliente solo con tienda o solo con propietario, pero rechaza si ambos están vacíos", async () => {

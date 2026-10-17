@@ -249,10 +249,25 @@ export const migrations: Migration[] = [
     id: "006_clients_owner_name_and_nullable_name",
     description: "Agregar columnas name y owner_name en tabla clients y asegurar que business_name sea nullable",
     run: async (client: PoolClient) => {
+      const { rows } = await client.query(`
+        SELECT column_name, is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'clients'
+      `);
+      if (rows.length === 0) return;
+      const colMap = new Map(rows.map((r: any) => [r.column_name, r]));
+
+      const bCol = colMap.get("business_name");
+      if (bCol && bCol.is_nullable === "NO") {
+        await client.query(`ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL`);
+      }
+      if (!colMap.has("name")) {
+        await client.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT`);
+      }
+      if (!colMap.has("owner_name")) {
+        await client.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT`);
+      }
       await client.query(`
-        ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT;
-        ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT;
-        ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL;
         UPDATE clients SET
           name = COALESCE(NULLIF(name, ''), business_name),
           business_name = COALESCE(NULLIF(business_name, ''), name),

@@ -240,10 +240,26 @@ async function pushClient(row: OutboxRow) {
   const client = await db.getFirstAsync<any>(`SELECT * FROM clients WHERE id = ?`, [row.local_entity_id]);
   if (!client) return markDone(row.id); // se borró localmente, nada que hacer
 
-  // Cliente borrado localmente: si ya existía en el servidor, propagar el borrado; si no, no hay nada que subir.
-  if (client.active === 0) {
+  // Cliente borrado localmente o con operación delete: propagar al servidor si tiene server_id; si no, marcar listo
+  if (row.operation === "delete" || client.active === 0) {
+    await db.runAsync(
+      `UPDATE outbox SET status = 'done', last_error = NULL
+       WHERE entity_type = 'client' AND local_entity_id = ? AND id <> ?`,
+      [client.id, row.id]
+    );
+
     if (client.server_id) {
-      await apiFetch<any>(`/clients/${client.server_id}`, { method: "DELETE" });
+      try {
+        await apiFetch<any>(`/clients/${client.server_id}`, { method: "DELETE" });
+      } catch (err: any) {
+        const status = err?.status ?? err?.statusCode;
+        const msg = String(err?.message || "");
+        if (status === 404 || msg.includes("404") || msg.toLowerCase().includes("no encontrado")) {
+          // Idempotente: el cliente ya no existe o fue eliminado previamente en el servidor
+        } else {
+          throw err;
+        }
+      }
     }
     return markDone(row.id);
   }

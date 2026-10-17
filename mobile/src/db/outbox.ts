@@ -131,3 +131,17 @@ export async function normalizeOutboxErrors(): Promise<number> {
   return res.changes ?? 0;
 }
 
+/**
+ * Purga o marca como 'done' todos los eventos de outbox asociados a una entidad local específica
+ * (por ejemplo al eliminar un cliente, para que eventos previos 'create' o 'update' no sigan fallando).
+ */
+export async function purgeOutboxForEntity(entityType: OutboxEntity, localEntityId: string): Promise<number> {
+  const db = await getDb();
+  const result = await db.runAsync(
+    `UPDATE outbox SET status = 'done', last_error = NULL
+     WHERE entity_type = ? AND local_entity_id = ? AND status <> 'done'`,
+    [entityType, localEntityId]
+  );
+  return result.changes ?? 0;
+}
+

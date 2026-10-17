@@ -386,11 +386,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           const uncachedIds = missingClientIds.filter((cid) => !clientNameCache.has(cid));
           if (uncachedIds.length > 0) {
             const { rows: fetchedClients } = await pool.query(
-              "SELECT id, business_name, contact_name, name, owner_name FROM clients WHERE id = ANY($1)",
+              "SELECT id, business_name, contact_name FROM clients WHERE id = ANY($1)",
               [uncachedIds]
             );
             for (const c of fetchedClients) {
-              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || c.name || c.contact_name || c.owner_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
+              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || c.contact_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
             }
           }
           for (const cid of missingClientIds) {
@@ -792,10 +792,10 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
     const serverId = existing[0].id;
     await client.query(
       `UPDATE clients SET
-         business_name = $1, name = $1, contact_name = $2, owner_name = $2,
-         phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $8, updated_at = now()
-       WHERE id = $7`,
-      [businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId, neighborhoodId]
+         business_name = $1, contact_name = $2,
+         phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $7, updated_at = now()
+       WHERE id = $8`,
+      [businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, serverId]
     );
     return { id: localId, serverId, entityType: "client", status: "synced" };
   }
@@ -803,9 +803,9 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
   const serverId = uuid();
   await client.query(
     `INSERT INTO clients (
-       id, client_local_id, business_name, name, contact_name, owner_name, phone, address, lat, lng,
+       id, client_local_id, business_name, contact_name, phone, address, lat, lng,
        neighborhood_id, visit_status, active, created_by, created_at, updated_at
-     ) VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
     [serverId, clientLocalId, businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, userId]
   );
   return { id: localId, serverId, entityType: "client", status: "synced" };

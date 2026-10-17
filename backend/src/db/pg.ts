@@ -60,12 +60,36 @@ export function nowIso(): string {
 /** Asegura idempotentemente que las columnas name y owner_name existan y business_name sea nullable. */
 export async function ensureClientsSchema(clientOrPool: Pool | import("pg").PoolClient = pool): Promise<void> {
   try {
-    await clientOrPool.query(`
-      ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT;
-      ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT;
-      ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL;
+    const { rows } = await clientOrPool.query(`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_name = 'clients'
     `);
-  } catch {
-    // Omitir si la tabla aún no existe
+    if (rows.length === 0) return;
+
+    const colMap = new Map(rows.map((r: any) => [r.column_name, r]));
+
+    const bCol = colMap.get("business_name");
+    if (bCol && bCol.is_nullable === "NO") {
+      await clientOrPool.query(`ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL`);
+    }
+
+    if (!colMap.has("name")) {
+      await clientOrPool.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS name TEXT`);
+    }
+    if (!colMap.has("owner_name")) {
+      await clientOrPool.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_name TEXT`);
+    }
+
+    await clientOrPool.query(`
+      UPDATE clients SET
+        name = COALESCE(NULLIF(name, ''), business_name),
+        business_name = COALESCE(NULLIF(business_name, ''), name),
+        owner_name = COALESCE(NULLIF(owner_name, ''), contact_name),
+        contact_name = COALESCE(NULLIF(contact_name, ''), owner_name);
+    `);
+  } catch (err) {
+    // Non-fatal: table might not exist yet or connection issue
+    console.warn("Aviso en ensureClientsSchema (no crítico):", err);
   }
 }

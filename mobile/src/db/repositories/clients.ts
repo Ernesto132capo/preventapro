@@ -1,6 +1,6 @@
 import { v4 as uuid } from "uuid";
 import { getDb, nowIso } from "../client";
-import { enqueue } from "../outbox";
+import { enqueue, purgeOutboxForEntity } from "../outbox";
 import { Client } from "../../domain/types";
 
 export async function listActiveClients(search?: string): Promise<Client[]> {
@@ -116,11 +116,26 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
 export async function deleteClientLocal(id: string): Promise<void> {
   const db = await getDb();
   await db.withTransactionAsync(async () => {
+    const existing = await getClient(id);
+    if (!existing) return;
+
     await db.runAsync(
-      `UPDATE clients SET active = 0, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+      `UPDATE clients SET active = 0, sync_status = 'synced', updated_at = ? WHERE id = ?`,
       [nowIso(), id]
     );
-    await enqueue("client", id, 1, "delete");
+
+    // Purgar eventos pendientes o fallidos previos de este cliente en outbox para que sync.ts no los reintente
+    await purgeOutboxForEntity("client", id);
+
+    // Si ya existía en el servidor (server_id no nulo), encolar el borrado remoto.
+    // Si era solo local y nunca subió al servidor, no encolar delete (evita 404).
+    if (existing.server_id) {
+      await db.runAsync(
+        `UPDATE clients SET sync_status = 'pending' WHERE id = ?`,
+        [id]
+      );
+      await enqueue("client", id, 1, "delete");
+    }
   });
 }
 

@@ -6,6 +6,7 @@ export type SyncStatus = "synced" | "pending" | "syncing" | "failed";
 
 export interface Client {
   id: string;
+  server_id?: string | null;
   client_local_id: string | null;
   client_code: string | null;
   business_name: string | null;
