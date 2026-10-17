@@ -1,31 +1,42 @@
 import { Router } from "express";
 import { z } from "zod";
+import rateLimit from "express-rate-limit";
 import { pool } from "../db/pg";
 import { createAccessToken, verifyPassword } from "../services/auth";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 
 export const authRouter = Router();
 
+export const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  statusCode: 429,
+  message: { error: "Demasiados intentos de inicio de sesión. Por favor, intenta de nuevo más tarde." },
+});
+
 const loginSchema = z.object({
   identifier: z.string().trim().min(1).max(254),
   password: z.string().min(1).max(128),
 }).strict();
 
-authRouter.post("/login", async (req, res, next) => {
+authRouter.post("/login", loginLimiter, async (req, res, next) => {
   try {
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Ingresa tu código y contraseña válidos." });
 
     const { identifier, password } = parsed.data;
     const cleanId = identifier.trim().toLowerCase();
-    const resolvedId = cleanId === "pv001" ? "david" : cleanId === "pv002" ? "yuma" : cleanId;
+    const alias: Record<string, string> = { pv001: "david", david: "pv001", pv002: "yuma", yuma: "pv002" };
+    const candidates = [cleanId, alias[cleanId]].filter(Boolean) as string[];
 
     const { rows } = await pool.query(
       `SELECT id, code, real_email, full_name, active, password_hash
        FROM users
-       WHERE lower(code) = lower($1) OR lower(coalesce(real_email, '')) = lower($1)
+       WHERE lower(code) = ANY($1) OR lower(coalesce(real_email, '')) = $2
        LIMIT 1`,
-      [resolvedId]
+      [candidates, cleanId]
     );
     const user = rows[0];
     if (!user || user.active === false || !(await verifyPassword(password, user.password_hash))) {

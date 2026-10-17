@@ -56,9 +56,10 @@ let runSpecificMigration: any;
 
 function makeRequest(
   app: express.Express,
-  options: { method: string; url: string; body?: any; userId?: string; userRole?: string }
+  options: { method: string; url: string; body?: any; userId?: string; userRole?: string; ip?: string }
 ): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
+    const clientIp = options.ip || "127.0.0.1";
     const req = {
       method: options.method,
       url: options.url,
@@ -66,6 +67,9 @@ function makeRequest(
       body: options.body || {},
       userId: options.userId || "usr-test-1",
       userRole: options.userRole,
+      ip: clientIp,
+      socket: { remoteAddress: clientIp },
+      connection: { remoteAddress: clientIp },
     } as any;
 
     const fakeRes = {
@@ -913,11 +917,11 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       authApp.use("/auth", authRouter);
 
       const passHash = await hashPassword("secreto123");
-      let queriedCode: string | null = null;
+      let queriedCandidates: string[] = [];
 
       mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
         if (sql.includes("FROM users") && sql.includes("lower(code)")) {
-          queriedCode = params[0];
+          queriedCandidates = params[0];
           return {
             rows: [
               {
@@ -939,17 +943,18 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         method: "POST",
         url: "/auth/login",
         body: { identifier: "PV001", password: "secreto123" },
+        ip: "10.10.1.1",
       });
       expect(resPv001.status).toBe(200);
-      expect(queriedCode).toBe("david");
+      expect(queriedCandidates).toContain("david");
       expect(resPv001.body.user.code).toBe("david");
       expect(resPv001.body.user.fullName).toBe("David");
 
       // Intento de login con "pv002"
-      queriedCode = null;
+      queriedCandidates = [];
       mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
         if (sql.includes("FROM users") && sql.includes("lower(code)")) {
-          queriedCode = params[0];
+          queriedCandidates = params[0];
           return {
             rows: [
               {
@@ -970,11 +975,133 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         method: "POST",
         url: "/auth/login",
         body: { identifier: "pv002", password: "secreto123" },
+        ip: "10.10.1.2",
       });
       expect(resPv002.status).toBe(200);
-      expect(queriedCode).toBe("yuma");
+      expect(queriedCandidates).toContain("yuma");
       expect(resPv002.body.user.code).toBe("yuma");
       expect(resPv002.body.user.fullName).toBe("Yuma");
+    });
+
+    it("permite a un usuario con code='pv001' autenticarse con 'pv001' o con 'david' simétricamente", async () => {
+      const authApp = express();
+      authApp.use(express.json());
+      authApp.use("/auth", authRouter);
+
+      const passHash = await hashPassword("secreto123");
+      const userDavid = {
+        id: "usr-david",
+        code: "pv001", // Base de datos conserva code='pv001'
+        real_email: "david@preventapro.bo",
+        full_name: "David",
+        active: true,
+        password_hash: passHash,
+      };
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users") && sql.includes("lower(code)")) {
+          const candidates: string[] = params[0];
+          if (candidates && candidates.includes(userDavid.code.toLowerCase())) {
+            return { rows: [userDavid] };
+          }
+        }
+        return { rows: [] };
+      });
+
+      // 1. Login usando identifier "pv001"
+      const res1 = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "pv001", password: "secreto123" },
+        ip: "10.20.1.1",
+      });
+      expect(res1.status).toBe(200);
+      expect(res1.body.user.code).toBe("pv001");
+
+      // 2. Login usando alias "david"
+      const res2 = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "david", password: "secreto123" },
+        ip: "10.20.1.2",
+      });
+      expect(res2.status).toBe(200);
+      expect(res2.body.user.code).toBe("pv001");
+
+      // 3. Login usando alias "yuma" para usuario con code='pv002'
+      const userYuma = {
+        id: "usr-yuma",
+        code: "pv002",
+        real_email: "yuma@preventapro.bo",
+        full_name: "Yuma",
+        active: true,
+        password_hash: passHash,
+      };
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users") && sql.includes("lower(code)")) {
+          const candidates: string[] = params[0];
+          if (candidates && candidates.includes(userYuma.code.toLowerCase())) {
+            return { rows: [userYuma] };
+          }
+        }
+        return { rows: [] };
+      });
+
+      const res3 = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "yuma", password: "secreto123" },
+        ip: "10.20.1.3",
+      });
+      expect(res3.status).toBe(200);
+      expect(res3.body.user.code).toBe("pv002");
+    });
+
+    it("aplica rate limiting en POST /auth/login y responde con HTTP 429 al exceder el límite", async () => {
+      const rateLimitApp = express();
+      rateLimitApp.use(express.json());
+      rateLimitApp.use("/auth", authRouter);
+
+      const passHash = await hashPassword("secreto123");
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM users")) {
+          return {
+            rows: [
+              {
+                id: "usr-david",
+                code: "david",
+                real_email: "david@preventapro.bo",
+                full_name: "David",
+                active: true,
+                password_hash: passHash,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      });
+
+      const testIp = "192.168.100.50";
+      // Realizamos 10 peticiones bajo el límite permitido
+      for (let i = 0; i < 10; i++) {
+        const res = await makeRequest(rateLimitApp, {
+          method: "POST",
+          url: "/auth/login",
+          body: { identifier: "david", password: "secreto123" },
+          ip: testIp,
+        });
+        expect(res.status).toBe(200);
+      }
+
+      // La petición 11 dentro de la misma ventana de 15 minutos debe recibir 429
+      const resBlocked = await makeRequest(rateLimitApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "david", password: "secreto123" },
+        ip: testIp,
+      });
+      expect(resBlocked.status).toBe(429);
+      expect(resBlocked.body.error).toContain("Demasiados intentos");
     });
   });
 
