@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
-import { Alert } from "react-native";
+import { Alert, Platform } from "react-native";
 import { getSecureItem, setSecureItem, deleteSecureItem } from "../services/secureStorage";
-import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError, subscribeToUnauthorized } from "../services/api";
+import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError, subscribeToUnauthorized, logoutRemote } from "../services/api";
 import { setMeta } from "../db/client";
 
 export interface AuthUser {
@@ -98,10 +98,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback(async (identifier: string, password: string, rememberSession: boolean) => {
     setError(null);
     try {
+      const deviceName = `${Platform.OS === "android" ? "Android" : Platform.OS === "ios" ? "iOS" : "Móvil"} (${normalizeUserName(identifier)})`;
       const res = await apiFetch<{ accessToken: string; user: AuthUser }>("/auth/login", {
         method: "POST",
         authRequired: false,
-        body: { identifier, password },
+        body: { identifier, password, deviceName },
       });
       await setTokens(res.accessToken, rememberSession);
       if (rememberSession) {
@@ -124,6 +125,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
+    await logoutRemote().catch(() => undefined);
     await clearTokens();
     await deleteSecureItem(USER_KEY);
     await setMeta("last_pull_at", "1970-01-01T00:00:00.000Z").catch(() => undefined);

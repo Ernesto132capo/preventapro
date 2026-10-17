@@ -12,7 +12,7 @@ import { listOrdersForWorkDay, cancelOrderLocal } from "../db/repositories/order
 import { mergeDuplicateClients } from "../db/repositories/clients";
 import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
-import { apiFetch } from "../services/api";
+import { apiFetch, fetchActiveSessions, revokeOtherSessions, revokeSessionById, UserSessionInfo } from "../services/api";
 import { countUnresolvedOutboxItems } from "../db/outbox";
 
 export function DashboardScreen() {
@@ -28,6 +28,72 @@ export function DashboardScreen() {
   const [loadingStats, setLoadingStats] = useState(false);
   const [showCounterModal, setShowCounterModal] = useState(false);
   const [counterInput, setCounterInput] = useState("");
+  const [showSessionsModal, setShowSessionsModal] = useState(false);
+  const [sessions, setSessions] = useState<UserSessionInfo[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+
+  async function loadSessions() {
+    setLoadingSessions(true);
+    try {
+      const list = await fetchActiveSessions();
+      setSessions(list);
+    } catch (err: any) {
+      Alert.alert("Error al cargar sesiones", err?.message || "No se pudo obtener la lista de sesiones.");
+    } finally {
+      setLoadingSessions(false);
+    }
+  }
+
+  function openSessionsModal() {
+    setShowUserModal(false);
+    setShowSessionsModal(true);
+    void loadSessions();
+  }
+
+  function handleRevokeOthers() {
+    Alert.alert(
+      "Cerrar otras sesiones",
+      "¿Deseas cerrar la sesión en todos los demás dispositivos? La sesión en este teléfono continuará abierta.",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Cerrar otras sesiones",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              const count = await revokeOtherSessions();
+              Alert.alert("Sesiones cerradas", `Se cerraron ${count} sesión(es) en otros dispositivos.`);
+              void loadSessions();
+            } catch (err: any) {
+              Alert.alert("Error", err?.message || "No se pudo revocar las otras sesiones.");
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function handleRevokeSingle(sessionId: string, deviceName: string) {
+    Alert.alert(
+      "Cerrar sesión",
+      `¿Deseas revocar el acceso en "${deviceName}"?`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Revocar",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await revokeSessionById(sessionId);
+              void loadSessions();
+            } catch (err: any) {
+              Alert.alert("Error", err?.message || "No se pudo revocar la sesión.");
+            }
+          },
+        },
+      ]
+    );
+  }
 
   async function loadStats() {
     setLoadingStats(true);
@@ -280,6 +346,12 @@ export function DashboardScreen() {
               onPress={() => { setShowUserModal(false); handleMergeDuplicates(); }}
               style={{ marginTop: spacing.sm }}
             />
+            <Button
+              label="🔒 Dispositivos y sesiones activas"
+              variant="outline"
+              onPress={openSessionsModal}
+              style={{ marginTop: spacing.sm }}
+            />
             <Button label="Cerrar" variant="outline" onPress={() => setShowUserModal(false)} style={{ marginTop: spacing.sm }} />
           </Pressable>
         </Pressable>
@@ -302,6 +374,60 @@ export function DashboardScreen() {
             />
             <Button label="Guardar" onPress={handleSaveCounter} style={{ marginTop: spacing.md }} />
             <Button label="Cancelar" variant="outline" onPress={() => setShowCounterModal(false)} style={{ marginTop: spacing.sm }} />
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={showSessionsModal} transparent animationType="fade" onRequestClose={() => setShowSessionsModal(false)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setShowSessionsModal(false)}>
+          <Pressable style={[styles.modalCard, { maxHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>Dispositivos y sesiones</Text>
+            <Text style={[styles.statsHint, { marginTop: spacing.xs }]}>
+              Sesiones activas autorizadas en PreventaPro para tu cuenta.
+            </Text>
+
+            <ScrollView style={{ marginTop: spacing.md, maxHeight: 260 }}>
+              {loadingSessions ? (
+                <Text style={[styles.modalValue, { textAlign: "center", paddingVertical: spacing.md }]}>Cargando sesiones...</Text>
+              ) : sessions.length === 0 ? (
+                <Text style={[styles.statsHint, { textAlign: "center", paddingVertical: spacing.md }]}>No se encontraron sesiones registradas.</Text>
+              ) : (
+                sessions.map((s) => (
+                  <View key={s.id} style={styles.sessionItem}>
+                    <View style={{ flex: 1, marginRight: spacing.sm }}>
+                      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <Text style={styles.sessionDevice}>{s.deviceName}</Text>
+                        {s.isCurrent && <StatusPill kind="synced" label="Este teléfono" />}
+                      </View>
+                      <Text style={styles.sessionDate}>
+                        Inició: {new Date(s.createdAt).toLocaleDateString("es-BO")}
+                      </Text>
+                    </View>
+                    {!s.isCurrent && (
+                      <Button
+                        label="Cerrar"
+                        variant="danger"
+                        onPress={() => handleRevokeSingle(s.id, s.deviceName)}
+                        style={{ minHeight: 32, paddingHorizontal: 10 }}
+                      />
+                    )}
+                  </View>
+                ))
+              )}
+            </ScrollView>
+
+            <Button
+              label="🔒 Cerrar sesiones en otros dispositivos"
+              variant="outline"
+              onPress={handleRevokeOthers}
+              style={{ marginTop: spacing.md }}
+            />
+            <Button
+              label="Volver"
+              variant="outline"
+              onPress={() => setShowSessionsModal(false)}
+              style={{ marginTop: spacing.sm }}
+            />
           </Pressable>
         </Pressable>
       </Modal>
@@ -553,4 +679,22 @@ const styles = StyleSheet.create({
   orderClient: { fontWeight: "600", color: colors.textPrimary },
   orderTotal: { color: colors.textSecondary, fontSize: 13, marginTop: 2 },
   actionsRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md },
+  sessionItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  sessionDevice: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: colors.textPrimary,
+  },
+  sessionDate: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
 });

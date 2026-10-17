@@ -122,3 +122,37 @@ export async function apiFetch<T = any>(path: string, opts: RequestOptions = {})
   }
   return data as T;
 }
+
+export interface UserSessionInfo {
+  id: string;
+  deviceName: string;
+  createdAt: string;
+  lastSeenAt: string;
+  isCurrent: boolean;
+}
+
+export async function fetchActiveSessions(): Promise<UserSessionInfo[]> {
+  const data = await apiFetch<{ sessions: UserSessionInfo[] }>("/auth/sessions");
+  return data.sessions || [];
+}
+
+export async function revokeOtherSessions(): Promise<number> {
+  const data = await apiFetch<{ ok: boolean; revokedCount: number }>("/auth/sessions/revoke-others", {
+    method: "POST",
+  });
+  return data.revokedCount || 0;
+}
+
+export async function revokeSessionById(sessionId: string): Promise<void> {
+  await apiFetch(`/auth/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function logoutRemote(): Promise<void> {
+  try {
+    await apiFetch("/auth/logout", { method: "POST", timeoutMs: 5000 });
+  } catch {
+    // Si el dispositivo está sin red, la sesión se limpia localmente de todos modos
+  }
+}
