@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback, use
 import { Alert } from "react-native";
 import { getSecureItem, setSecureItem, deleteSecureItem } from "../services/secureStorage";
 import { apiFetch, setTokens, clearTokens, getAccessToken, ApiError, subscribeToUnauthorized } from "../services/api";
+import { setMeta } from "../db/client";
 
 export interface AuthUser {
   id: string;
@@ -92,6 +93,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       setUser(res.user);
       unauthorizedHandlingRef.current = false;
+      await setMeta("last_pull_at", "1970-01-01T00:00:00.000Z").catch(() => undefined);
       return true;
     } catch (err) {
       if (err instanceof ApiError && err.status === 0) {
@@ -106,6 +108,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(async () => {
     await clearTokens();
     await deleteSecureItem(USER_KEY);
+    await setMeta("last_pull_at", "1970-01-01T00:00:00.000Z").catch(() => undefined);
     setUser(null);
   }, []);
 

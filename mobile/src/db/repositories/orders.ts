@@ -47,7 +47,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
       `SELECT id, user_id, status FROM work_days WHERE id = ? OR server_id = ?`,
       [input.workDayLocalId, input.workDayLocalId]
     );
-    if (!currentWorkDay || currentWorkDay.user_id !== userId) {
+    if (!currentWorkDay) {
       throw new PricingError("No hay una jornada válida para registrar la preventa.");
     }
     if (currentWorkDay.status !== "open") {
@@ -145,10 +145,10 @@ export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(Loc
       `SELECT o.*, c.business_name, c.name, c.contact_name, c.owner_name
        FROM orders o
        LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
-       WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?))
+       WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ?))
          AND o.status = 'active'
        ORDER BY o.created_at DESC`,
-      [workDayLocalId, wd.server_id, wd.server_id, wd.user_id]
+      [workDayLocalId, wd.server_id, wd.server_id]
     );
   }
   return db.getAllAsync<any>(
@@ -179,8 +179,8 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
   grandTotalUnits: number;
 }> {
   const db = await getDb();
-  const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
-    `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
+  const wd = await db.getFirstAsync<{ id: string; server_id: string | null }>(
+    `SELECT id, server_id FROM work_days WHERE id = ?`,
     [workDayLocalId]
   );
   const rows = await db.getAllAsync<{
@@ -198,11 +198,11 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
        SUM(oi.subtotal_cents) AS total_subtotal_cents
      FROM orders o
      JOIN order_items oi ON oi.order_id = o.id
-     WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?))
+     WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ?))
        AND o.status = 'active'
      GROUP BY oi.product_name_snapshot, oi.presentation_name_snapshot, oi.unit_price_cents_snapshot
      ORDER BY oi.product_name_snapshot COLLATE NOCASE ASC, oi.presentation_name_snapshot COLLATE NOCASE ASC`,
-    [workDayLocalId, wd?.server_id ?? workDayLocalId, wd?.server_id ?? "", wd?.user_id ?? ""]
+    [workDayLocalId, wd?.server_id ?? workDayLocalId, wd?.server_id ?? ""]
   );
 
   let grandTotalCents = 0;
@@ -269,22 +269,14 @@ export async function upsertOrderFromServer(serverOrder: any) {
   const db = await getDb();
 
   await db.withTransactionAsync(async () => {
-    let localWorkDay = serverOrder.user_id
-      ? await db.getFirstAsync<{ id: string }>(
-          `SELECT id FROM work_days WHERE user_id = ? AND (server_id = ? OR id = ?) LIMIT 1`,
-          [serverOrder.user_id, serverOrder.work_day_id, serverOrder.work_day_id]
-        )
-      : await db.getFirstAsync<{ id: string }>(
-          `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
-          [serverOrder.work_day_id, serverOrder.work_day_id]
-        );
+    let localWorkDay = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
+      [serverOrder.work_day_id, serverOrder.work_day_id]
+    );
     if (!localWorkDay) {
-      localWorkDay = serverOrder.user_id
-        ? await db.getFirstAsync<{ id: string }>(
-            `SELECT id FROM work_days WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1`,
-            [serverOrder.user_id]
-          )
-        : null;
+      localWorkDay = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
+      );
     }
     const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
 
@@ -437,7 +429,7 @@ async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymen
       `SELECT user_id, status FROM work_days WHERE id = ?`,
       [order.work_day_id]
     );
-    if (!workDay || workDay.user_id !== userId) {
+    if (!workDay) {
       throw new PricingError("No se encontró la jornada de esta preventa.");
     }
     if (workDay.status !== "open") {
@@ -483,13 +475,13 @@ export async function cancelOrderLocal(orderId: string): Promise<void> {
   if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
   const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [order.work_day_id]);
   if (!workDay) throw new PricingError("No se encontró la jornada de esta preventa.");
-  await withUserWorkDayLock(workDay.user_id, async () => {
+  await withUserWorkDayLock("shared", async () => {
     await db.withTransactionAsync(async () => {
       const current = await db.getFirstAsync<{ user_id: string; status: string }>(
         `SELECT wd.user_id, wd.status FROM work_days wd WHERE wd.id = ?`,
         [order.work_day_id]
       );
-      if (!current || current.user_id !== workDay.user_id) {
+      if (!current) {
         throw new PricingError("No se encontró la jornada de esta preventa.");
       }
       if (current.status !== "open") {
@@ -512,10 +504,10 @@ async function refreshWorkDayTotals(db: any, workDayId: string) {
   if (wd?.server_id) {
     await db.runAsync(
       `UPDATE work_days SET
-         order_count = (SELECT COUNT(*) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active'),
-         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active')
+         order_count = (SELECT COUNT(*) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active'),
+         total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ?)) AND status = 'active')
        WHERE id = ?`,
-      [workDayId, wd.server_id, wd.server_id, wd.user_id, workDayId, wd.server_id, wd.server_id, wd.user_id, workDayId]
+      [workDayId, wd.server_id, wd.server_id, workDayId, wd.server_id, wd.server_id, workDayId]
     );
   } else {
     await db.runAsync(

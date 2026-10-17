@@ -38,7 +38,7 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
   const catCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM categories WHERE active = 1`))?.n ?? 0;
 
   let since = (await getMeta("last_pull_at")) || "1970-01-01T00:00:00.000Z";
-  if (prodCount === 0 || clientCount === 0 || catCount === 0) {
+  if (force || prodCount === 0 || clientCount === 0 || catCount === 0) {
     since = "1970-01-01T00:00:00.000Z";
   }
 
@@ -127,14 +127,16 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
     }
   }
 
-  // Actualizar la jornada local de este preventista si vino en el pull.
+  // Actualizar la jornada local de hoy y las jornadas compartidas si vinieron en el pull.
   if (data.workDay) {
     const todayLocal = await getTodayWorkDay(userId);
     await upsertServerWorkDay(todayLocal.id, data.workDay);
+  }
 
-    // IMPORTANT: Do NOT delete local orders based on incremental pull data.
-    // In delta pulls, data.orders only contains orders modified since last_pull_at,
-    // not the complete set. Deleting based on this subset would erase valid orders.
+  if (data.workDays && Array.isArray(data.workDays)) {
+    for (const wd of data.workDays) {
+      await upsertServerWorkDay(wd.id, wd);
+    }
   }
 
   // Guardar siempre el cursor real del servidor (timestamp más fresco)
@@ -204,8 +206,8 @@ async function resolveTodayWorkDay(userId: string) {
   await upsertServerWorkDay(local.id, res.workDay);
   const db = await getDb();
   const allTodayDays = await db.getAllAsync<{ id: string }>(
-    `SELECT id FROM work_days WHERE user_id = ? AND work_date = ?`,
-    [userId, local.work_date]
+    `SELECT id FROM work_days WHERE work_date = ?`,
+    [local.work_date]
   );
   for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
@@ -749,8 +751,8 @@ async function rescueLocalConflict(userId: string) {
       const local = await getTodayWorkDay(userId);
       await upsertServerWorkDay(local.id, res.workDay);
       const allTodayDays = await db.getAllAsync<{ id: string }>(
-        `SELECT id FROM work_days WHERE user_id = ? AND work_date = ?`,
-        [userId, local.work_date]
+        `SELECT id FROM work_days WHERE work_date = ?`,
+        [local.work_date]
       );
       for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 

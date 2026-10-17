@@ -27,13 +27,13 @@ async function recalc(id: string, db: PoolClient) {
 // Historial, que solo lista jornadas cerradas) — invisible para siempre con
 // todos sus pedidos adentro. Esta función la cierra automáticamente, con sus
 // totales reales, justo antes de abrir la jornada del nuevo día.
-export async function closeStaleOpenWorkDays(currentDate: string, userId: string, db: PoolClient): Promise<boolean> {
+export async function closeStaleOpenWorkDays(currentDate: string, _userId: string, db: PoolClient): Promise<boolean> {
   const ts = nowIso();
   // Tomar primero los locks de jornada evita calcular totales con un snapshot
   // anterior a un pedido que estuviera terminando de insertarse.
   const { rows: staleRows } = await db.query(
-    "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND work_date < $2 FOR UPDATE",
-    [userId, currentDate]
+    "SELECT id FROM work_days WHERE status = 'open' AND work_date < $1 FOR UPDATE",
+    [currentDate]
   );
   if (staleRows.length === 0) return false;
 
@@ -59,38 +59,30 @@ export async function closeStaleOpenWorkDays(currentDate: string, userId: string
   return rows.length > 0;
 }
 
-async function lockUserWorkDays(client: PoolClient, userId: string) {
-  await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${userId}`]);
+export async function lockWorkDays(client: PoolClient) {
+  await client.query("SELECT pg_advisory_xact_lock(1003, hashtext('workdays:shared'))");
 }
 
-// ─── Caché en memoria para /workdays/current (indexada por userId) ────────────
+// ─── Caché en memoria para /workdays/current (compartida para el negocio) ────
 // Evita releer Postgres en cada poll de 60s cuando la jornada no cambió.
-// Aislada por preventista para evitar que las consultas de un usuario invaliden las del otro.
 interface WorkdayCache {
-  userId: string;
   date: string;
   data: object;
   cachedAt: number;
 }
-const workdayCache = new Map<string, WorkdayCache>();
+let currentWorkdayCache: WorkdayCache | null = null;
 const WORKDAY_CACHE_TTL_MS = 60_000;
-const MAX_WORKDAY_CACHE_ENTRIES = 100;
 
-export function invalidateWorkdayCache(userId?: string) {
-  if (userId) {
-    workdayCache.delete(userId);
-  } else {
-    workdayCache.clear();
-  }
+export function invalidateWorkdayCache(_userId?: string) {
+  currentWorkdayCache = null;
 }
 
 workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   const date = getBoliviaToday();
   const fresh = req.query.fresh === "1" || req.query.fresh === "true";
   const now = Date.now();
-  const cached = req.userId ? workdayCache.get(req.userId) : undefined;
-  if (!fresh && cached && cached.date === date && now - cached.cachedAt < WORKDAY_CACHE_TTL_MS) {
-    return res.json(cached.data);
+  if (!fresh && currentWorkdayCache && currentWorkdayCache.date === date && now - currentWorkdayCache.cachedAt < WORKDAY_CACHE_TTL_MS) {
+    return res.json(currentWorkdayCache.data);
   }
 
   const client = await pool.connect();
@@ -98,71 +90,62 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
   try {
     await client.query("BEGIN");
     inTransaction = true;
-    // GET /current también crea datos. El lock por usuario evita dos jornadas
-    // abiertas concurrentes, incluso si los dispositivos consultan fechas distintas.
-    await lockUserWorkDays(client, req.userId!);
+    // Lock compartido para todo el negocio
+    await lockWorkDays(client);
     const closedStale = await closeStaleOpenWorkDays(date, req.userId!, client);
 
     const { rows: futureOpenRows } = await client.query(
-      "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND work_date > $2 LIMIT 1 FOR UPDATE",
-      [req.userId, date]
+      "SELECT id FROM work_days WHERE status = 'open' AND work_date > $1 LIMIT 1 FOR UPDATE",
+      [date]
     );
     if (futureOpenRows.length > 0) {
       await client.query("ROLLBACK");
       inTransaction = false;
-      return res.status(409).json({ error: "Ya existe una jornada abierta para este preventista. Ciérrala antes de abrir otra." });
+      return res.status(409).json({ error: "Ya existe una jornada abierta. Ciérrala antes de abrir otra." });
     }
 
     const { rows: todayOpenRows } = await client.query(
-      "SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2 AND status = 'open' ORDER BY COALESCE(updated_at, created_at) DESC FOR UPDATE",
-      [req.userId, date]
+      "SELECT * FROM work_days WHERE work_date = $1 AND status = 'open' ORDER BY COALESCE(updated_at, created_at) DESC FOR UPDATE",
+      [date]
     );
     if (todayOpenRows.length > 0) {
       const currentOpen = todayOpenRows[0];
-      // Reparar duplicados antiguos: conservar una abierta y cerrar las demás con sus totales.
+      // Reparar duplicados antiguos: unificar órdenes y eliminar filas duplicadas
       for (const duplicate of todayOpenRows.slice(1)) {
-        const duplicateTotals = await recalc(duplicate.id, client);
-        const ts = nowIso();
-        await client.query(
-          "UPDATE work_days SET status = 'closed', order_count = $2, total_cents = $3, closed_at = $4, updated_at = $4 WHERE id = $1",
-          [duplicate.id, duplicateTotals.orderCount, duplicateTotals.totalCents, ts]
-        );
+        await client.query("UPDATE orders SET work_day_id = $1 WHERE work_day_id = $2", [currentOpen.id, duplicate.id]);
+        await client.query("DELETE FROM work_days WHERE id = $1", [duplicate.id]);
       }
-      const payload = { workDay: serial(currentOpen) };
+      await recalc(currentOpen.id, client);
+      const { rows: reloaded } = await client.query("SELECT * FROM work_days WHERE id = $1", [currentOpen.id]);
+      const payload = { workDay: serial(reloaded[0]) };
       await client.query("COMMIT");
       inTransaction = false;
       if (closedStale || todayOpenRows.length > 1) invalidatePullCache("workdays");
-      if (req.userId) {
-        workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
-        if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
-          const oldest = workdayCache.keys().next().value;
-          if (oldest) workdayCache.delete(oldest);
-        }
-      }
+      currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
       return res.json(payload);
     }
 
     const { rows: todayClosedRows } = await client.query(
-      "SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2 AND status = 'closed' ORDER BY COALESCE(updated_at, created_at) DESC FOR UPDATE",
-      [req.userId, date]
+      "SELECT * FROM work_days WHERE work_date = $1 AND status = 'closed' ORDER BY COALESCE(updated_at, created_at) DESC FOR UPDATE",
+      [date]
     );
     if (todayClosedRows.length > 0) {
-      const payload = { workDay: serial(todayClosedRows[0]) };
+      const currentClosed = todayClosedRows[0];
+      for (const duplicate of todayClosedRows.slice(1)) {
+        await client.query("UPDATE orders SET work_day_id = $1 WHERE work_day_id = $2", [currentClosed.id, duplicate.id]);
+        await client.query("DELETE FROM work_days WHERE id = $1", [duplicate.id]);
+      }
+      await recalc(currentClosed.id, client);
+      const { rows: reloaded } = await client.query("SELECT * FROM work_days WHERE id = $1", [currentClosed.id]);
+      const payload = { workDay: serial(reloaded[0]) };
       await client.query("COMMIT");
       inTransaction = false;
-      if (closedStale) invalidatePullCache("workdays");
-      if (req.userId) {
-        workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
-        if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
-          const oldest = workdayCache.keys().next().value;
-          if (oldest) workdayCache.delete(oldest);
-        }
-      }
+      if (closedStale || todayClosedRows.length > 1) invalidatePullCache("workdays");
+      currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
       return res.json(payload);
     }
 
-    // Las jornadas anteriores de este usuario ya se cerraron arriba; crear solo
-    // cuando no existe otra jornada abierta ni una jornada cerrada para hoy.
+    // Crear la jornada compartida única de hoy
     const id = uuid();
     const ts = nowIso();
     const { rows } = await client.query(
@@ -174,15 +157,9 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     const payload = { workDay: serial(rows[0]) };
     await client.query("COMMIT");
     inTransaction = false;
-    if (closedStale) invalidateWorkdayCache();
+    invalidateWorkdayCache();
     invalidatePullCache("workdays");
-    if (req.userId) {
-      workdayCache.set(req.userId, { userId: req.userId, date, data: payload, cachedAt: Date.now() });
-      if (workdayCache.size > MAX_WORKDAY_CACHE_ENTRIES) {
-        const oldest = workdayCache.keys().next().value;
-        if (oldest) workdayCache.delete(oldest);
-      }
-    }
+    currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
     return res.json(payload);
   } catch (error) {
     if (inTransaction) {
@@ -197,7 +174,7 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
 
 workdaysRouter.get("/history", async (req: AuthedRequest, res, next) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND status = 'closed' ORDER BY work_date DESC", [req.userId]);
+    const { rows } = await pool.query("SELECT * FROM work_days WHERE status = 'closed' ORDER BY work_date DESC");
     res.json({ workDays: rows.map(serial) });
   } catch (err) {
     next(err);
@@ -206,7 +183,7 @@ workdaysRouter.get("/history", async (req: AuthedRequest, res, next) => {
 
 workdaysRouter.get("/:id/orders", async (req: AuthedRequest, res, next) => {
   try {
-    const workDay = await pool.query("SELECT id FROM work_days WHERE id = $1 AND user_id = $2", [req.params.id, req.userId]);
+    const workDay = await pool.query("SELECT id FROM work_days WHERE id = $1", [req.params.id]);
     if (workDay.rows.length === 0) return res.status(404).json({ error: "Jornada no encontrada." });
     const { rows } = await pool.query(
       `SELECT o.*, c.business_name, c.neighborhood_id AS client_neighborhood_id
@@ -237,7 +214,7 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
     inTransaction = true;
     const { rows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [req.params.id]);
     row = rows[0];
-    if (!row || row.user_id !== req.userId || row.status !== "closed") {
+    if (!row || row.status !== "closed") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Registro histórico no encontrado." });
@@ -289,10 +266,10 @@ workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
   try {
     await client.query("BEGIN");
     inTransaction = true;
-    await lockUserWorkDays(client, req.userId!);
+    await lockWorkDays(client);
     const { rows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [req.params.id]);
     const row = rows[0];
-    if (!row || row.user_id !== req.userId) {
+    if (!row) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
@@ -330,18 +307,18 @@ workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
   try {
     await client.query("BEGIN");
     inTransaction = true;
-    await lockUserWorkDays(client, req.userId!);
+    await lockWorkDays(client);
     const { rows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [req.params.id]);
     const row = rows[0];
-    if (!row || row.user_id !== req.userId) {
+    if (!row) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
     }
 
     const otherOpen = await client.query(
-      "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2 LIMIT 1 FOR UPDATE",
-      [req.userId, row.id]
+      "SELECT id FROM work_days WHERE status = 'open' AND id != $1 LIMIT 1 FOR UPDATE",
+      [row.id]
     );
     if (otherOpen.rows.length > 0) {
       await client.query("ROLLBACK");

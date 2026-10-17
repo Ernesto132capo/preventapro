@@ -40,15 +40,11 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
   }
 }
 
-/** Middleware para exigir roles específicos (ej. 'admin'). */
-export function requireRole(...allowedRoles: string[]) {
+/** Middleware para exigir roles específicos. En Modo Compartido PreventaPro, todos los usuarios autenticados tienen permisos iguales. */
+export function requireRole(..._allowedRoles: string[]) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
     if (!req.userId) {
       return res.status(401).json({ error: "No autenticado." });
-    }
-    const currentRole = req.userRole || "preventista";
-    if (!allowedRoles.includes(currentRole)) {
-      return res.status(403).json({ error: "Acceso denegado: se requieren permisos administrativos." });
     }
     next();
   };

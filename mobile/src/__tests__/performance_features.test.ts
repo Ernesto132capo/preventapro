@@ -185,9 +185,9 @@ const mockDb = {
 
     // WORKDAYS: UPDATE stale workdays < today
     if (cleanSql.includes("UPDATE work_days") && cleanSql.includes("work_date < ?")) {
-      const [userId, today] = params;
+      const today = params[params.length - 1];
       for (const wd of mockDbState.workDays) {
-        if (wd.user_id === userId && wd.status === "open" && wd.work_date < today) {
+        if (wd.status === "open" && wd.work_date < today) {
           wd.status = "closed";
           const activeOrders = mockDbState.orders.filter((o) => o.work_day_id === wd.id && o.status === "active");
           wd.order_count = activeOrders.length;
@@ -358,10 +358,10 @@ const mockDb = {
     }
 
     // WORKDAYS: workdays of today
-    if (cleanSql.startsWith("SELECT * FROM work_days WHERE user_id = ? AND work_date = ?")) {
-      const [userId, workDate] = params;
+    if (cleanSql.includes("FROM work_days WHERE work_date = ?") || cleanSql.includes("FROM work_days WHERE user_id = ? AND work_date = ?")) {
+      const workDate = params[params.length - 1];
       return [...mockDbState.workDays]
-        .filter((w) => w.user_id === userId && w.work_date === workDate)
+        .filter((w) => w.work_date === workDate)
         .sort((a, b) => {
           const aClosed = a.status === "closed" ? 0 : 1;
           const bClosed = b.status === "closed" ? 0 : 1;
@@ -371,10 +371,9 @@ const mockDb = {
     }
 
     // WORKDAYS: listClosedWorkDays
-    if (cleanSql.startsWith("SELECT * FROM work_days WHERE user_id = ? AND status = 'closed'")) {
-      const [userId] = params;
+    if (cleanSql.includes("FROM work_days WHERE status = 'closed'") || cleanSql.includes("FROM work_days WHERE user_id = ? AND status = 'closed'")) {
       return [...mockDbState.workDays]
-        .filter((w) => w.user_id === userId && w.status === "closed")
+        .filter((w) => w.status === "closed")
         .sort((a, b) => b.work_date.localeCompare(a.work_date));
     }
 
@@ -397,10 +396,10 @@ const mockDb = {
     }
 
     // WORKDAYS: check future open
-    if (cleanSql.includes("SELECT id FROM work_days WHERE user_id = ? AND status = 'open' AND work_date > ?")) {
-      const [userId, today] = params;
-      const found = mockDbState.workDays.find((w) => w.user_id === userId && w.status === "open" && w.work_date > today);
-      return found ? { id: found.id } : null;
+    if (cleanSql.includes("status = 'open' AND work_date > ?")) {
+      const today = params[params.length - 1];
+      const found = mockDbState.workDays.find((w) => w.status === "open" && w.work_date > today);
+      return found ? { ...found } : null;
     }
 
     // WORKDAYS: find by id
@@ -418,9 +417,9 @@ const mockDb = {
     }
 
     // WORKDAYS: check other open on reopen
-    if (cleanSql.includes("SELECT id FROM work_days WHERE user_id = ? AND status = 'open' AND id != ?")) {
-      const [userId, localId] = params;
-      const found = mockDbState.workDays.find((w) => w.user_id === userId && w.status === "open" && w.id !== localId);
+    if (cleanSql.includes("status = 'open' AND id != ?")) {
+      const localId = params[0];
+      const found = mockDbState.workDays.find((w) => w.status === "open" && w.id !== localId);
       return found ? { id: found.id } : null;
     }
 

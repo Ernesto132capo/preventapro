@@ -45,10 +45,10 @@ const mockDb = {
   getFirstAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
-    if (cleanSql.includes("SELECT * FROM work_days WHERE user_id = ? AND status = 'open' AND work_date > ?")) {
-      const [userId, today] = params;
+    if (cleanSql.includes("status = 'open' AND work_date > ?")) {
+      const today = params[params.length - 1];
       const found = mockState.workdays.find(
-        (w) => w.user_id === userId && w.status === "open" && w.work_date > today
+        (w) => w.status === "open" && w.work_date > today
       );
       return found ? { ...found } : null;
     }
@@ -70,9 +70,9 @@ const mockDb = {
   getAllAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
-    if (cleanSql.includes("SELECT * FROM work_days WHERE user_id = ? AND work_date = ?")) {
-      const [userId, today] = params;
-      return mockState.workdays.filter((w) => w.user_id === userId && w.work_date === today);
+    if (cleanSql.includes("FROM work_days WHERE work_date = ?") || cleanSql.includes("FROM work_days WHERE user_id = ? AND work_date = ?")) {
+      const workDate = params[params.length - 1];
+      return mockState.workdays.filter((w) => w.work_date === workDate);
     }
 
     if (cleanSql.includes("GROUP BY server_id HAVING COUNT(*) > 1")) {

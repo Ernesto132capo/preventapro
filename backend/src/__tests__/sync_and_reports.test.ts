@@ -329,7 +329,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         const clean = sql.replace(/\s+/g, " ").trim();
         if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
         if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
-        if (clean.includes("SELECT * FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE")) {
+        if (clean.includes("SELECT * FROM orders WHERE id = $1") && clean.includes("FOR UPDATE")) {
           return { rows: [{ id: "order-to-cancel", work_day_id: "wd-closed-99", user_id: "usr-test-1", status: "active" }] };
         }
         if (clean.includes("SELECT status FROM work_days WHERE id = $1")) {
@@ -600,7 +600,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         if (clean.includes("SELECT * FROM work_days WHERE id = $1 FOR UPDATE")) {
           return { rows: [{ id: "wd-past", user_id: "usr-test-1", status: "closed" }] };
         }
-        if (clean.includes("SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2")) {
+        if (clean.includes("SELECT id FROM work_days WHERE status = 'open' AND id !=") || clean.includes("SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2")) {
           return { rows: [{ id: "wd-another-open" }] }; // Otra jornada abierta
         }
         return { rows: [] };
@@ -623,7 +623,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         if (clean.includes("SELECT * FROM work_days WHERE id = $1 FOR UPDATE")) {
           return { rows: [{ id: "wd-past", user_id: "usr-test-1", status: "closed", work_date: "2026-10-15" }] };
         }
-        if (clean.includes("SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2")) {
+        if (clean.includes("SELECT id FROM work_days WHERE status = 'open' AND id !=") || clean.includes("SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2")) {
           return { rows: [] }; // Ninguna otra abierta
         }
         if (clean.includes("SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders")) {
@@ -660,7 +660,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
     it("closeStaleOpenWorkDays cierra jornadas antiguas automáticamente con pedidos activos", async () => {
       mockClient.query.mockImplementation(async (sql: string) => {
         const clean = sql.replace(/\s+/g, " ").trim();
-        if (clean.includes("SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND work_date < $2")) {
+        if (clean.includes("status = 'open' AND work_date <")) {
           return { rows: [{ id: "stale-wd-1" }] };
         }
         if (clean.includes("UPDATE work_days wd SET status = 'closed'")) {
@@ -877,7 +877,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
   // ───────────────────────────────────────────────────────────────────────────
   describe("5. Auditoría y Endurecimiento (C-01, C-02, A-02, A-12, M-02, M-03, M-04)", () => {
     describe("[C-01] Prevención IDOR en descarga de reportes", () => {
-      it("rechaza con 403 Forbidden si un preventista intenta obtener token de descarga de otra jornada", async () => {
+      it("permite en modo compartido colaborativo que un preventista obtenga token de descarga de la jornada", async () => {
         mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
           if (sql.includes("FROM work_days WHERE id = $1")) {
             return {
@@ -894,8 +894,8 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
           userRole: "preventista",
         });
 
-        expect(res.status).toBe(403);
-        expect(res.body.error).toContain("Acceso denegado a reportes de otra jornada.");
+        expect(res.status).toBe(200);
+        expect(res.body.downloadToken).toBeDefined();
       });
 
       it("permite a un usuario con rol 'admin' obtener token de descarga para cualquier jornada", async () => {

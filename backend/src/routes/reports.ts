@@ -92,13 +92,9 @@ void cleanupExpiredReportDirectories();
 reportsRouter.post("/:workDayId/download-token", requireAuth, async (req: AuthedRequest, res) => {
   const { workDayId } = req.params;
   try {
-    const { rows } = await pool.query("SELECT id, user_id FROM work_days WHERE id = $1", [workDayId]);
+    const { rows } = await pool.query("SELECT id FROM work_days WHERE id = $1", [workDayId]);
     if (rows.length === 0) {
       return res.status(404).json({ error: "Jornada no encontrada." });
-    }
-    const workday = rows[0];
-    if (workday.user_id && workday.user_id !== req.userId && req.userRole !== "admin") {
-      return res.status(403).json({ error: "Acceso denegado a reportes de otra jornada." });
     }
     res.json({ downloadToken: createReportDownloadToken(workDayId) });
   } catch (err: any) {

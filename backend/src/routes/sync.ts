@@ -171,10 +171,10 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   let resolveForcedPull: ((value: PullCache) => void) | undefined;
   let forcedKey: string | undefined;
   try {
-    const since = req.query.since ? String(req.query.since) : "1970-01-01T00:00:00.000Z";
+    const requestedForce = req.query.force === "1";
+    const since = (requestedForce || !req.query.since) ? "1970-01-01T00:00:00.000Z" : String(req.query.since);
     const pullKey = `${req.userId}:${since}`;
     const isInitial = !req.query.since || since.startsWith("1970");
-    const requestedForce = req.query.force === "1";
 
     const now = Date.now();
     const userLastForce = lastRealForceFetchByUser.get(req.userId!) || 0;
@@ -268,11 +268,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
         cachedRows(
           "workdays",
           workdayQueryCache,
-          `${req.userId}:${cursorKey}`,
+          `shared:${cursorKey}`,
           async () =>
             isInitial
-              ? (await pool.query("SELECT * FROM work_days WHERE user_id = $1 ORDER BY work_date DESC LIMIT 30", [req.userId])).rows
-              : (await pool.query("SELECT * FROM work_days WHERE user_id = $1 AND updated_at > $2", [req.userId, since])).rows,
+              ? (await pool.query("SELECT * FROM work_days ORDER BY work_date DESC LIMIT 30")).rows
+              : (await pool.query("SELECT * FROM work_days WHERE updated_at > $1", [since])).rows,
           force
         ),
         cachedRows(
@@ -561,8 +561,8 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
   if (action === "cancel") {
     const targetOrderId = data.serverId || data.server_id || data.id || localId;
     const { rows: existing } = await client.query(
-      "SELECT * FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE",
-      [targetOrderId, userId]
+      "SELECT * FROM orders WHERE id = $1 FOR UPDATE",
+      [targetOrderId]
     );
     if (existing.length > 0) {
       const order = existing[0];
@@ -594,19 +594,29 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
     wd = rows[0];
   }
   if (!wd) {
-    // Intentar resolver por fecha y usuario
+    // Intentar resolver por fecha para la jornada compartida del negocio
     const orderDate = data.work_date || (data.createdAt ? String(data.createdAt).slice(0, 10) : getBoliviaToday());
     const { rows } = await client.query(
-      "SELECT * FROM work_days WHERE user_id = $1 AND work_date = $2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
-      [userId, orderDate]
+      "SELECT * FROM work_days WHERE work_date = $1 ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC LIMIT 1 FOR UPDATE",
+      [orderDate]
     );
     wd = rows[0];
   }
   if (!wd) {
-    throw new Error("No se encontró la jornada asociada para esta preventa.");
+    // Si no existe ninguna jornada en el servidor para esa fecha, crearla
+    const orderDate = data.work_date || (data.createdAt ? String(data.createdAt).slice(0, 10) : getBoliviaToday());
+    const newWdId = uuid();
+    const ts = nowIso();
+    const { rows: createdWd } = await client.query(
+      `INSERT INTO work_days (id, user_id, work_date, status, order_count, total_cents, created_at, updated_at)
+       VALUES ($1, $2, $3, 'open', 0, 0, $4, $4)
+       RETURNING *`,
+      [newWdId, userId, orderDate, ts]
+    );
+    wd = createdWd[0];
   }
 
-  // Regla de jornada cerrada: admitir pedidos legítimos tomados offline antes del cierre
+  // Regla de jornada cerrada: admitir pedidos legítimos tomados offline antes del cierre o durante el día
   if (wd.status === "closed") {
     const orderCreatedAt = data.createdAt || data.created_at;
     const isLegitimateOfflineOrder = Boolean(

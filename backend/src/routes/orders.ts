@@ -233,19 +233,14 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     inTransaction = true;
 
     // Comparte el lock del ciclo de vida de jornadas para serializar ventas
-    // con aperturas/cierres del mismo preventista.
-    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
+    // con aperturas/cierres compartidos del negocio.
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
 
     // El lock transaccional serializa reintentos simultáneos con la misma clave,
     // incluso en instalaciones que aún no tengan un índice UNIQUE para ella.
     await client.query("SELECT pg_advisory_xact_lock(1002, hashtext($1))", [d.idempotencyKey]);
     const existing = await client.query("SELECT id, user_id FROM orders WHERE idempotency_key = $1 LIMIT 1", [d.idempotencyKey]);
     if (existing.rows.length > 0) {
-      if (existing.rows[0].user_id !== req.userId) {
-        await client.query("ROLLBACK");
-        inTransaction = false;
-        return res.status(404).json({ error: "Preventa no encontrada." });
-      }
       const existingOrder = await full(existing.rows[0].id, client);
       await client.query("COMMIT");
       inTransaction = false;
@@ -256,7 +251,7 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     // anteriores a esta preventa o la cierre entre validación e inserción.
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [d.workDayId]);
     const wd = wdRows[0];
-    if (!wd || wd.user_id !== req.userId) {
+    if (!wd) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
@@ -269,7 +264,8 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
         orderCreatedAt &&
         (
           !wd.closed_at ||
-          new Date(orderCreatedAt).getTime() <= new Date(wd.closed_at).getTime() + 15 * 60 * 1000
+          new Date(orderCreatedAt).getTime() <= new Date(wd.closed_at).getTime() + 60 * 60 * 1000 ||
+          String(orderCreatedAt).slice(0, 10) === wd.work_date
         )
       );
 
@@ -280,13 +276,13 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
       }
     }
     const otherOpen = await client.query(
-      "SELECT id FROM work_days WHERE user_id = $1 AND status = 'open' AND id != $2 LIMIT 1",
-      [req.userId, wd.id]
+      "SELECT id FROM work_days WHERE status = 'open' AND id != $1 LIMIT 1",
+      [wd.id]
     );
     if (otherOpen.rows.length > 0 && wd.status !== "closed") {
       await client.query("ROLLBACK");
       inTransaction = false;
-      return res.status(409).json({ error: "Hay otra jornada abierta para este preventista. Resuelve esa jornada antes de registrar preventas." });
+      return res.status(409).json({ error: "Hay otra jornada abierta. Resuelve esa jornada antes de registrar preventas." });
     }
 
     const { rows: clRows } = await client.query("SELECT * FROM clients WHERE id = $1 FOR SHARE", [d.clientId]);
@@ -358,7 +354,7 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
 ordersRouter.get("/:id", async (req: AuthedRequest, res, next) => {
   try {
     const o = await full(req.params.id);
-    if (!o || o.user_id !== req.userId) return res.status(404).json({ error: "Preventa no encontrada." });
+    if (!o) return res.status(404).json({ error: "Preventa no encontrada." });
     res.json({ order: o });
   } catch (err) {
     next(err);
@@ -380,21 +376,16 @@ ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
       inTransaction = false;
       return res.status(404).json({ error: "Preventa no encontrada." });
     }
-    if (order.user_id !== req.userId) {
-      await client.query("ROLLBACK");
-      inTransaction = false;
-      return res.status(404).json({ error: "Preventa no encontrada." });
-    }
     if (order.status !== "active") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "Solo se pueden editar preventas activas." });
     }
-    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
 
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
-    if (!wd || wd.user_id !== req.userId) {
+    if (!wd) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
@@ -474,20 +465,15 @@ ordersRouter.post("/:id/cancel", async (req: AuthedRequest, res) => {
       inTransaction = false;
       return res.status(404).json({ error: "Preventa no encontrada." });
     }
-    if (order.user_id !== req.userId) {
-      await client.query("ROLLBACK");
-      inTransaction = false;
-      return res.status(404).json({ error: "Preventa no encontrada." });
-    }
     if (order.status !== "active") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "Solo se pueden cancelar preventas activas." });
     }
-    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", [`workdays:${req.userId}`]);
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
-    if (!wd || wd.user_id !== req.userId) {
+    if (!wd) {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(404).json({ error: "Jornada no encontrada." });
