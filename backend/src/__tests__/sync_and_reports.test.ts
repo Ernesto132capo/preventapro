@@ -38,6 +38,8 @@ vi.mock("../middleware/auth", () => ({
 import { syncRouter } from "../routes/sync";
 import { workdaysRouter, closeStaleOpenWorkDays } from "../routes/workdays";
 import { reportsRouter } from "../routes/reports";
+import { clientsRouter } from "../routes/clients";
+import { formatClientDisplayName } from "../services/client-display";
 import {
   generateClientReceiptsExcel,
   generateClientSummaryExcel,
@@ -1150,6 +1152,165 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         expect(sanitized).toContain("José");
         expect(sanitized).toContain("->");
         expect(sanitized).toContain("-");
+      });
+    });
+
+    describe("[Objetivo 1 y 2] Lista consolidada de productos y Flexibilidad de Nombres de Cliente", () => {
+      it("[Objetivo 2] formatClientDisplayName maneja correctamente Casos A, B y C sin nulls ni líneas vacías", () => {
+        // Caso A: Ambos
+        const casoA = formatClientDisplayName({ business_name: "Tienda Doña Rosa", contact_name: "Rosa Flores" });
+        expect(casoA.primary).toBe("Tienda Doña Rosa");
+        expect(casoA.secondary).toBe("Rosa Flores");
+        expect(casoA.fullTitle).toBe("Tienda Doña Rosa\nRosa Flores");
+
+        // Caso B: Solo Propietario (sin Tienda)
+        const casoB = formatClientDisplayName({ business_name: "", contact_name: "Carlos Gómez" });
+        expect(casoB.primary).toBe("Carlos Gómez");
+        expect(casoB.secondary).toBeNull();
+        expect(casoB.fullTitle).toBe("Carlos Gómez");
+
+        // Caso C: Solo Tienda (sin Propietario)
+        const casoC = formatClientDisplayName({ business_name: "Minimarket Central", contact_name: "" });
+        expect(casoC.primary).toBe("Minimarket Central");
+        expect(casoC.secondary).toBeNull();
+        expect(casoC.fullTitle).toBe("Minimarket Central");
+
+        // Fallback sin datos
+        const fallback = formatClientDisplayName({});
+        expect(fallback.primary).toBe("Cliente");
+        expect(fallback.secondary).toBeNull();
+      });
+
+      it("[Objetivo 2] clientsRouter valida que al menos un nombre esté presente al crear cliente", async () => {
+        const app = express();
+        app.use(express.json());
+        app.use("/clients", clientsRouter);
+
+        // Intento con ambos vacíos -> Rechazo 400
+        const resEmpty = await makeRequest(app, {
+          method: "POST",
+          url: "/clients",
+          body: { businessName: "", contactName: "" },
+        });
+        expect(resEmpty.status).toBe(400);
+        expect(resEmpty.body.error).toContain("Debes ingresar al menos el nombre del negocio o el nombre del propietario");
+
+        // Configuración de mock para INSERTs exitosos
+        mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
+          if (sql === "BEGIN" || sql === "COMMIT") return { rows: [] };
+          if (sql.includes("INSERT INTO clients")) {
+            return {
+              rows: [{
+                id: params?.[0] || "c-created-1",
+                business_name: params?.[1] || null,
+                contact_name: params?.[2] || null,
+                phone: params?.[3] || null,
+                address: null,
+                active: true,
+              }],
+            };
+          }
+          return { rows: [] };
+        });
+
+        // Creación con solo nombre de propietario -> 201 Exitoso
+        const resOwner = await makeRequest(app, {
+          method: "POST",
+          url: "/clients",
+          body: { contact_name: "Don Pedro", phone: "70012345" },
+        });
+        expect(resOwner.status).toBe(201);
+        expect(resOwner.body.client.contact_name).toBe("Don Pedro");
+
+        // Creación con solo nombre de negocio -> 201 Exitoso
+        const resStore = await makeRequest(app, {
+          method: "POST",
+          url: "/clients",
+          body: { business_name: "Pulpería El Carmen" },
+        });
+        expect(resStore.status).toBe(201);
+        expect(resStore.body.client.business_name).toBe("Pulpería El Carmen");
+      });
+
+      it("[Objetivo 1] generateProductListExcel genera exactamente las 4 columnas requeridas y fila TOTAL GENERAL", async () => {
+        mockPool.query.mockImplementation(async (sql: string) => {
+          if (sql.includes("FROM work_days")) {
+            return { rows: [{ id: "wd-prod-test", work_date: "2026-10-16", user_id: "usr-1", status: "closed" }] };
+          }
+          if (sql.includes("JOIN order_items oi") || sql.includes("FROM order_items oi")) {
+            return {
+              rows: [
+                {
+                  order_item_id: "oi-1",
+                  client_id: "c-1",
+                  business_name: "Tienda 1",
+                  contact_name: "Dueño 1",
+                  product_name_snapshot: "Papas en tira",
+                  presentation_name_snapshot: "Bolsa 500g",
+                  unit_price_cents_snapshot: 2800,
+                  quantity: 10,
+                  subtotal_cents: 28000,
+                  order_id: "o-1",
+                  created_at: "2026-10-16T10:00:00Z",
+                  receipt_number: "001",
+                },
+                {
+                  order_item_id: "oi-2",
+                  client_id: "c-1",
+                  business_name: "Tienda 1",
+                  contact_name: "Dueño 1",
+                  product_name_snapshot: "Bombón",
+                  presentation_name_snapshot: "Caja x24",
+                  unit_price_cents_snapshot: 6000,
+                  quantity: 10,
+                  subtotal_cents: 60000,
+                  order_id: "o-1",
+                  created_at: "2026-10-16T10:00:00Z",
+                  receipt_number: "001",
+                },
+              ],
+            };
+          }
+          if (sql.includes("FROM order_item_selections")) {
+            return { rows: [] };
+          }
+          return { rows: [] };
+        });
+
+        const filePath = await generateProductListExcel("wd-prod-test", tempDir);
+        expect(fs.existsSync(filePath)).toBe(true);
+
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.readFile(filePath);
+        const ws = wb.getWorksheet("Lista de Productos");
+        expect(ws).toBeDefined();
+
+        // Verificar encabezados de las 4 columnas (fila 3)
+        const headerRow = ws!.getRow(3);
+        expect(headerRow.getCell(1).value).toBe("Producto");
+        expect(headerRow.getCell(2).value).toBe("Precio Unitario");
+        expect(headerRow.getCell(3).value).toBe("Precio Total");
+        expect(headerRow.getCell(4).value).toBe("Total de Unidades Pedidas");
+
+        // Fila 4: Papas en tira
+        const r1 = ws!.getRow(4);
+        expect(r1.getCell(1).value).toBe("Papas en tira (Bolsa 500g)");
+        expect(r1.getCell(2).value).toBe(28); // Bs 28
+        expect(r1.getCell(3).value).toBe(280); // Bs 280
+        expect(r1.getCell(4).value).toBe(10); // 10 unidades
+
+        // Fila 5: Bombón
+        const r2 = ws!.getRow(5);
+        expect(r2.getCell(1).value).toBe("Bombón (Caja x24)");
+        expect(r2.getCell(2).value).toBe(60); // Bs 60
+        expect(r2.getCell(3).value).toBe(600); // Bs 600
+        expect(r2.getCell(4).value).toBe(10); // 10 unidades
+
+        // Fila 7: TOTAL GENERAL (fila 6 es separador)
+        const totalRow = ws!.getRow(7);
+        expect(totalRow.getCell(1).value).toBe("TOTAL GENERAL");
+        expect(totalRow.getCell(3).value).toBe(880); // 280 + 600 = 880
+        expect(totalRow.getCell(4).value).toBe(20); // 10 + 10 = 20
       });
     });
   });

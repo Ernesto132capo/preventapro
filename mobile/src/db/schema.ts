@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS clients (
   id TEXT PRIMARY KEY,
   server_id TEXT,
-  business_name TEXT NOT NULL,
+  business_name TEXT,
   contact_name TEXT,
   phone TEXT,
   neighborhood_id TEXT,

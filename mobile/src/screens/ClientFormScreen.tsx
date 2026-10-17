@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, TextInput, StyleSheet, ScrollView } from "react-native";
+import { View, Text, TextInput, StyleSheet, ScrollView, Alert } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "../components/Button";
@@ -31,7 +31,7 @@ export function ClientFormScreen() {
     (async () => {
       const client = await getClient(clientId);
       if (client) {
-        setBusinessName(client.business_name);
+        setBusinessName(client.business_name || "");
         setContactName(client.contact_name || "");
         setPhone(client.phone || "");
         setAddress(client.address || "");
@@ -44,8 +44,11 @@ export function ClientFormScreen() {
     if (isSubmittingRef.current || saving) return;
     setError(null);
     const trimmedBusinessName = businessName.trim();
-    if (!trimmedBusinessName) {
-      setError("El nombre del negocio es obligatorio.");
+    const trimmedContactName = contactName.trim();
+    if (!trimmedBusinessName && !trimmedContactName) {
+      const msg = "Debes ingresar al menos el nombre del negocio o el nombre del propietario";
+      setError(msg);
+      Alert.alert("Dato requerido", msg);
       return;
     }
     isSubmittingRef.current = true;
@@ -53,14 +56,14 @@ export function ClientFormScreen() {
     try {
       const client = isEditing
         ? await updateClientLocal(clientId!, {
-            businessName: trimmedBusinessName,
-            contactName: contactName.trim() || undefined,
+            businessName: trimmedBusinessName || undefined,
+            contactName: trimmedContactName || undefined,
             phone: phone.trim() || undefined,
             address: address.trim() || undefined,
           })
         : await createClientLocal({
-            businessName: trimmedBusinessName,
-            contactName: contactName.trim() || undefined,
+            businessName: trimmedBusinessName || undefined,
+            contactName: trimmedContactName || undefined,
             phone: phone.trim() || undefined,
             address: address.trim() || undefined,
           });
@@ -82,8 +85,11 @@ export function ClientFormScreen() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
-      <Field label="Nombre del negocio *" value={businessName} onChangeText={setBusinessName} placeholder="Tienda Doña Rosa" maxLength={120} />
-      <Field label="Propietario o contacto" value={contactName} onChangeText={setContactName} placeholder="Rosa Mamani" maxLength={100} />
+      <Field label="Nombre del negocio o tienda" value={businessName} onChangeText={setBusinessName} placeholder="Ej. Tienda Doña Rosa (opcional si hay propietario)" maxLength={120} />
+      <Field label="Nombre del propietario o contacto" value={contactName} onChangeText={setContactName} placeholder="Ej. Rosa Mamani (opcional si hay negocio)" maxLength={100} />
+      <Text style={{ fontSize: 12, color: colors.emeraldDark, marginTop: -spacing.xs, marginBottom: spacing.md, fontWeight: "500" }}>
+        * Al menos uno de los dos nombres anteriores debe estar registrado.
+      </Text>
       <Field label="Teléfono / WhatsApp" value={phone} onChangeText={setPhone} placeholder="77712345" keyboardType="phone-pad" maxLength={30} />
       <Field label="Dirección" value={address} onChangeText={setAddress} placeholder="Av. Principal 123" maxLength={200} />
 

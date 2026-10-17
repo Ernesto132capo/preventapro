@@ -3,6 +3,7 @@ import { getDb, nowIso } from "../client";
 import { enqueue } from "../outbox";
 import { CartLine, LocalOrder } from "../../domain/types";
 import { calcOrderTotals, PricingError } from "../../domain/pricing";
+import { formatClientDisplayName } from "../../domain/client-display";
 import { getClient } from "./clients";
 import { withUserWorkDayLock } from "./workdays";
 
@@ -35,6 +36,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
 
   const client = await getClient(input.clientId);
   if (!client) throw new PricingError("Cliente no encontrado.");
+  const clientDisplayName = formatClientDisplayName(client).fullTitle.replace("\n", " - ");
 
   const db = await getDb();
   const orderId = uuid();
@@ -61,7 +63,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
         orderId,
         currentWorkDay.id,
         input.clientId,
-        client.business_name,
+        clientDisplayName,
         input.paymentCondition,
         totals.subtotalCents,
         totals.taxCents,
@@ -132,27 +134,112 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
   return row as LocalOrder;
 }
 
-export async function listOrdersForWorkDay(workDayLocalId: string): Promise<LocalOrder[]> {
+export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(LocalOrder & { business_name?: string | null; contact_name?: string | null })[]> {
   const db = await getDb();
   const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
     `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
     [workDayLocalId]
   );
   if (wd?.server_id) {
-    return db.getAllAsync<LocalOrder>(
-      `SELECT * FROM orders WHERE (work_day_id = ? OR work_day_id = ? OR work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?)) AND status = 'active' ORDER BY created_at DESC`,
+    return db.getAllAsync<any>(
+      `SELECT o.*, c.business_name, c.contact_name
+       FROM orders o
+       LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
+       WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?))
+         AND o.status = 'active'
+       ORDER BY o.created_at DESC`,
       [workDayLocalId, wd.server_id, wd.server_id, wd.user_id]
     );
   }
-  return db.getAllAsync<LocalOrder>(
-    `SELECT * FROM orders WHERE work_day_id = ? AND status = 'active' ORDER BY created_at DESC`,
+  return db.getAllAsync<any>(
+    `SELECT o.*, c.business_name, c.contact_name
+     FROM orders o
+     LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
+     WHERE o.work_day_id = ? AND o.status = 'active'
+     ORDER BY o.created_at DESC`,
     [workDayLocalId]
   );
 }
 
+export interface ConsolidatedProductRow {
+  productName: string;
+  presentationName: string;
+  unitPriceCents: number;
+  totalSubtotalCents: number;
+  totalUnits: number;
+}
+
+/**
+ * Retorna la lista consolidada de productos pedidos de la jornada (excluyendo cancelados)
+ * con las 4 columnas de negocio: Producto | Precio Unitario | Precio Total | Total de Unidades
+ */
+export async function getConsolidatedProductsForWorkDay(workDayLocalId: string): Promise<{
+  items: ConsolidatedProductRow[];
+  grandTotalCents: number;
+  grandTotalUnits: number;
+}> {
+  const db = await getDb();
+  const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
+    `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
+    [workDayLocalId]
+  );
+  const rows = await db.getAllAsync<{
+    product_name_snapshot: string;
+    presentation_name_snapshot: string;
+    unit_price_cents_snapshot: number;
+    total_quantity: number;
+    total_subtotal_cents: number;
+  }>(
+    `SELECT
+       oi.product_name_snapshot,
+       oi.presentation_name_snapshot,
+       oi.unit_price_cents_snapshot,
+       SUM(oi.quantity) AS total_quantity,
+       SUM(oi.subtotal_cents) AS total_subtotal_cents
+     FROM orders o
+     JOIN order_items oi ON oi.order_id = o.id
+     WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ? AND user_id = ?))
+       AND o.status = 'active'
+     GROUP BY oi.product_name_snapshot, oi.presentation_name_snapshot, oi.unit_price_cents_snapshot
+     ORDER BY oi.product_name_snapshot COLLATE NOCASE ASC, oi.presentation_name_snapshot COLLATE NOCASE ASC`,
+    [workDayLocalId, wd?.server_id ?? workDayLocalId, wd?.server_id ?? "", wd?.user_id ?? ""]
+  );
+
+  let grandTotalCents = 0;
+  let grandTotalUnits = 0;
+  const items: ConsolidatedProductRow[] = (rows || []).map((r) => {
+    const isSpecialPres = r.presentation_name_snapshot &&
+      r.presentation_name_snapshot !== "Unidad" &&
+      r.presentation_name_snapshot !== "Default" &&
+      r.presentation_name_snapshot !== r.product_name_snapshot;
+    const displayName = isSpecialPres
+      ? `${r.product_name_snapshot} (${r.presentation_name_snapshot})`
+      : r.product_name_snapshot;
+    const units = Number(r.total_quantity || 0);
+    const subtotal = Number(r.total_subtotal_cents || 0);
+    grandTotalCents += subtotal;
+    grandTotalUnits += units;
+    return {
+      productName: displayName,
+      presentationName: r.presentation_name_snapshot,
+      unitPriceCents: Number(r.unit_price_cents_snapshot || 0),
+      totalSubtotalCents: subtotal,
+      totalUnits: units,
+    };
+  });
+
+  return { items, grandTotalCents, grandTotalUnits };
+}
+
 export async function getOrderWithItems(orderId: string) {
   const db = await getDb();
-  const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ? OR server_id = ?`, [orderId, orderId]);
+  const order = await db.getFirstAsync<any>(
+    `SELECT o.*, c.business_name, c.contact_name
+     FROM orders o
+     LEFT JOIN clients c ON c.id = o.client_id OR c.server_id = o.client_id
+     WHERE o.id = ? OR o.server_id = ?`,
+    [orderId, orderId]
+  );
   if (!order) return { order: null, items: [] };
   const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
   const itemIds = items.map((i) => i.id);

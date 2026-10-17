@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { pool } from "../db/pg";
 import { formatBoliviaDate } from "./dates";
+import { formatClientDisplayName } from "./client-display";
 
 export interface ReceiptSelection {
   id: string;
@@ -20,7 +21,8 @@ export interface ReceiptLine {
   total_cents: number;
   subtotal_cents_order: number;
   tax_cents_order: number;
-  business_name: string;
+  business_name: string | null;
+  contact_name: string | null;
   address: string | null;
   receipt_number: number;
   product_name_snapshot: string;
@@ -74,7 +76,7 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
     `SELECT
        o.id AS order_id, o.created_at, o.subtotal_cents AS subtotal_cents_order,
        o.tax_cents AS tax_cents_order, o.total_cents, o.receipt_number,
-       c.business_name, c.address,
+       c.business_name, c.contact_name, c.address,
        oi.id AS order_item_id,
        oi.product_name_snapshot, oi.presentation_name_snapshot, oi.quantity,
        oi.unit_price_cents_snapshot, oi.subtotal_cents
@@ -119,7 +121,8 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
     total_cents: Number(r.total_cents),
     subtotal_cents_order: Number(r.subtotal_cents_order ?? r.total_cents),
     tax_cents_order: Number(r.tax_cents_order ?? 0),
-    business_name: r.business_name,
+    business_name: r.business_name ?? null,
+    contact_name: r.contact_name ?? null,
     address: r.address,
     receipt_number: Number(r.receipt_number),
     product_name_snapshot: r.product_name_snapshot,
@@ -181,7 +184,11 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
         doc.moveDown(0.35);
         doc.fillColor("#111827").font("Helvetica").fontSize(10);
         doc.text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 });
-        doc.text(`Cliente: ${sanitizePdfText(first.business_name)}`);
+        const { primary, secondary } = formatClientDisplayName(first);
+        doc.text(`Cliente: ${sanitizePdfText(primary)}`);
+        if (secondary) {
+          doc.text(`Propietario: ${sanitizePdfText(secondary)}`);
+        }
         doc.text(`Fecha: ${formatBoliviaDate(first.created_at)}`);
         if (first.address) doc.text(`Dirección: ${sanitizePdfText(first.address)}`);
         doc.moveDown(0.45);

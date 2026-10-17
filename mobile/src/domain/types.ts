@@ -137,6 +137,8 @@ export interface LocalOrder {
   work_day_local_id: string;
   client_id: string;
   client_name: string;
+  business_name?: string | null;
+  contact_name?: string | null;
   payment_condition: string;
   subtotal_cents: number;
   tax_cents: number;

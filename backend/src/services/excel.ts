@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { pool } from "../db/pg";
 import { formatBoliviaDate } from "./dates";
+import { formatClientDisplayName } from "./client-display";
 
 export interface OrderSelectionSnapshot {
   id: string;
@@ -17,6 +18,7 @@ export interface ProductLineRow {
   order_item_id: string;
   client_id?: string;
   business_name: string;
+  contact_name?: string | null;
   address: string | null;
   product_name_snapshot: string;
   presentation_name_snapshot: string;
@@ -97,7 +99,7 @@ async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[
     `SELECT
        oi.id AS order_item_id,
        c.id AS client_id,
-       c.business_name, c.address,
+       c.business_name, c.contact_name, c.address,
        oi.product_name_snapshot, oi.presentation_name_snapshot, oi.quantity,
        oi.unit_price_cents_snapshot, oi.subtotal_cents,
        o.id AS order_id, o.subtotal_cents AS order_subtotal_cents, o.tax_cents AS order_tax_cents,
@@ -140,6 +142,7 @@ async function productRowsForWorkDay(workDayId: string): Promise<ProductLineRow[
     order_item_id: row.order_item_id,
     client_id: row.client_id,
     business_name: row.business_name,
+    contact_name: row.contact_name,
     address: row.address,
     product_name_snapshot: row.product_name_snapshot,
     presentation_name_snapshot: row.presentation_name_snapshot,
@@ -167,65 +170,106 @@ function styleClientHeading(row: ExcelJS.Row) {
   row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: accentFill } };
 }
 
-/** Lista por cliente, sin SKU/barrio ni datos repetidos por cada producto. */
+/**
+ * Lista consolidada de productos pedidos en la jornada (excluyendo cancelados/anulados):
+ * 4 columnas exactas:
+ * 1. Producto (nombre del producto / presentación)
+ * 2. Precio Unitario
+ * 3. Precio Total (subtotal acumulado de ese producto)
+ * 4. Total de Unidades Pedidas
+ * Fila final: TOTAL GENERAL (suma de Precio Total y Total de Unidades)
+ */
 export async function generateProductListExcel(workDayId: string, outDir: string): Promise<string> {
-  const rows = await productRowsForWorkDay(workDayId);
+  const rawRows = await productRowsForWorkDay(workDayId);
   const wb = new ExcelJS.Workbook();
   const sheet = wb.addWorksheet(getUniqueSheetName(wb, "Lista de Productos"));
-  sheet.columns = [{ width: 32 }, { width: 22 }, { width: 12 }, { width: 20 }, { width: 20 }];
-  sheet.mergeCells("A1:E1");
-  sheet.getCell("A1").value = "Lista de productos por cliente";
+  sheet.columns = [
+    { width: 38 }, // Producto
+    { width: 22 }, // Precio Unitario
+    { width: 22 }, // Precio Total
+    { width: 26 }, // Total de Unidades Pedidas
+  ];
+  sheet.mergeCells("A1:D1");
+  sheet.getCell("A1").value = "LISTA DE PRODUCTOS PEDIDOS";
   sheet.getCell("A1").font = { bold: true, size: 16, color: { argb: "FFFFFFFF" } };
   sheet.getCell("A1").fill = { type: "pattern", pattern: "solid", fgColor: { argb: headerFill } };
-  sheet.getCell("A1").alignment = { horizontal: "center" };
+  sheet.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
   sheet.addRow([]);
 
-  const byOrder = new Map<string, ProductLineRow[]>();
-  for (const row of rows) byOrder.set(row.order_id, [...(byOrder.get(row.order_id) || []), row]);
+  styleTableHeader(sheet.addRow([
+    "Producto",
+    "Precio Unitario",
+    "Precio Total",
+    "Total de Unidades Pedidas",
+  ]));
 
-  for (const [, lines] of byOrder) {
-    const first = lines[0];
-    const clientRow = sheet.addRow([`Cliente: ${first.business_name}`]);
-    sheet.mergeCells(`A${clientRow.number}:E${clientRow.number}`);
-    styleClientHeading(clientRow);
-    styleTableHeader(sheet.addRow(["Producto", "Presentación", "Cantidad", "Precio unitario (Bs.)", "Subtotal (Bs.)"]));
+  interface AggregatedProduct {
+    displayName: string;
+    unitPriceCents: number;
+    totalSubtotalCents: number;
+    totalUnits: number;
+  }
+  const map = new Map<string, AggregatedProduct>();
 
-    for (const line of lines) {
-      const isCombo = line.selections && line.selections.length > 0;
-      const displayName = isCombo ? `${line.product_name_snapshot} (Combo)` : line.product_name_snapshot;
-      const row = sheet.addRow([
+  for (const row of rawRows) {
+    const key = `${row.product_name_snapshot}__${row.presentation_name_snapshot}__${row.unit_price_cents_snapshot}`;
+    const qty = Number(row.quantity || 0);
+    const subtotal = Number(row.subtotal_cents ?? (row.unit_price_cents_snapshot * qty));
+    const isSpecialPres = row.presentation_name_snapshot &&
+      row.presentation_name_snapshot !== "Unidad" &&
+      row.presentation_name_snapshot !== "Default" &&
+      row.presentation_name_snapshot !== row.product_name_snapshot;
+    const isCombo = row.selections && row.selections.length > 0;
+    const baseName = isCombo ? `${row.product_name_snapshot} (Combo)` : row.product_name_snapshot;
+    const displayName = isSpecialPres ? `${baseName} (${row.presentation_name_snapshot})` : baseName;
+
+    const existing = map.get(key);
+    if (existing) {
+      existing.totalUnits += qty;
+      existing.totalSubtotalCents += subtotal;
+    } else {
+      map.set(key, {
         displayName,
-        line.presentation_name_snapshot,
-        line.quantity,
-        line.unit_price_cents_snapshot / 100,
-        line.subtotal_cents / 100,
-      ]);
-      row.getCell(4).numFmt = moneyFormat;
-      row.getCell(5).numFmt = moneyFormat;
-
-      // Desglose de opciones seleccionadas en combos
-      if (isCombo) {
-        for (const sel of line.selections) {
-          const selRow = sheet.addRow([
-            `   • ${sel.product_name_snapshot}`,
-            sel.presentation_name_snapshot,
-            sel.quantity,
-            "",
-            "",
-          ]);
-          selRow.font = { italic: true, color: { argb: "FF4B5563" } };
-        }
-      }
+        unitPriceCents: Number(row.unit_price_cents_snapshot || 0),
+        totalSubtotalCents: subtotal,
+        totalUnits: qty,
+      });
     }
-
-    const total = sheet.addRow(["", "", "", "Total del cliente", first.order_total_cents / 100]);
-    total.font = { bold: true };
-    total.getCell(5).numFmt = moneyFormat;
-    sheet.addRow([]);
   }
 
-  if (byOrder.size === 0) {
-    sheet.addRow(["No hay preventas activas para esta jornada."]);
+  let grandTotalCents = 0;
+  let grandTotalUnits = 0;
+
+  for (const item of map.values()) {
+    grandTotalCents += item.totalSubtotalCents;
+    grandTotalUnits += item.totalUnits;
+
+    const row = sheet.addRow([
+      item.displayName,
+      item.unitPriceCents / 100,
+      item.totalSubtotalCents / 100,
+      item.totalUnits,
+    ]);
+    row.getCell(2).numFmt = moneyFormat;
+    row.getCell(3).numFmt = moneyFormat;
+    row.getCell(4).numFmt = "#,##0";
+    row.getCell(4).alignment = { horizontal: "center" };
+  }
+
+  if (map.size === 0) {
+    sheet.addRow(["No hay productos pedidos en esta jornada.", "", "", ""]);
+  } else {
+    sheet.addRow([]);
+    const totalRow = sheet.addRow([
+      "TOTAL GENERAL",
+      "",
+      grandTotalCents / 100,
+      grandTotalUnits,
+    ]);
+    totalRow.font = { bold: true };
+    totalRow.getCell(3).numFmt = moneyFormat;
+    totalRow.getCell(4).numFmt = "#,##0";
+    totalRow.getCell(4).alignment = { horizontal: "center" };
   }
 
   const filePath = path.join(outDir, "lista_de_productos.xlsx");
@@ -234,19 +278,20 @@ export async function generateProductListExcel(workDayId: string, outDir: string
 
 /** Resumen compacto: una fila por cliente sin órdenes canceladas. */
 export async function generateClientSummaryExcel(workDayId: string, outDir: string): Promise<string> {
-  // [M-02] Agrupación por c.id y c.business_name para evitar fusionar clientes homónimos
+  // [M-02] Agrupación por c.id para evitar fusionar clientes homónimos
   const { rows: summaryRows } = await pool.query(
-    `SELECT c.id AS client_id, c.business_name, COALESCE(SUM(o.total_cents), 0)::text AS total_cents
+    `SELECT c.id AS client_id, c.business_name, c.contact_name, COALESCE(SUM(o.total_cents), 0)::text AS total_cents
      FROM orders o
      JOIN clients c ON c.id = o.client_id
      WHERE o.work_day_id = $1 AND o.status = 'active'
-     GROUP BY c.id, c.business_name
-     ORDER BY c.business_name, c.id`,
+     GROUP BY c.id, c.business_name, c.contact_name
+     ORDER BY COALESCE(NULLIF(c.business_name, ''), c.contact_name), c.id`,
     [workDayId]
   );
   const rows = summaryRows.map((row: any) => ({
     client_id: row.client_id,
     business_name: row.business_name,
+    contact_name: row.contact_name,
     total_cents: Number(row.total_cents),
   }));
   const wb = new ExcelJS.Workbook();
@@ -256,7 +301,9 @@ export async function generateClientSummaryExcel(workDayId: string, outDir: stri
   let grandTotal = 0;
   rows.forEach((r, index) => {
     grandTotal += r.total_cents;
-    const row = sheet.addRow([index + 1, r.business_name, r.total_cents / 100]);
+    const { primary, secondary } = formatClientDisplayName(r);
+    const clientLabel = secondary ? `${primary} (${secondary})` : primary;
+    const row = sheet.addRow([index + 1, clientLabel, r.total_cents / 100]);
     row.getCell(3).numFmt = moneyFormat;
   });
   const total = sheet.addRow(["", "TOTAL GENERAL", grandTotal / 100]);
@@ -284,7 +331,11 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
     sheet.getCell("A1").fill = { type: "pattern", pattern: "solid", fgColor: { argb: headerFill } };
     sheet.getCell("A1").alignment = { horizontal: "center" };
     sheet.addRow(["Nro. de boleta", receiptCode]);
-    sheet.addRow(["Cliente", first.business_name]);
+    const { primary, secondary } = formatClientDisplayName(first);
+    sheet.addRow(["Cliente", primary]);
+    if (secondary) {
+      sheet.addRow(["Propietario", secondary]);
+    }
     sheet.addRow(["Fecha", formatBoliviaDate(first.created_at)]);
     if (first.address) sheet.addRow(["Dirección", first.address]);
     sheet.addRow([]);

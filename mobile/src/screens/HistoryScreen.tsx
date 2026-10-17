@@ -10,6 +10,7 @@ import { useAuth } from "../context/AuthContext";
 import { deleteClosedWorkDayLocal, listClosedWorkDays } from "../db/repositories/workdays";
 import { listOrdersForWorkDay } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
+import { formatClientDisplayName } from "../domain/client-display";
 import { WorkDay } from "../domain/types";
 import { API_BASE_URL } from "../services/config";
 import { apiFetch } from "../services/api";
@@ -149,17 +150,28 @@ export function HistoryScreen() {
                       ) : (ordersMap[item.id] || []).length === 0 ? (
                         <Text style={styles.loadingOrdersText}>No hay preventas registradas en esta jornada.</Text>
                       ) : (
-                        (ordersMap[item.id] || []).map((ord: any, idx: number) => (
-                          <View key={ord.id || idx} style={styles.orderCard}>
-                            <View style={styles.rowBetween}>
-                              <Text style={styles.orderClientText}>{ord.business_name || ord.client_name || "Cliente"}</Text>
-                              <Text style={styles.orderTotalText}>{centsToBs(ord.totalCents ?? ord.total_cents ?? 0)}</Text>
+                        (ordersMap[item.id] || []).map((ord: any, idx: number) => {
+                          const clientDisplay = formatClientDisplayName({
+                            business_name: ord.business_name || ord.businessName || ord.client_name,
+                            contact_name: ord.contact_name || ord.contactName,
+                          });
+                          return (
+                            <View key={ord.id || idx} style={styles.orderCard}>
+                              <View style={styles.rowBetween}>
+                                <View style={{ flex: 1, marginRight: spacing.sm }}>
+                                  <Text style={styles.orderClientText}>{clientDisplay.primary}</Text>
+                                  {!!clientDisplay.secondary && (
+                                    <Text style={styles.orderClientSubText}>{clientDisplay.secondary}</Text>
+                                  )}
+                                </View>
+                                <Text style={styles.orderTotalText}>{centsToBs(ord.totalCents ?? ord.total_cents ?? 0)}</Text>
+                              </View>
+                              <Text style={styles.orderSubText}>
+                                {ord.item_count ?? (ord.items ? ord.items.length : 0)} producto(s) · {ord.payment_condition || ord.paymentCondition || "Contado"}
+                              </Text>
                             </View>
-                            <Text style={styles.orderSubText}>
-                              {ord.item_count ?? (ord.items ? ord.items.length : 0)} producto(s) · {ord.payment_condition || ord.paymentCondition || "Contado"}
-                            </Text>
-                          </View>
-                        ))
+                          );
+                        })
                       )}
                     </View>
                   )}
@@ -195,6 +207,7 @@ const styles = StyleSheet.create({
   loadingOrdersText: { fontSize: 13, color: colors.textMuted, textAlign: "center", paddingVertical: spacing.sm },
   orderCard: { backgroundColor: colors.surface, padding: spacing.sm, borderRadius: 6, marginBottom: spacing.xs },
   orderClientText: { fontSize: 14, fontWeight: "600", color: colors.textPrimary },
+  orderClientSubText: { fontSize: 12, color: colors.textSecondary, marginTop: 1 },
   orderTotalText: { fontSize: 14, fontWeight: "700", color: colors.navy },
   orderSubText: { fontSize: 12, color: colors.textSecondary, marginTop: 2 },
 });

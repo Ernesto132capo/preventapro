@@ -9,6 +9,8 @@ import {
   remapCategoryReferences,
 } from "../db/repositories/products";
 import { normalizeOutboxErrors } from "../db/outbox";
+import { formatClientDisplayName } from "../domain/client-display";
+import { getConsolidatedProductsForWorkDay } from "../db/repositories/orders";
 
 interface MockCategory {
   id: string;
@@ -354,6 +356,10 @@ const mockDb = {
       return c ? { ...c } : null;
     }
 
+    if (cleanSql.includes("FROM work_days WHERE id = ?")) {
+      return { id: params[0], server_id: "srv-wd-1", user_id: "usr-1" };
+    }
+
     if (cleanSql.includes("SELECT * FROM products WHERE id = ? OR server_id = ?")) {
       const [id] = params;
       const p = state.products.find((pr) => pr.id === id || pr.server_id === id);
@@ -392,6 +398,25 @@ const mockDb = {
 
     if (cleanSql.includes("SELECT id FROM product_presentations WHERE")) {
       return state.presentations.filter((pr) => pr.active === 1 && params.includes(pr.product_id)).map((pr) => ({ id: pr.id }));
+    }
+
+    if (cleanSql.includes("JOIN order_items oi")) {
+      return [
+        {
+          product_name_snapshot: "Papas en tira",
+          presentation_name_snapshot: "Bolsa 500g",
+          unit_price_cents_snapshot: 2800,
+          total_quantity: 10,
+          total_subtotal_cents: 28000,
+        },
+        {
+          product_name_snapshot: "Bombón",
+          presentation_name_snapshot: "Caja x24",
+          unit_price_cents_snapshot: 6000,
+          total_quantity: 10,
+          total_subtotal_cents: 60000,
+        },
+      ];
     }
 
     return [];
@@ -534,6 +559,72 @@ describe("Repositories & Outbox Atomicity", () => {
 
       const outboxRow = state.outbox.find((o) => o.local_entity_id === client.id && o.operation === "delete");
       expect(outboxRow).toBeDefined();
+    });
+
+    it("[Objetivo 2] permite crear cliente solo con tienda o solo con propietario, pero rechaza si ambos están vacíos", async () => {
+      // Solo con propietario
+      const clientOwnerOnly = await createClientLocal({ contactName: "Don Pedro" });
+      expect(clientOwnerOnly.contact_name).toBe("Don Pedro");
+      expect(clientOwnerOnly.business_name).toBe("");
+
+      // Solo con tienda
+      const clientStoreOnly = await createClientLocal({ businessName: "Almacén Central" });
+      expect(clientStoreOnly.business_name).toBe("Almacén Central");
+      expect(clientStoreOnly.contact_name).toBeNull();
+
+      // Ambos vacíos -> debe lanzar error
+      await expect(createClientLocal({})).rejects.toThrow(
+        "Debes ingresar al menos el nombre del negocio o el nombre del propietario."
+      );
+      await expect(createClientLocal({ businessName: "   ", contactName: "  " })).rejects.toThrow(
+        "Debes ingresar al menos el nombre del negocio o el nombre del propietario."
+      );
+    });
+
+    it("[Objetivo 2] formatClientDisplayName formatea según Casos A, B y C de PreventaPro", () => {
+      // Caso A: Ambos
+      const a = formatClientDisplayName({ business_name: "Tienda Rosita", contact_name: "Rosa Flores" });
+      expect(a.primary).toBe("Tienda Rosita");
+      expect(a.secondary).toBe("Rosa Flores");
+      expect(a.fullTitle).toBe("Tienda Rosita\nRosa Flores");
+
+      // Caso B: Solo Propietario
+      const b = formatClientDisplayName({ business_name: "", contact_name: "Rosa Flores" });
+      expect(b.primary).toBe("Rosa Flores");
+      expect(b.secondary).toBeNull();
+      expect(b.fullTitle).toBe("Rosa Flores");
+
+      // Caso C: Solo Tienda
+      const c = formatClientDisplayName({ business_name: "Tienda Rosita", contact_name: "" });
+      expect(c.primary).toBe("Tienda Rosita");
+      expect(c.secondary).toBeNull();
+      expect(c.fullTitle).toBe("Tienda Rosita");
+
+      // Fallback
+      const fallback = formatClientDisplayName(null);
+      expect(fallback.primary).toBe("Cliente");
+      expect(fallback.secondary).toBeNull();
+    });
+
+    it("[Objetivo 1] getConsolidatedProductsForWorkDay consolida productos en 4 columnas y calcula totales generales", async () => {
+      const result = await getConsolidatedProductsForWorkDay("wd-local-1");
+      expect(result.items).toHaveLength(2);
+
+      // Producto 1
+      expect(result.items[0].productName).toBe("Papas en tira (Bolsa 500g)");
+      expect(result.items[0].unitPriceCents).toBe(2800);
+      expect(result.items[0].totalSubtotalCents).toBe(28000);
+      expect(result.items[0].totalUnits).toBe(10);
+
+      // Producto 2
+      expect(result.items[1].productName).toBe("Bombón (Caja x24)");
+      expect(result.items[1].unitPriceCents).toBe(6000);
+      expect(result.items[1].totalSubtotalCents).toBe(60000);
+      expect(result.items[1].totalUnits).toBe(10);
+
+      // Totales generales
+      expect(result.grandTotalCents).toBe(88000);
+      expect(result.grandTotalUnits).toBe(20);
     });
   });
 

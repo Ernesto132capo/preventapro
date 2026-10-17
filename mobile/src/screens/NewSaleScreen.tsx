@@ -20,6 +20,7 @@ import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId, upsertServ
 import { buildCartLine, calcOrderTotals, recalcLineQuantity, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
 import { CartLine, CartLineSelection, Category, Client, Presentation, Product, WorkDay } from "../domain/types";
+import { formatClientDisplayName } from "../domain/client-display";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
 import { apiFetch, ApiError } from "../services/api";
@@ -450,7 +451,7 @@ export function NewSaleScreen() {
           )}
         </View>
         <Pressable onPress={() => setStep("client")}>
-          <Text style={styles.changeClient}>Cliente: {selectedClient?.business_name} · Cambiar</Text>
+          <Text style={styles.changeClient}>Cliente: {formatClientDisplayName(selectedClient).primary} · Cambiar</Text>
         </Pressable>
       </View>
 
@@ -603,7 +604,7 @@ export function NewSaleScreen() {
             <View style={styles.modalHeaderRow}>
               <View style={{ flex: 1, marginRight: spacing.sm }}>
                 <Text style={styles.modalTitle}>Resumen del Pedido</Text>
-                <Text style={styles.modalClientSub}>Cliente: {selectedClient?.business_name}</Text>
+                <Text style={styles.modalClientSub}>Cliente: {formatClientDisplayName(selectedClient).primary}</Text>
               </View>
               <Pressable onPress={() => setCartModalVisible(false)} style={styles.modalCloseBtn}>
                 <Text style={styles.modalCloseBtnText}>✕ Seguir agregando</Text>
@@ -671,11 +672,12 @@ const ClientPickerItem = React.memo(function ClientPickerItem({
   client: Client;
   onSelect: (client: Client) => void;
 }) {
+  const display = formatClientDisplayName(client);
   return (
     <Pressable onPress={() => onSelect(client)}>
       <Card style={{ marginBottom: spacing.sm }}>
-        <Text style={styles.clientName}>{client.business_name}</Text>
-        {!!client.contact_name && <Text style={styles.clientSub}>{client.contact_name}</Text>}
+        <Text style={styles.clientName}>{display.primary}</Text>
+        {!!display.secondary && <Text style={styles.clientSub}>{display.secondary}</Text>}
       </Card>
     </Pressable>
   );

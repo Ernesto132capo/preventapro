@@ -11,24 +11,34 @@ clientsRouter.use(requireAuth);
 function serializeClient(row: any) {
   return {
     id: row.id, server_id: row.id, client_local_id: row.client_local_id ?? null, client_code: row.client_code ?? null,
-    business_name: row.business_name, contact_name: row.contact_name ?? null, phone: row.phone ?? null,
+    business_name: row.business_name ?? "", contact_name: row.contact_name ?? null, phone: row.phone ?? null,
     neighborhood_id: row.neighborhood_id ?? null, neighborhood_name: row.neighborhood_name ?? null, address: row.address ?? null,
     lat: row.lat ?? null, lng: row.lng ?? null, visit_status: row.visit_status ?? "pending", active: row.active === false ? 0 : 1,
     sync_status: "synced", created_at: row.created_at, updated_at: row.updated_at,
   };
 }
 
-const optionalText = z.string().trim().max(250).optional();
+const optionalText = z.string().trim().max(250).optional().nullable();
 const clientSchema = z.object({
   clientLocalId: z.string().uuid().optional(),
-  businessName: z.string().trim().min(1, "El nombre del negocio es obligatorio").max(250),
+  businessName: z.string().trim().max(250).optional().nullable(),
+  business_name: z.string().trim().max(250).optional().nullable(),
   contactName: optionalText,
-  phone: z.string().trim().max(50).optional(),
-  neighborhoodId: z.string().uuid().optional(),
-  address: z.string().trim().max(500).optional(),
-  lat: z.number().finite().min(-90).max(90).optional(),
-  lng: z.number().finite().min(-180).max(180).optional(),
-}).strict();
+  contact_name: optionalText,
+  phone: z.string().trim().max(50).optional().nullable(),
+  neighborhoodId: z.string().uuid().optional().nullable(),
+  neighborhood_id: z.string().uuid().optional().nullable(),
+  address: z.string().trim().max(500).optional().nullable(),
+  lat: z.number().finite().min(-90).max(90).optional().nullable(),
+  lng: z.number().finite().min(-180).max(180).optional().nullable(),
+}).refine(
+  (data) => {
+    const b = (data.businessName || data.business_name || "").trim();
+    const c = (data.contactName || data.contact_name || "").trim();
+    return b.length > 0 || c.length > 0;
+  },
+  { message: "Debes ingresar al menos el nombre del negocio o el nombre del propietario", path: ["businessName"] }
+);
 
 function isConstraintViolation(error: unknown): boolean {
   return Boolean(
@@ -45,7 +55,7 @@ clientsRouter.get("/", async (_req, res, next) => {
        FROM clients c
        LEFT JOIN neighborhoods n ON n.id = c.neighborhood_id
        WHERE c.active = true
-       ORDER BY c.business_name`
+       ORDER BY COALESCE(NULLIF(c.business_name, ''), c.contact_name) ASC`
     );
     res.json({ clients: rows.map(serializeClient) });
   } catch (err) {
@@ -55,8 +65,16 @@ clientsRouter.get("/", async (_req, res, next) => {
 
 clientsRouter.post("/", async (req: AuthedRequest, res) => {
   const parsed = clientSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+  if (!parsed.success) {
+    const errorMsg = parsed.error.errors[0]?.message || "Datos inválidos";
+    return res.status(400).json({ error: errorMsg, details: parsed.error.flatten() });
+  }
   const d = parsed.data;
+  const bName = (d.businessName || d.business_name || "").trim() || null;
+  const cName = (d.contactName || d.contact_name || "").trim() || null;
+  const phone = (d.phone || "").trim() || null;
+  const nId = d.neighborhoodId || d.neighborhood_id || null;
+
   const client = await pool.connect();
   let inTransaction = false;
   try {
@@ -83,7 +101,7 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
        ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'pending', true, $9, $9, $10, $11, $11)
        RETURNING *`,
       [
-        id, d.businessName, d.contactName ?? null, d.phone ?? null, d.neighborhoodId ?? null,
+        id, bName, cName, phone, nId,
         d.address ?? null, d.lat ?? null, d.lng ?? null, req.userId, d.clientLocalId ?? null, ts,
       ]
     );
@@ -107,7 +125,20 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
 
 clientsRouter.put("/:id", async (req, res, next) => {
   try {
-    const parsed = clientSchema.partial().safeParse(req.body);
+    const rawPutSchema = z.object({
+      clientLocalId: z.string().uuid().optional(),
+      businessName: z.string().trim().max(250).optional().nullable(),
+      business_name: z.string().trim().max(250).optional().nullable(),
+      contactName: optionalText,
+      contact_name: optionalText,
+      phone: z.string().trim().max(50).optional().nullable(),
+      neighborhoodId: z.string().uuid().optional().nullable(),
+      neighborhood_id: z.string().uuid().optional().nullable(),
+      address: z.string().trim().max(500).optional().nullable(),
+      lat: z.number().finite().min(-90).max(90).optional().nullable(),
+      lng: z.number().finite().min(-180).max(180).optional().nullable(),
+    });
+    const parsed = rawPutSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
 
     const existing = await pool.query("SELECT * FROM clients WHERE id = $1", [req.params.id]);
@@ -115,15 +146,22 @@ clientsRouter.put("/:id", async (req, res, next) => {
     if (!current || current.active === false) return res.status(404).json({ error: "Cliente no encontrado." });
 
     const d = parsed.data;
+    const bGiven = d.businessName !== undefined ? d.businessName : d.business_name;
+    const cGiven = d.contactName !== undefined ? d.contactName : d.contact_name;
+    const nGiven = d.neighborhoodId !== undefined ? d.neighborhoodId : d.neighborhood_id;
+
     const merged = {
-      business_name: d.businessName !== undefined ? d.businessName : current.business_name,
-      contact_name: d.contactName !== undefined ? d.contactName : current.contact_name,
-      phone: d.phone !== undefined ? d.phone : current.phone,
-      neighborhood_id: d.neighborhoodId !== undefined ? d.neighborhoodId : current.neighborhood_id,
-      address: d.address !== undefined ? d.address : current.address,
+      business_name: bGiven !== undefined ? (bGiven?.trim() || null) : current.business_name,
+      contact_name: cGiven !== undefined ? (cGiven?.trim() || null) : current.contact_name,
+      phone: d.phone !== undefined ? (d.phone?.trim() || null) : current.phone,
+      neighborhood_id: nGiven !== undefined ? nGiven : current.neighborhood_id,
+      address: d.address !== undefined ? (d.address?.trim() || null) : current.address,
       lat: d.lat !== undefined ? d.lat : current.lat,
       lng: d.lng !== undefined ? d.lng : current.lng,
     };
+    if (!merged.business_name && !merged.contact_name) {
+      return res.status(400).json({ error: "Debes ingresar al menos el nombre del negocio o el nombre del propietario" });
+    }
     const ts = nowIso();
     const { rows } = await pool.query(
       `UPDATE clients SET business_name = $2, contact_name = $3, phone = $4, neighborhood_id = $5,

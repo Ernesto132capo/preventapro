@@ -55,7 +55,7 @@ export const migrations: Migration[] = [
           id TEXT PRIMARY KEY,
           client_local_id TEXT,
           client_code TEXT,
-          business_name TEXT NOT NULL,
+          business_name TEXT,
           contact_name TEXT,
           phone TEXT,
           neighborhood_id TEXT REFERENCES neighborhoods(id),
@@ -233,6 +233,15 @@ export const migrations: Migration[] = [
     run: async (client: PoolClient) => {
       await client.query(`
         ALTER TABLE product_presentations DROP COLUMN IF EXISTS quantity_available;
+      `);
+    },
+  },
+  {
+    id: "005_flexible_client_names",
+    description: "Permitir nombre de negocio o de propietario opcionales individualmente en tabla clients",
+    run: async (client: PoolClient) => {
+      await client.query(`
+        ALTER TABLE clients ALTER COLUMN business_name DROP NOT NULL;
       `);
     },
   },

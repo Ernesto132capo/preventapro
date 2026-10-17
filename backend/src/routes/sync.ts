@@ -15,7 +15,7 @@ function client(row: any) {
   return {
     id: row.id,
     client_local_id: row.client_local_id ?? null,
-    business_name: row.business_name,
+    business_name: row.business_name ?? "",
     contact_name: row.contact_name ?? null,
     phone: row.phone ?? null,
     neighborhood_id: row.neighborhood_id ?? null,
@@ -373,7 +373,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
 
         const clientMap = new Map<string, string>();
         for (const row of clientRows) {
-          const name = row.business_name || "Cliente";
+          const name = row.business_name || row.contact_name || "Cliente";
           clientMap.set(row.id, name);
           setBoundedCacheEntry(clientNameCache, row.id, name, MAX_CLIENT_NAME_CACHE_ENTRIES);
         }
@@ -382,11 +382,11 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           const uncachedIds = missingClientIds.filter((cid) => !clientNameCache.has(cid));
           if (uncachedIds.length > 0) {
             const { rows: fetchedClients } = await pool.query(
-              "SELECT id, business_name FROM clients WHERE id = ANY($1)",
+              "SELECT id, business_name, contact_name FROM clients WHERE id = ANY($1)",
               [uncachedIds]
             );
             for (const c of fetchedClients) {
-              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
+              setBoundedCacheEntry(clientNameCache, c.id, c.business_name || c.contact_name || "Cliente", MAX_CLIENT_NAME_CACHE_ENTRIES);
             }
           }
           for (const cid of missingClientIds) {
@@ -772,7 +772,10 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
   const localId = op.id || op.local_entity_id || op.localId || uuid();
   const data = op.data || op;
   const businessName = String(data.businessName || data.business_name || "").trim();
-  if (!businessName) throw new Error("El nombre comercial es obligatorio.");
+  const contactName = String(data.contactName || data.contact_name || "").trim();
+  if (!businessName && !contactName) {
+    throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
+  }
 
   const clientLocalId = data.clientLocalId || data.client_local_id || localId;
   const { rows: existing } = await client.query(
@@ -786,7 +789,7 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
     await client.query(
       `UPDATE clients SET business_name = $1, contact_name = $2, phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $8, updated_at = now()
        WHERE id = $7`,
-      [businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId, neighborhoodId]
+      [businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, serverId, neighborhoodId]
     );
     return { id: localId, serverId, entityType: "client", status: "synced" };
   }
@@ -796,7 +799,7 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
     `INSERT INTO clients (
        id, client_local_id, business_name, contact_name, phone, address, lat, lng, neighborhood_id, visit_status, active, created_by, created_at, updated_at
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', true, $10, now(), now())`,
-    [serverId, clientLocalId, businessName, data.contactName ?? data.contact_name ?? null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, userId]
+    [serverId, clientLocalId, businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, userId]
   );
   return { id: localId, serverId, entityType: "client", status: "synced" };
 }

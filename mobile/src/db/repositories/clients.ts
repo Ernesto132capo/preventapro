@@ -9,11 +9,13 @@ export async function listActiveClients(search?: string): Promise<Client[]> {
     const q = `%${search.trim()}%`;
     return db.getAllAsync<Client>(
       `SELECT * FROM clients WHERE active = 1 AND (business_name LIKE ? OR contact_name LIKE ? OR phone LIKE ?)
-       ORDER BY business_name COLLATE NOCASE ASC`,
+       ORDER BY COALESCE(NULLIF(business_name, ''), contact_name) COLLATE NOCASE ASC`,
       [q, q, q]
     );
   }
-  return db.getAllAsync<Client>(`SELECT * FROM clients WHERE active = 1 ORDER BY business_name COLLATE NOCASE ASC`);
+  return db.getAllAsync<Client>(
+    `SELECT * FROM clients WHERE active = 1 ORDER BY COALESCE(NULLIF(business_name, ''), contact_name) COLLATE NOCASE ASC`
+  );
 }
 
 export async function getClient(id: string): Promise<Client | null> {
@@ -22,7 +24,7 @@ export async function getClient(id: string): Promise<Client | null> {
 }
 
 export interface QuickClientInput {
-  businessName: string;
+  businessName?: string;
   contactName?: string;
   phone?: string;
   address?: string;
@@ -32,8 +34,10 @@ export interface QuickClientInput {
 
 /** Alta rápida de cliente (Fase 8) — funciona 100% offline. Se encola para sincronizar. */
 export async function createClientLocal(input: QuickClientInput): Promise<Client> {
-  if (!input.businessName?.trim()) {
-    throw new Error("El nombre del negocio es obligatorio.");
+  const bName = (input.businessName || "").trim();
+  const cName = (input.contactName || "").trim();
+  if (!bName && !cName) {
+    throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
   }
   const db = await getDb();
   const id = uuid();
@@ -44,7 +48,7 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
       `INSERT INTO clients
         (id, business_name, contact_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'pending', ?, ?)`,
-      [id, input.businessName.trim(), input.contactName || null, input.phone || null, input.address || null, input.lat ?? null, input.lng ?? null, ts, ts]
+      [id, bName, cName || null, input.phone?.trim() || null, input.address?.trim() || null, input.lat ?? null, input.lng ?? null, ts, ts]
     );
     await enqueue("client", id, 1, "create");
   });
@@ -55,8 +59,10 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
 
 /** Edita un cliente ya existente (creado offline o ya sincronizado). Se re-encola para reflejar el cambio en el servidor. */
 export async function updateClientLocal(id: string, input: QuickClientInput): Promise<Client> {
-  if (!input.businessName?.trim()) {
-    throw new Error("El nombre del negocio es obligatorio.");
+  const bName = (input.businessName || "").trim();
+  const cName = (input.contactName || "").trim();
+  if (!bName && !cName) {
+    throw new Error("Debes ingresar al menos el nombre del negocio o el nombre del propietario.");
   }
   const db = await getDb();
   const existing = await getClient(id);
@@ -69,10 +75,10 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
          sync_status = 'pending', updated_at = ?
        WHERE id = ?`,
       [
-        input.businessName.trim(),
-        input.contactName || null,
-        input.phone || null,
-        input.address || null,
+        bName,
+        cName || null,
+        input.phone?.trim() || null,
+        input.address?.trim() || null,
         input.lat ?? null,
         input.lng ?? null,
         nowIso(),

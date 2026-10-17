@@ -7,6 +7,7 @@ import { getOrderWithItems, cancelOrderLocal } from "../db/repositories/orders";
 import { getTodayWorkDay } from "../db/repositories/workdays";
 import { getDb } from "../db/client";
 import { centsToBs } from "../domain/pricing";
+import { formatClientDisplayName } from "../domain/client-display";
 import { colors, radius, spacing } from "../theme/tokens";
 import { useSync } from "../context/SyncContext";
 import { useAuth } from "../context/AuthContext";
@@ -98,12 +99,19 @@ export function OrderDetailScreen() {
   const { order, items } = data;
   const isCancelled = order.status === "cancelled";
   const isWorkdayClosed = orderWorkDay?.status === "closed";
+  const clientDisplay = formatClientDisplayName({
+    business_name: order.business_name || order.client_name,
+    contact_name: order.contact_name,
+  });
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <Card>
         <View style={styles.row}>
-          <Text style={styles.client}>{order.client_name}</Text>
+          <View style={{ flex: 1, marginRight: spacing.sm }}>
+            <Text style={styles.client}>{clientDisplay.primary}</Text>
+            {!!clientDisplay.secondary && <Text style={styles.clientOwnerSub}>{clientDisplay.secondary}</Text>}
+          </View>
           {isCancelled && (
             <View style={styles.cancelledBadge}>
               <Text style={styles.cancelledBadgeText}>❌ Anulada</Text>
@@ -184,6 +192,7 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg },
   client: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
+  clientOwnerSub: { fontSize: 14, color: colors.textSecondary, marginTop: 2 },
   heading: { marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: "700", color: colors.textPrimary },
   row: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   product: { fontWeight: "600", color: colors.textPrimary },

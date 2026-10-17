@@ -8,6 +8,7 @@ import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { listActiveClients, deleteClientLocal } from "../db/repositories/clients";
 import { Client } from "../domain/types";
+import { formatClientDisplayName } from "../domain/client-display";
 import { useSync } from "../context/SyncContext";
 import { useDebounce } from "../utils/useDebounce";
 
@@ -35,9 +36,10 @@ export function ClientsScreen() {
   }, [syncTick]);
 
   const confirmDelete = useCallback((c: Client) => {
+    const displayName = formatClientDisplayName(c).primary;
     Alert.alert(
       "Eliminar cliente",
-      `¿Seguro que quieres eliminar a "${c.business_name}"? Esta acción no se puede deshacer.`,
+      `¿Seguro que quieres eliminar a "${displayName}"? Esta acción no se puede deshacer.`,
       [
         { text: "Cancelar", style: "cancel" },
         {
@@ -127,12 +129,13 @@ const ClientCardItem = React.memo(function ClientCardItem({
   onDelete: () => void;
   onStartSale: () => void;
 }) {
+  const display = formatClientDisplayName(item);
   return (
     <Card style={{ marginBottom: spacing.sm }}>
       <View style={styles.rowBetween}>
-        <Text style={styles.businessName}>{item.business_name}</Text>
+        <Text style={styles.businessName}>{display.primary}</Text>
       </View>
-      {!!item.contact_name && <Text style={styles.subtext}>{item.contact_name}</Text>}
+      {!!display.secondary && <Text style={styles.subtext}>{display.secondary}</Text>}
       {!!item.address && <Text style={styles.subtext}>{item.address}</Text>}
       {item.sync_status !== "synced" && <StatusPill kind={item.sync_status as any} />}
 
