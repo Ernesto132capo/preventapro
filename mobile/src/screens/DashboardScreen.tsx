@@ -5,9 +5,9 @@ import { colors, spacing, radius } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { Button } from "../components/Button";
-import { useAuth } from "../context/AuthContext";
+import { useAuth, normalizeUserName } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { getOrCreateOpenWorkDay, listClosedWorkDays, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
+import { getOrCreateOpenWorkDay, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { listOrdersForWorkDay, cancelOrderLocal } from "../db/repositories/orders";
 import { mergeDuplicateClients } from "../db/repositories/clients";
 import { centsToBs } from "../domain/pricing";
@@ -22,7 +22,6 @@ export function DashboardScreen() {
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
   const [recentOrders, setRecentOrders] = useState<LocalOrder[]>([]);
-  const [yesterdayTotal, setYesterdayTotal] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [showUserModal, setShowUserModal] = useState(false);
   const [stats, setStats] = useState<{ totalHistoricalOrders: number } | null>(null);
@@ -137,11 +136,6 @@ export function DashboardScreen() {
       total_cents: totalCents,
       order_count: orderCount,
     });
-
-    const closed = await listClosedWorkDays(user.id);
-    const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    const yesterday = closed.find((w) => w.work_date === yesterdayStr);
-    setYesterdayTotal(yesterday ? yesterday.total_cents : null);
   }, [user]);
 
   useFocusEffect(
@@ -208,11 +202,6 @@ export function DashboardScreen() {
 
   if (!user || !workDay) return null;
 
-  const diffFromYesterday =
-    yesterdayTotal !== null && yesterdayTotal > 0
-      ? Math.round(((workDay.total_cents - yesterdayTotal) / yesterdayTotal) * 100)
-      : null;
-
   return (
     <ScrollView
       style={styles.screen}
@@ -224,9 +213,13 @@ export function DashboardScreen() {
           <View style={styles.userIconCircle}>
             <Text style={styles.userIconText}>👤</Text>
           </View>
-          <View>
-            <Text style={styles.greeting}>Hola, Preventista 👋</Text>
-            <Text style={styles.date}>{new Date().toLocaleDateString("es-BO", { weekday: "long", day: "numeric", month: "long" })}</Text>
+          <View style={styles.greetingTextContainer}>
+            <Text style={styles.greeting} numberOfLines={1}>
+              {`Hola, ${normalizeUserName(user.code, user.fullName)}\u00A0👋`}
+            </Text>
+            <Text style={styles.date} numberOfLines={1}>
+              {new Date().toLocaleDateString("es-BO", { weekday: "long", day: "numeric", month: "long" })}
+            </Text>
           </View>
         </Pressable>
         <View style={styles.headerActions}>
@@ -323,11 +316,6 @@ export function DashboardScreen() {
         <Text style={styles.totalValue}>{centsToBs(workDay.total_cents)}</Text>
         <View style={styles.metaRow}>
           <Text style={styles.metaText}>{workDay.order_count} preventa{workDay.order_count === 1 ? "" : "s"}</Text>
-          {diffFromYesterday !== null && (
-            <Text style={[styles.metaText, { color: diffFromYesterday >= 0 ? colors.emeraldTint : colors.errorBg }]}>
-              {diffFromYesterday >= 0 ? "▲" : "▼"} {Math.abs(diffFromYesterday)}% vs. ayer
-            </Text>
-          )}
         </View>
       </Card>
 
@@ -504,12 +492,13 @@ export function DashboardScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
   rowBetween: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
-  headerActions: { flexDirection: "row", alignItems: "center" },
+  headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  headerActions: { flexDirection: "row", alignItems: "center", flexShrink: 0 },
   logoutButton: { minHeight: 34, paddingHorizontal: 10, marginLeft: spacing.sm },
   greeting: { fontSize: 20, fontWeight: "700", color: colors.textPrimary },
   date: { fontSize: 13, color: colors.textSecondary, textTransform: "capitalize" },
-  greetingRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, flex: 1 },
+  greetingRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, flex: 1, marginRight: spacing.sm },
+  greetingTextContainer: { flex: 1, justifyContent: "center" },
   userIconCircle: {
     width: 40,
     height: 40,

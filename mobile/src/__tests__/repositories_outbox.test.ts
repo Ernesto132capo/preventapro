@@ -467,6 +467,7 @@ const mockDb = {
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: jest.fn(() => "2026-10-16T12:00:00.000Z"),
+  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
 }));
 
 describe("Repositories & Outbox Atomicity", () => {

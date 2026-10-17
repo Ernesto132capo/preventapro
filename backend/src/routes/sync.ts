@@ -172,7 +172,13 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
   let forcedKey: string | undefined;
   try {
     const requestedForce = req.query.force === "1";
-    const since = (requestedForce || !req.query.since) ? "1970-01-01T00:00:00.000Z" : String(req.query.since);
+    let since = (requestedForce || !req.query.since) ? "1970-01-01T00:00:00.000Z" : String(req.query.since);
+    if (!since.startsWith("1970")) {
+      const sinceMs = Date.parse(since);
+      if (!isNaN(sinceMs)) {
+        since = new Date(Math.max(0, sinceMs - 120_000)).toISOString();
+      }
+    }
     const pullKey = `${req.userId}:${since}`;
     const isInitial = !req.query.since || since.startsWith("1970");
 
@@ -324,33 +330,56 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     let orders: any[] = [];
     if (workDayRows.length > 0) {
       const allOrderRows: any[] = [];
-      for (const wd of workDayRows) {
-        const orderRows = await cachedRows(
-          "orders",
-          orderQueryCache,
-          wd.id,
-          async () => (await pool.query("SELECT * FROM orders WHERE work_day_id = $1", [wd.id])).rows,
-          force
+      const missingWdIds = force
+        ? workDayRows.map((w) => w.id)
+        : workDayRows.filter((w) => !orderQueryCache.has(w.id)).map((w) => w.id);
+
+      if (missingWdIds.length > 0) {
+        const { rows: fetchedOrders } = await pool.query(
+          "SELECT * FROM orders WHERE work_day_id = ANY($1)",
+          [missingWdIds]
         );
-        allOrderRows.push(...orderRows);
+        const ordersByWd = new Map<string, any[]>();
+        for (const wid of missingWdIds) ordersByWd.set(wid, []);
+        for (const ord of fetchedOrders) {
+          const list = ordersByWd.get(ord.work_day_id) || [];
+          list.push(ord);
+          ordersByWd.set(ord.work_day_id, list);
+        }
+        for (const [wid, ords] of ordersByWd.entries()) {
+          setBoundedCacheEntry(orderQueryCache, wid, ords, MAX_SOURCE_CACHE_ENTRIES);
+        }
       }
+      for (const wd of workDayRows) {
+        allOrderRows.push(...(orderQueryCache.get(wd.id) || []));
+      }
+
       const activeOrders = allOrderRows.filter((row) => row.status === "active");
 
       if (activeOrders.length > 0) {
-        const [itemsResults, clientIds] = [
-          await Promise.all(
-            activeOrders.map((row) =>
-              cachedRows(
-                "order-items",
-                orderItemQueryCache,
-                row.id,
-                async () => (await pool.query("SELECT * FROM order_items WHERE order_id = $1", [row.id])).rows,
-                force
-              )
-            )
-          ),
-          [...new Set(activeOrders.map((row) => row.client_id))],
-        ];
+        const missingOrderIds = force
+          ? activeOrders.map((o) => o.id)
+          : activeOrders.filter((o) => !orderItemQueryCache.has(o.id)).map((o) => o.id);
+
+        if (missingOrderIds.length > 0) {
+          const { rows: fetchedItems } = await pool.query(
+            "SELECT * FROM order_items WHERE order_id = ANY($1)",
+            [missingOrderIds]
+          );
+          const itemsByOrd = new Map<string, any[]>();
+          for (const oid of missingOrderIds) itemsByOrd.set(oid, []);
+          for (const it of fetchedItems) {
+            const list = itemsByOrd.get(it.order_id) || [];
+            list.push(it);
+            itemsByOrd.set(it.order_id, list);
+          }
+          for (const [oid, its] of itemsByOrd.entries()) {
+            setBoundedCacheEntry(orderItemQueryCache, oid, its, MAX_SOURCE_CACHE_ENTRIES);
+          }
+        }
+
+        const itemsResults = activeOrders.map((row) => orderItemQueryCache.get(row.id) || []);
+        const clientIds = [...new Set(activeOrders.map((row) => row.client_id))];
 
         const allItemIds = itemsResults.flat().map((it: any) => it.id);
         const selectionsByItem = new Map<string, any[]>();

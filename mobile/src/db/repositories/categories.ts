@@ -1,5 +1,5 @@
 import { v4 as uuid } from "uuid";
-import { getDb, nowIso } from "../client";
+import { getDb, nowIso, withTx } from "../client";
 import { enqueue } from "../outbox";
 import { Category } from "../../domain/types";
 
@@ -23,7 +23,7 @@ export async function createCategoryLocal(name: string): Promise<Category> {
   const db = await getDb();
   let targetId = "";
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const existing = await db.getFirstAsync<Category>(
       `SELECT * FROM categories WHERE lower(name) = lower(?)`,
       [trimmed]
@@ -68,7 +68,7 @@ export async function updateCategoryLocal(id: string, name: string): Promise<Cat
   const localId = existing.id;
 
   const ts = nowIso();
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(
       `UPDATE categories SET name = ?, sync_status = 'pending', updated_at = ? WHERE id = ?`,
       [trimmed, ts, localId]
@@ -84,7 +84,7 @@ export async function deleteCategoryLocal(id: string): Promise<void> {
   const db = await getDb();
   const ts = nowIso();
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const existing = await db.getFirstAsync<Category>(
       `SELECT id, server_id FROM categories WHERE id = ? OR server_id = ?`,
       [id, id]

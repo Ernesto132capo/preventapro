@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid";
-import { getDb, nowIso } from "../client";
+import type { SQLiteDatabase } from "expo-sqlite";
+import { getDb, nowIso, withTx } from "../client";
 import { enqueue } from "../outbox";
 import { CartLine, LocalOrder } from "../../domain/types";
 import { calcOrderTotals, PricingError } from "../../domain/pricing";
@@ -42,7 +43,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
   const orderId = uuid();
   const ts = nowIso();
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const currentWorkDay = await db.getFirstAsync<{ id: string; user_id: string; status: string }>(
       `SELECT id, user_id, status FROM work_days WHERE id = ? OR server_id = ?`,
       [input.workDayLocalId, input.workDayLocalId]
@@ -265,10 +266,10 @@ export async function getOrderWithItems(orderId: string) {
   return { order, items: itemsWithSelections };
 }
 
-export async function upsertOrderFromServer(serverOrder: any) {
-  const db = await getDb();
+export async function upsertOrderFromServer(serverOrder: any, existingDb?: SQLiteDatabase) {
+  const db = existingDb || (await getDb());
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     let localWorkDay = await db.getFirstAsync<{ id: string }>(
       `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
       [serverOrder.work_day_id, serverOrder.work_day_id]
@@ -424,7 +425,7 @@ async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymen
   if (!order) throw new PricingError("La preventa no existe o ya fue eliminada.");
   const ts = nowIso();
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const workDay = await db.getFirstAsync<{ user_id: string; status: string }>(
       `SELECT user_id, status FROM work_days WHERE id = ?`,
       [order.work_day_id]
@@ -476,7 +477,7 @@ export async function cancelOrderLocal(orderId: string): Promise<void> {
   const workDay = await db.getFirstAsync<{ user_id: string }>(`SELECT user_id FROM work_days WHERE id = ?`, [order.work_day_id]);
   if (!workDay) throw new PricingError("No se encontró la jornada de esta preventa.");
   await withUserWorkDayLock("shared", async () => {
-    await db.withTransactionAsync(async () => {
+    await withTx(async () => {
       const current = await db.getFirstAsync<{ user_id: string; status: string }>(
         `SELECT wd.user_id, wd.status FROM work_days wd WHERE wd.id = ?`,
         [order.work_day_id]

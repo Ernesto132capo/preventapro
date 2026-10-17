@@ -84,21 +84,33 @@ export async function migrateClientsTableIfNeeded(db: SqliteDbLike): Promise<voi
     const updatedExpr = colMap.has("updated_at") ? "updated_at" : "datetime('now')";
     const serverIdExpr = colMap.has("server_id") ? "server_id" : "NULL";
 
-    await db.execAsync(`
-      INSERT INTO clients_new (
-        id, server_id, business_name, name, contact_name, owner_name,
-        phone, neighborhood_id, neighborhood_name, address, lat, lng,
-        visit_status, active, sync_status, created_at, updated_at
-      )
-      SELECT
-        id, ${serverIdExpr}, ${bNameExpr}, ${nameExpr}, ${cNameExpr}, ${oNameExpr},
-        ${phoneExpr}, ${nIdExpr}, ${nNameExpr}, ${addrExpr}, ${latExpr}, ${lngExpr},
-        ${visitExpr}, ${activeExpr}, ${syncExpr}, ${createdExpr}, ${updatedExpr}
-      FROM clients;
-      DROP TABLE clients;
-      ALTER TABLE clients_new RENAME TO clients;
-      PRAGMA foreign_keys = ON;
-    `);
+    try {
+      await db.execAsync(`
+        BEGIN IMMEDIATE;
+        INSERT INTO clients_new (
+          id, server_id, business_name, name, contact_name, owner_name,
+          phone, neighborhood_id, neighborhood_name, address, lat, lng,
+          visit_status, active, sync_status, created_at, updated_at
+        )
+        SELECT
+          id, ${serverIdExpr}, ${bNameExpr}, ${nameExpr}, ${cNameExpr}, ${oNameExpr},
+          ${phoneExpr}, ${nIdExpr}, ${nNameExpr}, ${addrExpr}, ${latExpr}, ${lngExpr},
+          ${visitExpr}, ${activeExpr}, ${syncExpr}, ${createdExpr}, ${updatedExpr}
+        FROM clients;
+        DROP TABLE clients;
+        ALTER TABLE clients_new RENAME TO clients;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    } catch (migErr) {
+      try {
+        await db.execAsync("ROLLBACK;");
+      } catch {}
+      try {
+        await db.execAsync("PRAGMA foreign_keys = ON;");
+      } catch {}
+      throw migErr;
+    }
   }
 
   await db.execAsync(`

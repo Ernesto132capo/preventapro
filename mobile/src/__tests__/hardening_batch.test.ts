@@ -101,6 +101,7 @@ const mockDb = {
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: () => "2026-10-16T12:00:00.000Z",
+  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
 }));
 
 jest.mock("../db/outbox", () => ({

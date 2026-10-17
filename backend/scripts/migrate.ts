@@ -276,6 +276,21 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    id: "007_rename_users_david_yuma",
+    description: "Renombrar preventistas PV001 a david y PV002 a yuma con nombres amigables",
+    run: async (client: PoolClient) => {
+      await client.query(`
+        UPDATE users
+        SET code = 'david', full_name = 'David', updated_at = now()
+        WHERE lower(code) = 'pv001' OR lower(code) = 'david';
+
+        UPDATE users
+        SET code = 'yuma', full_name = 'Yuma', updated_at = now()
+        WHERE lower(code) = 'pv002' OR lower(code) = 'yuma';
+      `);
+    },
+  },
 ];
 
 async function ensureMigrationsTable(client: PoolClient): Promise<void> {

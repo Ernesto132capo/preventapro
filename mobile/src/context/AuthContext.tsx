@@ -11,6 +11,24 @@ export interface AuthUser {
   fullName: string;
 }
 
+export function normalizeUserName(code?: string | null, fullName?: string | null): string {
+  const normCode = (code || "").trim().toLowerCase();
+  const normName = (fullName || "").trim().toLowerCase();
+  if (normCode === "david" || normCode === "pv001" || normName.includes("david")) {
+    return "David";
+  }
+  if (normCode === "yuma" || normCode === "pv002" || normName.includes("yuma")) {
+    return "Yuma";
+  }
+  if (fullName && fullName.trim()) {
+    return fullName.trim();
+  }
+  if (code && code.trim()) {
+    return code.trim();
+  }
+  return "Preventista";
+}
+
 interface AuthContextValue {
   user: AuthUser | null;
   loading: boolean;

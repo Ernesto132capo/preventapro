@@ -14,7 +14,16 @@ function derivePasswordKey(password: string, salt: Buffer): Promise<Buffer> {
 }
 
 function authSecret(): string {
-  const secret = process.env.AUTH_TOKEN_SECRET || "preventapro_super_secure_jwt_auth_secret_key_32_chars_fallback";
+  const isTest = process.env.NODE_ENV === "test" || Boolean(process.env.VITEST);
+  const secret = process.env.AUTH_TOKEN_SECRET;
+  if (!secret) {
+    if (isTest) return "preventapro_super_secure_jwt_auth_secret_key_32_chars_test";
+    throw new Error("Falta la variable de entorno AUTH_TOKEN_SECRET (debe tener al menos 32 caracteres).");
+  }
+  if (secret.length < 32) {
+    if (isTest) return "preventapro_super_secure_jwt_auth_secret_key_32_chars_test";
+    throw new Error("AUTH_TOKEN_SECRET debe tener al menos 32 caracteres de longitud por seguridad.");
+  }
   return secret;
 }
 

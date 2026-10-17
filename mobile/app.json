@@ -18,10 +18,7 @@
       "adaptiveIcon": {
         "backgroundColor": "#001428"
       },
-      "permissions": [
-        "CAMERA",
-        "ACCESS_FINE_LOCATION"
-      ]
+      "permissions": []
     },
     "plugins": [
       "expo-secure-store"

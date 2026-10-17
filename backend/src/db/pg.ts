@@ -32,9 +32,13 @@ types.setTypeParser(TIMESTAMPTZ_OID, (value: string | null) => safeDateIso(value
 // Connection string pooleado de Neon. Ejemplo:
 // postgres://user:password@ep-xxxx-pooler.region.aws.neon.tech/neondb?sslmode=require
 if (!process.env.DATABASE_URL) {
-  throw new Error(
-    "Falta la variable de entorno DATABASE_URL (connection string de Neon)."
-  );
+  if (process.env.NODE_ENV === "test" || Boolean(process.env.VITEST)) {
+    process.env.DATABASE_URL = "postgres://test:test@localhost:5432/test_db";
+  } else {
+    throw new Error(
+      "Falta la variable de entorno DATABASE_URL (connection string de Neon)."
+    );
+  }
 }
 
 const rejectUnauthorizedEnv = process.env.PGSSLREJECTUNAUTHORIZED || process.env.DB_SSL_REJECT_UNAUTHORIZED;
@@ -45,6 +49,9 @@ const sslRejectUnauthorized = rejectUnauthorizedEnv !== undefined
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: sslRejectUnauthorized },
+  max: 10,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000,
 });
 
 pool.on("error", (err) => {
@@ -86,7 +93,8 @@ export async function ensureClientsSchema(clientOrPool: Pool | import("pg").Pool
         name = COALESCE(NULLIF(name, ''), business_name),
         business_name = COALESCE(NULLIF(business_name, ''), name),
         owner_name = COALESCE(NULLIF(owner_name, ''), contact_name),
-        contact_name = COALESCE(NULLIF(contact_name, ''), owner_name);
+        contact_name = COALESCE(NULLIF(contact_name, ''), owner_name)
+      WHERE (name IS NULL OR name = '' OR business_name IS NULL OR business_name = '' OR owner_name IS NULL OR owner_name = '' OR contact_name IS NULL OR contact_name = '');
     `);
   } catch (err) {
     // Non-fatal: table might not exist yet or connection issue

@@ -1,6 +1,6 @@
 import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
-import { getDb, nowIso } from "../client";
+import { getDb, nowIso, withTx } from "../client";
 import { enqueue } from "../outbox";
 import { Product, Presentation, ComboDefinition, ComboOption } from "../../domain/types";
 import { listRecentProductIdsForClient } from "./orders";
@@ -366,7 +366,7 @@ export async function createProductLocal(input: NewProductInput): Promise<Produc
   const db = await getDb();
   const productId = uuid();
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(
       `INSERT INTO products (id, sku, name, category_id, base_cost_cents, base_unit_name, product_type, active, sync_status)
        VALUES (?, ?, ?, ?, ?, 'Unidad', ?, 1, 'pending')`,
@@ -425,7 +425,7 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
   const localProdId = existing.id;
   const serverProdId = existing.server_id;
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(`UPDATE products SET name = ?, category_id = ?, product_type = ?, sync_status = 'pending' WHERE id = ?`, [
       input.name.trim(),
       input.categoryId || null,
@@ -510,7 +510,7 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
 /** Borrado (soft delete) de un producto. Nunca se elimina físicamente para no perder historial de preventas. */
 export async function deleteProductLocal(productId: string): Promise<void> {
   const db = await getDb();
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const product = await db.getFirstAsync<{ id: string }>(
       `SELECT id FROM products WHERE id = ? OR server_id = ?`,
       [productId, productId]

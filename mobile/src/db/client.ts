@@ -99,6 +99,79 @@ async function removeLegacyStockColumn(db: SQLite.SQLiteDatabase): Promise<boole
   }
 }
 
+let txQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Cola global serializada para transacciones SQLite (evita "cannot rollback - no transaction is active"
+ * cuando dos tareas asíncronas ejecutan transacciones simultáneamente).
+ * Soporta llamadas reentrantes mediante SAVEPOINT para evitar deadlocks cuando una función dentro
+ * de un withTx invoca a otra que también usa withTx.
+ */
+export async function withTx<T>(
+  task: (db: SQLite.SQLiteDatabase) => Promise<T>,
+  existingDb?: SQLite.SQLiteDatabase
+): Promise<T> {
+  const db = existingDb || (await getDb());
+
+  // Compatibilidad con mocks de pruebas unitarias (Jest)
+  if (typeof (db as any).withTransactionAsync === "function" && typeof db.execAsync !== "function") {
+    return (db as any).withTransactionAsync(async () => task(db));
+  }
+
+  // Soporte reentrante: si la conexión ya está en una transacción activa en este hilo
+  if ((db as any).__inTx) {
+    const depth = ((db as any).__txDepth || 0) + 1;
+    (db as any).__txDepth = depth;
+    const sp = `sp_${depth}`;
+    await db.execAsync(`SAVEPOINT ${sp}`);
+    try {
+      const res = await task(db);
+      await db.execAsync(`RELEASE SAVEPOINT ${sp}`);
+      return res;
+    } catch (err) {
+      try {
+        await db.execAsync(`ROLLBACK TO SAVEPOINT ${sp}`);
+      } catch {}
+      throw err;
+    } finally {
+      (db as any).__txDepth = depth - 1;
+    }
+  }
+
+  // Nivel superior: serialización en cola global
+  let releaseLock: () => void;
+  const lockPromise = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+
+  const prevQueue = txQueue;
+  txQueue = txQueue.then(() => lockPromise, () => lockPromise);
+
+  await prevQueue;
+
+  try {
+    (db as any).__inTx = true;
+    (db as any).__txDepth = 0;
+    await db.execAsync("BEGIN IMMEDIATE");
+    let result: T;
+    try {
+      result = await task(db);
+      await db.execAsync("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        await db.execAsync("ROLLBACK");
+      } catch {}
+      throw err;
+    } finally {
+      (db as any).__inTx = false;
+      (db as any).__txDepth = 0;
+    }
+  } finally {
+    releaseLock!();
+  }
+}
+
 async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
   const db = await SQLite.openDatabaseAsync("preventapro.db");
   await db.execAsync(LOCAL_SCHEMA);
@@ -107,7 +180,7 @@ async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
 
   const versionRows = await db.getAllAsync<{ user_version: number }>("PRAGMA user_version");
   const currentVersion = Number(versionRows[0]?.user_version ?? 0);
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     // Se comprueba cada columna para reparar también instalaciones en las que
     // una versión anterior dejó la migración a medio aplicar.
     await ensureRequiredColumns(db);
@@ -119,7 +192,7 @@ async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
       ? Math.max(currentVersion, DATABASE_SCHEMA_VERSION)
       : currentVersion;
     await db.execAsync(`PRAGMA user_version = ${nextVersion}`);
-  });
+  }, db);
 
   await db.execAsync(LOCAL_INDEXES);
   dbInstance = db;
@@ -158,7 +231,7 @@ export function nowIso(): string {
 /** Borra solo la copia local para recuperar una cola offline corrupta. */
 export async function resetLocalDatabase(): Promise<void> {
   const db = await getDb();
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     // Ordenado de dependientes a principales; no toca el servidor ni la sesión.
     await db.runAsync(`DELETE FROM order_item_selections`);
     await db.runAsync(`DELETE FROM order_items`);
@@ -173,6 +246,7 @@ export async function resetLocalDatabase(): Promise<void> {
     await db.runAsync(`DELETE FROM work_days`);
     await db.runAsync(`DELETE FROM categories`);
     await db.runAsync(`DELETE FROM meta`);
-  });
+  }, db);
 }
+
 

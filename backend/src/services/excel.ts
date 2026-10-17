@@ -212,28 +212,81 @@ export async function generateProductListExcel(workDayId: string, outDir: string
   const map = new Map<string, AggregatedProduct>();
 
   for (const row of rawRows) {
-    const key = `${row.product_name_snapshot}__${row.presentation_name_snapshot}__${row.unit_price_cents_snapshot}`;
-    const qty = Number(row.quantity || 0);
-    const subtotal = Number(row.subtotal_cents ?? (row.unit_price_cents_snapshot * qty));
-    const isSpecialPres = row.presentation_name_snapshot &&
-      row.presentation_name_snapshot !== "Unidad" &&
-      row.presentation_name_snapshot !== "Default" &&
-      row.presentation_name_snapshot !== row.product_name_snapshot;
     const isCombo = row.selections && row.selections.length > 0;
-    const baseName = isCombo ? `${row.product_name_snapshot} (Combo)` : row.product_name_snapshot;
-    const displayName = isSpecialPres ? `${baseName} (${row.presentation_name_snapshot})` : baseName;
+    if (isCombo) {
+      // Desglosar el combo en sus productos individuales componentes
+      const comboQty = Number(row.quantity || 0);
+      const comboSubtotal = Number(row.subtotal_cents ?? (row.unit_price_cents_snapshot * comboQty));
+      const totalSelQty = row.selections.reduce((sum, s) => sum + (Number(s.quantity) || 1), 0);
 
-    const existing = map.get(key);
-    if (existing) {
-      existing.totalUnits += qty;
-      existing.totalSubtotalCents += subtotal;
+      let allocatedSubtotal = 0;
+      for (let i = 0; i < row.selections.length; i++) {
+        const sel = row.selections[i];
+        const selFactor = Number(sel.quantity) || 1;
+        const itemUnits = comboQty * selFactor;
+
+        let itemSubtotal: number;
+        if (i === row.selections.length - 1) {
+          itemSubtotal = comboSubtotal - allocatedSubtotal;
+        } else {
+          itemSubtotal = totalSelQty > 0
+            ? Math.round((comboSubtotal * selFactor) / totalSelQty)
+            : Math.round(comboSubtotal / row.selections.length);
+          allocatedSubtotal += itemSubtotal;
+        }
+
+        const isSpecialPres = sel.presentation_name_snapshot &&
+          sel.presentation_name_snapshot !== "Unidad" &&
+          sel.presentation_name_snapshot !== "Default" &&
+          sel.presentation_name_snapshot !== sel.product_name_snapshot;
+        const displayName = isSpecialPres
+          ? `${sel.product_name_snapshot} (${sel.presentation_name_snapshot})`
+          : sel.product_name_snapshot;
+
+        const key = `${sel.product_name_snapshot}__${sel.presentation_name_snapshot}`;
+        const existing = map.get(key);
+        if (existing) {
+          existing.totalUnits += itemUnits;
+          existing.totalSubtotalCents += itemSubtotal;
+          existing.unitPriceCents = existing.totalUnits > 0
+            ? Math.round(existing.totalSubtotalCents / existing.totalUnits)
+            : 0;
+        } else {
+          map.set(key, {
+            displayName,
+            totalSubtotalCents: itemSubtotal,
+            totalUnits: itemUnits,
+            unitPriceCents: itemUnits > 0 ? Math.round(itemSubtotal / itemUnits) : 0,
+          });
+        }
+      }
     } else {
-      map.set(key, {
-        displayName,
-        unitPriceCents: Number(row.unit_price_cents_snapshot || 0),
-        totalSubtotalCents: subtotal,
-        totalUnits: qty,
-      });
+      const qty = Number(row.quantity || 0);
+      const subtotal = Number(row.subtotal_cents ?? (row.unit_price_cents_snapshot * qty));
+      const isSpecialPres = row.presentation_name_snapshot &&
+        row.presentation_name_snapshot !== "Unidad" &&
+        row.presentation_name_snapshot !== "Default" &&
+        row.presentation_name_snapshot !== row.product_name_snapshot;
+      const displayName = isSpecialPres
+        ? `${row.product_name_snapshot} (${row.presentation_name_snapshot})`
+        : row.product_name_snapshot;
+
+      const key = `${row.product_name_snapshot}__${row.presentation_name_snapshot}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.totalUnits += qty;
+        existing.totalSubtotalCents += subtotal;
+        existing.unitPriceCents = existing.totalUnits > 0
+          ? Math.round(existing.totalSubtotalCents / existing.totalUnits)
+          : 0;
+      } else {
+        map.set(key, {
+          displayName,
+          totalSubtotalCents: subtotal,
+          totalUnits: qty,
+          unitPriceCents: Number(row.unit_price_cents_snapshot || 0),
+        });
+      }
     }
   }
 

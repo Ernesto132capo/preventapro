@@ -39,6 +39,8 @@ import { syncRouter } from "../routes/sync";
 import { workdaysRouter, closeStaleOpenWorkDays } from "../routes/workdays";
 import { reportsRouter } from "../routes/reports";
 import { clientsRouter } from "../routes/clients";
+import { authRouter } from "../routes/auth";
+import { hashPassword } from "../services/auth";
 import { formatClientDisplayName } from "../services/client-display";
 import {
   generateClientReceiptsExcel,
@@ -761,6 +763,16 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       const filePath = await generateProductListExcel(workDayId, tempDir);
       expect(fs.existsSync(filePath)).toBe(true);
       expect(path.basename(filePath)).toBe("lista_de_productos.xlsx");
+
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.readFile(filePath);
+      const ws = wb.getWorksheet("Lista de Productos");
+      expect(ws).toBeDefined();
+
+      const firstColValues = ws!.getRows(1, ws!.rowCount)?.map((r) => r.getCell(1).value) || [];
+      expect(firstColValues).toContain("Cereal Chocolate (Caja 300g)");
+      expect(firstColValues).toContain("Cereal Miel (Caja 300g)");
+      expect(firstColValues.some((v) => String(v).includes("Combo Desayuno"))).toBe(false);
     });
 
     it("generateClientReceiptsExcel formatea boletas de clientes activas", async () => {
@@ -869,6 +881,100 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       );
       expect(insertCall).toBeDefined();
       expect(insertCall![1]).toEqual(["002_auth"]);
+    });
+
+    it("runSpecificMigration ejecuta 007_rename_users_david_yuma correctamente", async () => {
+      let executedSql = "";
+      mockClient.query.mockImplementation(async (sql: string) => {
+        const clean = sql.replace(/\s+/g, " ").trim();
+        if (clean.includes("CREATE TABLE IF NOT EXISTS _migrations")) return { rows: [] };
+        if (clean.includes("SELECT name FROM _migrations WHERE name = $1")) return { rows: [] };
+        if (clean.includes("UPDATE users SET code = 'david'")) {
+          executedSql = clean;
+          return { rows: [] };
+        }
+        return { rows: [] };
+      });
+
+      await runSpecificMigration("007_rename_users_david_yuma");
+
+      expect(executedSql).toContain("UPDATE users SET code = 'david', full_name = 'David'");
+      expect(executedSql).toContain("UPDATE users SET code = 'yuma', full_name = 'Yuma'");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 6. AUTENTICACIÓN Y ALIAS DAVID Y YUMA
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("6. Autenticación y Alias (David y Yuma)", () => {
+    it("permite login insensible a mayúsculas y mapea alias PV001 a david y PV002 a yuma", async () => {
+      const authApp = express();
+      authApp.use(express.json());
+      authApp.use("/auth", authRouter);
+
+      const passHash = await hashPassword("secreto123");
+      let queriedCode: string | null = null;
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users") && sql.includes("lower(code)")) {
+          queriedCode = params[0];
+          return {
+            rows: [
+              {
+                id: "usr-david",
+                code: "david",
+                real_email: "david@preventapro.bo",
+                full_name: "David",
+                active: true,
+                password_hash: passHash,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      });
+
+      // Intento de login con "PV001" en mayúsculas
+      const resPv001 = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "PV001", password: "secreto123" },
+      });
+      expect(resPv001.status).toBe(200);
+      expect(queriedCode).toBe("david");
+      expect(resPv001.body.user.code).toBe("david");
+      expect(resPv001.body.user.fullName).toBe("David");
+
+      // Intento de login con "pv002"
+      queriedCode = null;
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM users") && sql.includes("lower(code)")) {
+          queriedCode = params[0];
+          return {
+            rows: [
+              {
+                id: "usr-yuma",
+                code: "yuma",
+                real_email: "yuma@preventapro.bo",
+                full_name: "Yuma",
+                active: true,
+                password_hash: passHash,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      });
+
+      const resPv002 = await makeRequest(authApp, {
+        method: "POST",
+        url: "/auth/login",
+        body: { identifier: "pv002", password: "secreto123" },
+      });
+      expect(resPv002.status).toBe(200);
+      expect(queriedCode).toBe("yuma");
+      expect(resPv002.body.user.code).toBe("yuma");
+      expect(resPv002.body.user.fullName).toBe("Yuma");
     });
   });
 

@@ -1,5 +1,5 @@
 import { v4 as uuid } from "uuid";
-import { getDb, nowIso } from "../client";
+import { getDb, nowIso, withTx } from "../client";
 import { WorkDay } from "../../domain/types";
 import { todayBolivia } from "../../utils/dates";
 
@@ -29,7 +29,7 @@ export async function getTodayWorkDay(userId: string): Promise<WorkDay> {
   const today = todayBolivia();
   return withUserWorkDayLock("shared", async () => {
     let row: any = null;
-    await db.withTransactionAsync(async () => {
+    await withTx(async () => {
       // Al cambiar de fecha, concluir localmente jornadas olvidadas con sus totales reales.
       await db.runAsync(
         `UPDATE work_days
@@ -108,7 +108,7 @@ export async function upsertServerWorkDay(localId: string, serverWorkDay: any) {
   const userId = typeof serverWorkDay.user_id === "string" ? serverWorkDay.user_id : "shared";
 
   await withUserWorkDayLock("shared", async () => {
-    await db.withTransactionAsync(async () => {
+    await withTx(async () => {
       const matchingRows = await db.getAllAsync<any>(
         `SELECT * FROM work_days WHERE id = ? OR server_id = ? OR (work_date = ? AND ? IS NOT NULL)`,
         [localId, serverId, workDate, workDate]
@@ -174,7 +174,7 @@ export async function markWorkDayClosed(localId: string, orderCount?: number, to
   );
   if (!row) return;
   await withUserWorkDayLock("shared", async () => {
-    await db.withTransactionAsync(async () => {
+    await withTx(async () => {
       let oc = orderCount;
       let tc = totalCents;
       if (oc === undefined || tc === undefined) {
@@ -236,7 +236,7 @@ export async function listClosedWorkDays(_userId?: string): Promise<WorkDay[]> {
 /** Elimina la copia local después de que el backend confirmó borrar el histórico. */
 export async function deleteClosedWorkDayLocal(localId: string): Promise<void> {
   const db = await getDb();
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(
       `DELETE FROM order_item_selections
        WHERE order_item_id IN (

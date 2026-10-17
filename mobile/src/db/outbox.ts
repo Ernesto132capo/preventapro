@@ -112,12 +112,25 @@ export async function getFailedErrors(): Promise<{ entity_type: OutboxEntity; la
     `SELECT entity_type, last_error FROM outbox WHERE status IN ('failed', 'error') ORDER BY created_at DESC LIMIT 5`
   );
 }
-// Descarta (marca como 'done', sin subir) los ítems que quedaron trabados con error de
-// validación — ej. datos mal cargados que el servidor rechaza siempre. No hay UI de edición
-// todavía, así que esta es la forma de "destrabar" la cola sin tener que reinstalar la app.
+// Descarta (marca como 'done', sin subir) únicamente los ítems que quedaron trabados con error
+// permanente de validación (status = 'error'). NO descarta filas reintentables ('failed').
+// Actualiza coherentemente el sync_status del pedido asociado para no dejarlo en un estado inconsistente.
 export async function discardFailed(): Promise<number> {
   const db = await getDb();
-  const result = await db.runAsync(`UPDATE outbox SET status = 'done', last_error = NULL WHERE status IN ('failed', 'error')`);
+  const errorOrders = await db.getAllAsync<{ local_entity_id: string }>(
+    `SELECT local_entity_id FROM outbox WHERE status = 'error' AND entity_type = 'order'`
+  );
+  for (const o of errorOrders) {
+    await db.runAsync(`UPDATE orders SET sync_status = 'failed', sync_error = 'Descartado por validación' WHERE id = ?`, [o.local_entity_id]);
+  }
+  const result = await db.runAsync(`UPDATE outbox SET status = 'done', last_error = NULL WHERE status = 'error'`);
+  return result.changes ?? 0;
+}
+
+/** Reintenta todos los ítems fallidos o en error devolviéndolos a estado 'pending'. */
+export async function retryFailed(): Promise<number> {
+  const db = await getDb();
+  const result = await db.runAsync(`UPDATE outbox SET status = 'pending' WHERE status IN ('failed', 'error')`);
   return result.changes ?? 0;
 }
 

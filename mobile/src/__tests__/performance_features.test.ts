@@ -171,10 +171,11 @@ const mockDb = {
     }
 
     // OUTBOX: discardFailed
-    if (cleanSql.includes("UPDATE outbox SET status = 'done', last_error = NULL WHERE status IN ('failed', 'error')")) {
+    if (cleanSql.includes("UPDATE outbox SET status = 'done', last_error = NULL WHERE status = 'error'") ||
+        cleanSql.includes("UPDATE outbox SET status = 'done', last_error = NULL WHERE status IN ('failed', 'error')")) {
       let changes = 0;
       for (const row of mockDbState.outbox) {
-        if (row.status === "failed" || row.status === "error") {
+        if (row.status === "error") {
           row.status = "done";
           row.last_error = null;
           changes++;
@@ -471,6 +472,7 @@ const mockDb = {
 jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: jest.fn(() => new Date().toISOString()),
+  withTx: jest.fn(async (cb: (db: any) => Promise<any>) => mockDb.withTransactionAsync(() => cb(mockDb))),
 }));
 
 describe("Performance utilities & enhancements", () => {
@@ -596,7 +598,13 @@ describe("Outbox deduplication and sorting logic", () => {
     expect(failedErrors.length).toBeGreaterThanOrEqual(1);
     expect(failedErrors[0].last_error).toBe("Error 500");
 
-    // discardFailed limpia los registros trabados marcándolos como done
+    // discardFailed NO descarta errores reintentables transitorios ('failed')
+    const notDiscarded = await discardFailed();
+    expect(notDiscarded).toBe(0);
+    expect(mockDbState.outbox.find((r) => r.id === row.id)?.status).toBe("failed");
+
+    // markPermanentError marca error permanente ('error') y discardFailed lo descarta
+    await markPermanentError(row.id, "Error 400 Bad Request");
     const discarded = await discardFailed();
     expect(discarded).toBe(1);
     expect(mockDbState.outbox.find((r) => r.id === row.id)?.status).toBe("done");

@@ -17,12 +17,15 @@ authRouter.post("/login", async (req, res, next) => {
     if (!parsed.success) return res.status(400).json({ error: "Ingresa tu código y contraseña válidos." });
 
     const { identifier, password } = parsed.data;
+    const cleanId = identifier.trim().toLowerCase();
+    const resolvedId = cleanId === "pv001" ? "david" : cleanId === "pv002" ? "yuma" : cleanId;
+
     const { rows } = await pool.query(
       `SELECT id, code, real_email, full_name, active, password_hash
        FROM users
        WHERE lower(code) = lower($1) OR lower(coalesce(real_email, '')) = lower($1)
        LIMIT 1`,
-      [identifier]
+      [resolvedId]
     );
     const user = rows[0];
     if (!user || user.active === false || !(await verifyPassword(password, user.password_hash))) {

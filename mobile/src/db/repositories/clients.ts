@@ -1,5 +1,5 @@
 import { v4 as uuid } from "uuid";
-import { getDb, nowIso } from "../client";
+import { getDb, nowIso, withTx } from "../client";
 import { enqueue, purgeOutboxForEntity } from "../outbox";
 import { Client } from "../../domain/types";
 
@@ -50,7 +50,7 @@ export async function createClientLocal(input: QuickClientInput): Promise<Client
   const id = uuid();
   const ts = nowIso();
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(
       `INSERT INTO clients
         (id, business_name, name, contact_name, owner_name, phone, address, lat, lng, visit_status, active, sync_status, created_at, updated_at)
@@ -87,7 +87,7 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
   const existing = await getClient(id);
   if (!existing) throw new Error("Cliente no encontrado.");
 
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     await db.runAsync(
       `UPDATE clients SET
          business_name = ?, name = ?, contact_name = ?, owner_name = ?, phone = ?, address = ?, lat = ?, lng = ?,
@@ -115,7 +115,7 @@ export async function updateClientLocal(id: string, input: QuickClientInput): Pr
 /** Borrado (soft delete) de un cliente. Nunca se elimina físicamente para no perder historial de preventas. */
 export async function deleteClientLocal(id: string): Promise<void> {
   const db = await getDb();
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const existing = await getClient(id);
     if (!existing) return;
 
@@ -221,7 +221,7 @@ export async function resolveServerClientId(localId: string): Promise<string | n
 export async function mergeDuplicateClients(): Promise<number> {
   const db = await getDb();
   let removed = 0;
-  await db.withTransactionAsync(async () => {
+  await withTx(async () => {
     const groups = await db.getAllAsync<{ server_id: string; ids: string }>(
       `SELECT server_id, GROUP_CONCAT(id) as ids FROM clients
        WHERE server_id IS NOT NULL AND active = 1

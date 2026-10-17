@@ -1,4 +1,4 @@
-import { getDb, getMeta, setMeta } from "../db/client";
+import { getDb, getMeta, setMeta, withTx } from "../db/client";
 import { apiFetch, ApiError } from "./api";
 import {
   enqueue,
@@ -35,109 +35,122 @@ async function pullCatalog(userId: string, force = false): Promise<{ clients: nu
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
-  const catCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM categories WHERE active = 1`))?.n ?? 0;
 
-  let since = (await getMeta("last_pull_at")) || "1970-01-01T00:00:00.000Z";
-  if (force || prodCount === 0 || clientCount === 0 || catCount === 0) {
+  const savedSince = await getMeta("last_pull_at");
+  let since = savedSince || "1970-01-01T00:00:00.000Z";
+  // Solo pedir desde 1970 si se fuerza o si es la primera sincronización (base vacía sin cursor guardado)
+  if (force || (!savedSince && prodCount === 0 && clientCount === 0)) {
     since = "1970-01-01T00:00:00.000Z";
+  }
+
+  // Margen de seguridad de 2 minutos para el cursor since para evitar omitir transacciones
+  // que comenzaron justo antes del pull anterior y confirmaron después.
+  if (since && !since.startsWith("1970")) {
+    const sinceMs = new Date(since).getTime();
+    if (!isNaN(sinceMs) && sinceMs > 120_000) {
+      since = new Date(sinceMs - 120_000).toISOString();
+    }
   }
 
   const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}${force ? "&force=1" : ""}`);
 
-  if (data.categories && Array.isArray(data.categories)) {
-    for (const cat of data.categories) {
-      await upsertCategoryFromServer(cat);
-    }
-  }
-
-  for (const c of data.clients) await upsertClientFromServer(c);
-
-  // Agrupar presentaciones por producto para reusar upsertProductFromServer
-  const presByProduct: Record<string, any[]> = {};
-  for (const p of data.presentations) {
-    presByProduct[p.product_id] = presByProduct[p.product_id] || [];
-    presByProduct[p.product_id].push(p);
-  }
-  for (const prod of data.products) {
-    const presentations = presByProduct[prod.id] || [];
-    await upsertProductFromServer({ ...prod, presentations });
-  }
-
-  // Integrar definiciones y opciones de combos
-  if (data.comboDefinitions && Array.isArray(data.comboDefinitions)) {
-    for (const cd of data.comboDefinitions) {
-      const localProd = await db.getFirstAsync<{ id: string; sync_status: string }>(
-        `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
-        [cd.product_id, cd.product_id]
-      );
-      if (localProd && localProd.sync_status === "pending") {
-        continue;
+  // Agrupar todas las inserciones del pull en una sola transacción atómica serializada
+  await withTx(async (txDb) => {
+    if (data.categories && Array.isArray(data.categories)) {
+      for (const cat of data.categories) {
+        await upsertCategoryFromServer(cat);
       }
-      const targetProdId = localProd ? localProd.id : cd.product_id;
-      const existingDef = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
-        [cd.id, targetProdId, cd.id]
-      );
-      const targetDefId = existingDef ? existingDef.id : cd.id;
-      await db.runAsync(
-        `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
-         VALUES (?, ?, ?, ?, ?, ?, 'synced')
-         ON CONFLICT(id) DO UPDATE SET
-           server_id = excluded.server_id, product_id = excluded.product_id,
-           selection_min = excluded.selection_min, selection_max = excluded.selection_max,
-           active = excluded.active, sync_status = 'synced'`,
-        [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
-      );
     }
-  }
 
-  if (data.comboOptions && Array.isArray(data.comboOptions)) {
-    for (const co of data.comboOptions) {
-      const localPres = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
-        [co.presentation_id, co.presentation_id]
-      );
-      const targetPresId = localPres ? localPres.id : co.presentation_id;
-      const localDef = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
-        [co.combo_id, co.combo_id]
-      );
-      const targetComboId = localDef ? localDef.id : co.combo_id;
-      const existingOpt = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
-        [co.id, co.id, targetComboId, targetPresId]
-      );
-      const targetOptId = existingOpt ? existingOpt.id : co.id;
-      await db.runAsync(
-        `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
-         ON CONFLICT(id) DO UPDATE SET
-           server_id = excluded.server_id, combo_id = excluded.combo_id,
-           presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
-           sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
-        [targetOptId, co.id, targetComboId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
-      );
+    for (const c of data.clients) await upsertClientFromServer(c);
+
+    // Agrupar presentaciones por producto para reusar upsertProductFromServer
+    const presByProduct: Record<string, any[]> = {};
+    for (const p of data.presentations) {
+      presByProduct[p.product_id] = presByProduct[p.product_id] || [];
+      presByProduct[p.product_id].push(p);
     }
-  }
-
-  // Descargar e integrar preventas de la jornada del preventista autenticado.
-  if (data.orders && Array.isArray(data.orders)) {
-    for (const o of data.orders) {
-      await upsertOrderFromServer(o);
+    for (const prod of data.products) {
+      const presentations = presByProduct[prod.id] || [];
+      await upsertProductFromServer({ ...prod, presentations });
     }
-  }
 
-  // Actualizar la jornada local de hoy y las jornadas compartidas si vinieron en el pull.
-  if (data.workDay) {
-    const todayLocal = await getTodayWorkDay(userId);
-    await upsertServerWorkDay(todayLocal.id, data.workDay);
-  }
-
-  if (data.workDays && Array.isArray(data.workDays)) {
-    for (const wd of data.workDays) {
-      await upsertServerWorkDay(wd.id, wd);
+    // Integrar definiciones y opciones de combos
+    if (data.comboDefinitions && Array.isArray(data.comboDefinitions)) {
+      for (const cd of data.comboDefinitions) {
+        const localProd = await txDb.getFirstAsync<{ id: string; sync_status: string }>(
+          `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
+          [cd.product_id, cd.product_id]
+        );
+        if (localProd && localProd.sync_status === "pending") {
+          continue;
+        }
+        const targetProdId = localProd ? localProd.id : cd.product_id;
+        const existingDef = await txDb.getFirstAsync<{ id: string }>(
+          `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
+          [cd.id, targetProdId, cd.id]
+        );
+        const targetDefId = existingDef ? existingDef.id : cd.id;
+        await txDb.runAsync(
+          `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
+           VALUES (?, ?, ?, ?, ?, ?, 'synced')
+           ON CONFLICT(id) DO UPDATE SET
+             server_id = excluded.server_id, product_id = excluded.product_id,
+             selection_min = excluded.selection_min, selection_max = excluded.selection_max,
+             active = excluded.active, sync_status = 'synced'`,
+          [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
+        );
+      }
     }
-  }
+
+    if (data.comboOptions && Array.isArray(data.comboOptions)) {
+      for (const co of data.comboOptions) {
+        const localPres = await txDb.getFirstAsync<{ id: string }>(
+          `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
+          [co.presentation_id, co.presentation_id]
+        );
+        const targetPresId = localPres ? localPres.id : co.presentation_id;
+        const localDef = await txDb.getFirstAsync<{ id: string }>(
+          `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
+          [co.combo_id, co.combo_id]
+        );
+        const targetComboId = localDef ? localDef.id : co.combo_id;
+        const existingOpt = await txDb.getFirstAsync<{ id: string }>(
+          `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+          [co.id, co.id, targetComboId, targetPresId]
+        );
+        const targetOptId = existingOpt ? existingOpt.id : co.id;
+        await txDb.runAsync(
+          `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
+           ON CONFLICT(id) DO UPDATE SET
+             server_id = excluded.server_id, combo_id = excluded.combo_id,
+             presentation_id = excluded.presentation_id, max_quantity = excluded.max_quantity,
+             sort_order = excluded.sort_order, active = excluded.active, sync_status = 'synced'`,
+          [targetOptId, co.id, targetComboId, targetPresId, co.max_quantity ?? null, co.sort_order ?? 0, co.active ?? 1]
+        );
+      }
+    }
+
+    // Descargar e integrar preventas de la jornada del preventista autenticado.
+    if (data.orders && Array.isArray(data.orders)) {
+      for (const o of data.orders) {
+        await upsertOrderFromServer(o, txDb);
+      }
+    }
+
+    // Actualizar la jornada local de hoy y las jornadas compartidas si vinieron en el pull.
+    if (data.workDay) {
+      const todayLocal = await getTodayWorkDay(userId);
+      await upsertServerWorkDay(todayLocal.id, data.workDay);
+    }
+
+    if (data.workDays && Array.isArray(data.workDays)) {
+      for (const wd of data.workDays) {
+        await upsertServerWorkDay(wd.id, wd);
+      }
+    }
+  });
 
   // Guardar siempre el cursor real del servidor (timestamp más fresco)
   // para que las próximas recargas usen el since incremental y no 1970.
@@ -177,7 +190,7 @@ async function reconcileResetServerMappings() {
   );
   for (const product of localProducts) {
     if (!productIds.has(product.server_id)) {
-      await db.withTransactionAsync(async () => {
+      await withTx(async () => {
         await db.runAsync(`UPDATE products SET server_id = NULL, sync_status = 'pending' WHERE id = ?`, [product.id]);
         await db.runAsync(`UPDATE product_presentations SET server_id = NULL WHERE product_id = ?`, [product.id]);
       });
@@ -417,13 +430,16 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
 type PushOutcome = "done" | "deferred" | "failed";
 
 function isRetryablePushError(err: unknown): boolean {
-  if (!(err instanceof ApiError)) return false;
+  if (!(err instanceof ApiError)) return true;
   return err.status === 0 || err.status >= 500 || [401, 403, 408, 425, 429].includes(err.status);
 }
 
 function shouldPauseQueue(err: unknown): boolean {
   // Evita disparar una petición por cada fila si la conexión, sesión o servicio está caído.
-  return isRetryablePushError(err);
+  if (err instanceof ApiError) {
+    return err.status === 0 || err.status >= 500 || [401, 403, 408, 429].includes(err.status);
+  }
+  return false;
 }
 
 function errorMessage(err: unknown): string {
@@ -446,7 +462,10 @@ async function markPermanentOutboxFailure(row: OutboxRow, message: string): Prom
 
 async function recordPushError(row: OutboxRow, err: unknown): Promise<PushOutcome> {
   const message = errorMessage(err);
-  if (isRetryablePushError(err)) {
+  if (!(err instanceof ApiError) || isRetryablePushError(err)) {
+    if (row.attempts >= 8) {
+      return markPermanentOutboxFailure(row, `Reintentos agotados (8): ${message}`);
+    }
     await deferForRetry(row.id, message);
     return "deferred";
   }
@@ -611,6 +630,12 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       await markPermanentError(row.id, message);
       return "failed";
     }
+
+    if (err instanceof ApiError && err.status === 404) {
+      console.warn(`[pushOrder] Pedido ${order.id} recibió 404. Reconciliando mappings del servidor...`);
+      await reconcileResetServerMappings().catch((rErr) => console.warn("Error en reconcileResetServerMappings:", rErr));
+    }
+
     throw err;
   }
 }
