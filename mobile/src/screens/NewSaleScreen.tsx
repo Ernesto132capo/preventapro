@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert, Modal } from "react-native";
+import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert, Modal, ActivityIndicator } from "react-native";
 import { useFocusEffect, useIsFocused, useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
@@ -38,8 +38,12 @@ export function NewSaleScreen() {
   const { user } = useAuth();
   const { forceSync, pushSync } = useSync();
 
+  const editingOrderId = route.params?.orderId as string | undefined;
+  const isEditing = Boolean(editingOrderId);
+
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
-  const [step, setStep] = useState<Step>("client");
+  const [step, setStep] = useState<Step>(isEditing ? "products" : "client");
+  const [loadingOrder, setLoadingOrder] = useState(isEditing);
   const [clientSearch, setClientSearch] = useState("");
   const debouncedClientSearch = useDebounce(clientSearch, 300);
   const [clients, setClients] = useState<Client[]>([]);
@@ -60,7 +64,6 @@ export function NewSaleScreen() {
   const [saving, setSaving] = useState(false);
   const saveInFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const editingOrderId = route.params?.orderId as string | undefined;
 
   // Estado para modal de revisión de pedido/carrito sin scrollear
   const [cartModalVisible, setCartModalVisible] = useState(false);
@@ -150,47 +153,69 @@ export function NewSaleScreen() {
   }
 
   useEffect(() => {
-    if (route.params?.preselectedClientId) {
-      listActiveClients().then((all) => {
-        const c = all.find((x) => x.id === route.params.preselectedClientId);
-        if (c) {
-          setSelectedClient(c);
-          setStep("products");
-        }
-      });
-    }
-  }, [route.params?.preselectedClientId]);
+    if (isEditing || !route.params?.preselectedClientId) return;
+    listActiveClients().then((all) => {
+      const c = all.find((x) => x.id === route.params.preselectedClientId);
+      if (c) {
+        setSelectedClient(c);
+        setStep("products");
+      }
+    });
+  }, [isEditing, route.params?.preselectedClientId]);
 
   // Al editar, reconstruye el carrito usando el snapshot de la preventa incluyendo combos.
   useEffect(() => {
     if (!editingOrderId) return;
-    getOrderWithItems(editingOrderId).then(async ({ order, items }) => {
-      if (!order) return;
-      const client = await getClient(order.client_id);
-      if (client) setSelectedClient(client);
-      setCart(items.map((item: any) => ({
-        productId: item.product_id,
-        presentationId: item.presentation_id,
-        productName: item.product_name_snapshot,
-        sku: item.sku_snapshot,
-        presentationName: item.presentation_name_snapshot,
-        unitEquivalence: item.unit_equivalence_snapshot,
-        unitPriceCents: item.unit_price_cents_snapshot,
-        quantity: item.quantity,
-        subtotalCents: item.subtotal_cents,
-        isCombo: item.selections && item.selections.length > 0,
-        selections: (item.selections || []).map((s: any) => ({
-          selectedProductId: s.selected_product_id,
-          selectedPresentationId: s.selected_presentation_id,
-          productNameSnapshot: s.product_name_snapshot,
-          presentationNameSnapshot: s.presentation_name_snapshot,
-          quantity: s.quantity,
-          sortOrder: s.sort_order,
-        })),
-      })));
-      setStep("products");
-    });
-  }, [editingOrderId]);
+    setLoadingOrder(true);
+    getOrderWithItems(editingOrderId)
+      .then(async ({ order, items }) => {
+        if (!order) {
+          Alert.alert("Preventa no encontrada", "La preventa que intentas editar no existe.", [
+            { text: "Volver", onPress: () => navigation.goBack() },
+          ]);
+          return;
+        }
+        const client = await getClient(order.client_id);
+        if (!client) {
+          Alert.alert("Cliente no encontrado", "No se encontró el cliente original de esta preventa.", [
+            { text: "Volver", onPress: () => navigation.goBack() },
+          ]);
+          return;
+        }
+        setSelectedClient(client);
+        setCart(
+          items.map((item: any) => ({
+            productId: item.product_id,
+            presentationId: item.presentation_id,
+            productName: item.product_name_snapshot,
+            sku: item.sku_snapshot,
+            presentationName: item.presentation_name_snapshot,
+            unitEquivalence: item.unit_equivalence_snapshot,
+            unitPriceCents: item.unit_price_cents_snapshot,
+            quantity: item.quantity,
+            subtotalCents: item.subtotal_cents,
+            isCombo: item.selections && item.selections.length > 0,
+            selections: (item.selections || []).map((s: any) => ({
+              selectedProductId: s.selected_product_id,
+              selectedPresentationId: s.selected_presentation_id,
+              productNameSnapshot: s.product_name_snapshot,
+              presentationNameSnapshot: s.presentation_name_snapshot,
+              quantity: s.quantity,
+              sortOrder: s.sort_order,
+            })),
+          }))
+        );
+        setStep("products");
+      })
+      .catch((err) => {
+        Alert.alert("Error", err?.message || "No se pudo cargar la preventa para editar.", [
+          { text: "Volver", onPress: () => navigation.goBack() },
+        ]);
+      })
+      .finally(() => {
+        setLoadingOrder(false);
+      });
+  }, [editingOrderId, navigation]);
 
   const totals = useMemo(() => {
     try {
@@ -269,10 +294,14 @@ export function NewSaleScreen() {
     );
   }, []);
 
-  const handleSelectClient = useCallback((client: Client) => {
-    setSelectedClient(client);
-    setStep("products");
-  }, []);
+  const handleSelectClient = useCallback(
+    (client: Client) => {
+      if (isEditing) return;
+      setSelectedClient(client);
+      setStep("products");
+    },
+    [isEditing]
+  );
 
   async function handleSaveOrder() {
     if (saveInFlightRef.current) return;
@@ -401,11 +430,20 @@ export function NewSaleScreen() {
     );
   }
 
-  if (step === "client") {
+  if (isEditing && loadingOrder) {
+    return (
+      <View style={[styles.screen, { justifyContent: "center", alignItems: "center" }]}>
+        <ActivityIndicator size="large" color={colors.emerald} style={{ marginBottom: spacing.md }} />
+        <Text style={{ fontSize: 16, color: colors.textSecondary }}>Cargando preventa...</Text>
+      </View>
+    );
+  }
+
+  if (!isEditing && step === "client") {
     return (
       <View style={styles.screen}>
         <View style={styles.stepHeader}>
-          <Text style={styles.stepTitle}>{editingOrderId ? "Editar preventa" : "Paso 1: Cliente"}</Text>
+          <Text style={styles.stepTitle}>Paso 1: Cliente</Text>
           <Text style={styles.stepSub}>Selecciona el cliente para esta preventa</Text>
         </View>
 
@@ -443,16 +481,26 @@ export function NewSaleScreen() {
     <View style={styles.screen}>
       <View style={styles.stepHeader}>
         <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-          <Text style={styles.stepTitle}>Paso 2: Productos</Text>
+          <Text style={styles.stepTitle}>{isEditing ? "Editar preventa" : "Paso 2: Productos"}</Text>
           {cart.length > 0 && (
             <Pressable style={styles.headerCartBadge} onPress={() => setCartModalVisible(true)}>
               <Text style={styles.headerCartBadgeText}>🛒 {totals.itemCount} ({centsToBs(totals.totalCents)})</Text>
             </Pressable>
           )}
         </View>
-        <Pressable onPress={() => setStep("client")}>
-          <Text style={styles.changeClient}>Cliente: {formatClientDisplayName(selectedClient).primary} · Cambiar</Text>
-        </Pressable>
+        {isEditing ? (
+          <View>
+            <Text style={styles.changeClient}>
+              Cliente: {formatClientDisplayName(selectedClient).primary}
+            </Text>
+          </View>
+        ) : (
+          <Pressable onPress={() => setStep("client")}>
+            <Text style={styles.changeClient}>
+              Cliente: {formatClientDisplayName(selectedClient).primary} · Cambiar
+            </Text>
+          </Pressable>
+        )}
       </View>
 
       <View style={styles.topFilterSection}>
