@@ -91,7 +91,10 @@ npm run migrate
 > 1. Esquema base (`pg.ts`): tablas `users`, `categories`, `clients`, `products`, `orders`, `order_items`, etc.
 > 2. Autenticación (`migrate-auth.ts`): columnas de contraseñas scrypt.
 > 3. Combos y promociones (`migrate-combos.ts`): `combo_definitions` y `combo_options`.
-> 4. Depuración de stock (`migrate-remove-stock.ts`): retiro definitivo de inventario obsoleto.
+> 4. Depuración de stock: retiro definitivo del inventario obsoleto.
+> 5. Compatibilidad de nombres de clientes y propietarios.
+> 6. Alias de acceso legibles para David y Yuma.
+> 7. Sesiones revocables por dispositivo (`user_sessions`).
 > Se puede ejecutar múltiples veces seguidas de manera completamente segura.
 
 #### c. Configuración de Contraseñas de Preventistas
@@ -172,6 +175,37 @@ Las pruebas cubren:
 - Contratos de selección de combos configurables (`combos.test.ts`).
 - Deduplicación, ordenamiento por prioridad y ciclo de vida del Outbox (`performance_features.test.ts`).
 - Invariantes de jornadas laborales abiertas, cerradas y auto-cierre de fechas anteriores (`performance_features.test.ts`).
+
+#### e. Generar un APK para instalación directa
+
+El perfil `preview` de `mobile/eas.json` genera un APK firmado para instalar directamente en teléfonos Android. Antes de crear una actualización, incrementa `android.versionCode` en `mobile/app.json`.
+
+```bash
+cd mobile
+eas login
+eas build --platform android --profile preview
+```
+
+El progreso, el enlace de descarga y el código QR aparecen en Expo.dev. El perfil `production` genera un archivo AAB destinado a Google Play.
+
+---
+
+## ☁️ Despliegue del Backend en Render
+
+Configura el Web Service con estos valores:
+
+- **Root Directory:** `backend`
+- **Build Command:** `npm ci --include=dev && npm run build`
+- **Start Command:** `npm start`
+- **Health Check Path:** `/api/health`
+
+Variables requeridas en Render:
+
+- `DATABASE_URL`: conexión de Neon.
+- `AUTH_TOKEN_SECRET`: secreto estable de al menos 32 caracteres.
+- `NODE_ENV=production`.
+
+Render asigna `PORT` automáticamente. Antes de un despliegue con cambios de esquema, ejecuta `npm run migrate` una vez contra Neon; para migraciones usa preferentemente la conexión directa de Neon.
 
 ---
 
