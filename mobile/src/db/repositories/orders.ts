@@ -285,12 +285,87 @@ export async function upsertOrderFromServerInTx(db: SQLiteDatabase, serverOrder:
   const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
   const clientName = serverOrder.client_name || (localClient ? formatClientDisplayName(localClient).primary : "Cliente");
 
-  const existing = await db.getFirstAsync<{ id: string; sync_status: string }>(
-    `SELECT id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
+  const existing = await db.getFirstAsync<{ id: string; server_id: string | null; work_day_id: string; sync_status: string }>(
+    `SELECT id, server_id, work_day_id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
     [serverOrder.id, serverOrder.id]
   );
 
+  const isCancelled = serverOrder.status === "cancelled";
+
   if (existing && existing.sync_status === "pending") {
+    // Si la copia local tiene cambios pendientes:
+    if (!isCancelled) {
+      // Para actualizaciones remotas normales, proteger cambios locales pendientes
+      return;
+    }
+    // Si es un tombstone pero la orden local todavía no tiene server_id (puramente local):
+    if (!existing.server_id) {
+      return;
+    }
+    // Si ya tiene server_id: la anulación remota gana y continúa abajo
+  }
+
+  // Si llega un tombstone (status = 'cancelled'):
+  if (isCancelled) {
+    if (!existing) {
+      // Registrar tombstone si no existía previamente para evitar inconsistencias futuras
+      await db.runAsync(
+        `INSERT INTO orders
+          (id, server_id, work_day_id, client_id, client_name, payment_condition,
+           subtotal_cents, tax_cents, total_cents, item_count, status, sync_status, sync_error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cancelled', 'synced', NULL, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           status = 'cancelled',
+           sync_status = 'synced',
+           sync_error = NULL,
+           updated_at = excluded.updated_at`,
+        [
+          serverOrder.id,
+          serverOrder.id,
+          workDayLocalId,
+          clientLocalId,
+          clientName,
+          serverOrder.payment_condition || "Contado 48h",
+          serverOrder.subtotal_cents ?? 0,
+          serverOrder.tax_cents ?? 0,
+          serverOrder.total_cents ?? 0,
+          serverOrder.item_count ?? 0,
+          serverOrder.created_at || nowIso(),
+          serverOrder.updated_at || nowIso(),
+        ]
+      );
+      return;
+    }
+
+    const targetOrderId = existing.id;
+    await db.runAsync(
+      `UPDATE orders SET
+         status = 'cancelled',
+         sync_status = 'synced',
+         sync_error = NULL,
+         server_id = COALESCE(server_id, ?),
+         updated_at = ?
+       WHERE id = ?`,
+      [serverOrder.id, serverOrder.updated_at || nowIso(), targetOrderId]
+    );
+
+    await db.runAsync(
+      `DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`,
+      [targetOrderId]
+    );
+    await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [targetOrderId]);
+
+    // Marcar como 'done' las operaciones pendientes de outbox de esa orden ('create', 'update' o 'cancel')
+    await db.runAsync(
+      `UPDATE outbox SET status = 'done', last_error = NULL WHERE entity_type = 'order' AND (local_entity_id = ? OR local_entity_id = ?) AND status IN ('pending', 'syncing', 'failed')`,
+      [targetOrderId, serverOrder.id]
+    );
+
+    const affectedWorkDay = existing.work_day_id || workDayLocalId;
+    await refreshWorkDayTotals(db, affectedWorkDay);
+    if (workDayLocalId && workDayLocalId !== affectedWorkDay) {
+      await refreshWorkDayTotals(db, workDayLocalId);
+    }
     return;
   }
 

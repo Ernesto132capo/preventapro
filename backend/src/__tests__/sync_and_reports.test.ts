@@ -1410,6 +1410,121 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         expect(typeof res.body.cursor).toBe("string");
         expect(new Date(res.body.cursor).getFullYear()).toBe(2026);
       });
+
+      it("incluye órdenes anuladas como tombstones con items: [] sin consultar sus order_items", async () => {
+        let orderItemQueryCalledForCancelled = false;
+
+        mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+          if (sql.includes("SELECT * FROM clients")) {
+            return { rows: [{ id: "cli-1", business_name: "Tienda A", active: true }] };
+          }
+          if (sql.includes("SELECT * FROM products")) return { rows: [] };
+          if (sql.includes("SELECT * FROM categories")) return { rows: [] };
+          if (sql.includes("SELECT * FROM neighborhoods")) return { rows: [] };
+          if (sql.includes("SELECT * FROM work_days")) {
+            return {
+              rows: [
+                {
+                  id: "wd-shared-1",
+                  user_id: "usr-1",
+                  work_date: "2026-10-16",
+                  status: "open",
+                  order_count: 1,
+                  total_cents: 1500,
+                  updated_at: "2026-10-16T15:00:00.000Z",
+                  created_at: "2026-10-16T08:00:00.000Z",
+                },
+              ],
+            };
+          }
+          if (sql.includes("SELECT * FROM combo_definitions")) return { rows: [] };
+          if (sql.includes("SELECT * FROM combo_options")) return { rows: [] };
+          if (sql.includes("SELECT id, product_id, name")) return { rows: [] };
+          if (sql.includes("SELECT * FROM orders WHERE work_day_id = ANY($1)")) {
+            return {
+              rows: [
+                {
+                  id: "ord-active-1",
+                  idempotency_key: "idem-act-1",
+                  work_day_id: "wd-shared-1",
+                  user_id: "usr-1",
+                  client_id: "cli-1",
+                  payment_condition: "Contado",
+                  subtotal_cents: 1500,
+                  tax_cents: 0,
+                  total_cents: 1500,
+                  item_count: 1,
+                  status: "active",
+                  receipt_number: "REC-001",
+                  created_at: "2026-10-16T10:00:00.000Z",
+                  updated_at: "2026-10-16T10:00:00.000Z",
+                },
+                {
+                  id: "ord-cancelled-1",
+                  idempotency_key: "idem-canc-1",
+                  work_day_id: "wd-shared-1",
+                  user_id: "usr-2",
+                  client_id: "cli-1",
+                  payment_condition: "Contado",
+                  subtotal_cents: 2000,
+                  tax_cents: 0,
+                  total_cents: 2000,
+                  item_count: 2,
+                  status: "cancelled",
+                  receipt_number: "REC-002",
+                  created_at: "2026-10-16T09:00:00.000Z",
+                  updated_at: "2026-10-16T14:30:00.000Z",
+                },
+              ],
+            };
+          }
+          if (sql.includes("SELECT * FROM order_items WHERE order_id = ANY($1)")) {
+            const requestedIds = params[0] || [];
+            if (requestedIds.includes("ord-cancelled-1")) {
+              orderItemQueryCalledForCancelled = true;
+            }
+            return {
+              rows: [
+                {
+                  id: "it-1",
+                  order_id: "ord-active-1",
+                  product_id: "p-1",
+                  presentation_id: "pres-1",
+                  quantity: 1,
+                  unit_price_cents_snapshot: 1500,
+                  subtotal_cents: 1500,
+                },
+              ],
+            };
+          }
+          if (sql.includes("SELECT * FROM order_item_selections WHERE order_item_id = ANY($1)")) {
+            return { rows: [] };
+          }
+          return { rows: [] };
+        });
+
+        const res = await makeRequest(syncApp, {
+          method: "GET",
+          url: "/api/sync/pull?force=1",
+        });
+
+        expect(res.status).toBe(200);
+        expect(orderItemQueryCalledForCancelled).toBe(false);
+        expect(res.body.orders).toHaveLength(2);
+
+        const activeOrder = res.body.orders.find((o: any) => o.id === "ord-active-1");
+        expect(activeOrder).toBeDefined();
+        expect(activeOrder.status).toBe("active");
+        expect(activeOrder.items).toHaveLength(1);
+        expect(activeOrder.client_name).toBe("Tienda A");
+
+        const cancelledOrder = res.body.orders.find((o: any) => o.id === "ord-cancelled-1");
+        expect(cancelledOrder).toBeDefined();
+        expect(cancelledOrder.status).toBe("cancelled");
+        expect(cancelledOrder.items).toEqual([]);
+        expect(cancelledOrder.client_name).toBe("Tienda A");
+        expect(cancelledOrder.work_day_id).toBe("wd-shared-1");
+      });
     });
 
     describe("[A-02] Fallo de BD en requireAuth responde 503 y nunca 401", () => {

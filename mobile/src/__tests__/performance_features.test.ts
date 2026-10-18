@@ -22,7 +22,9 @@ import {
   deleteClosedWorkDayLocal,
   upsertServerWorkDay,
 } from "../db/repositories/workdays";
-import { upsertOrderFromServer } from "../db/repositories/orders";
+import { upsertOrderFromServer, listOrdersForWorkDay } from "../db/repositories/orders";
+import { pullCatalog, SYNC_PROTOCOL_VERSION } from "../services/sync";
+import { apiFetch } from "../services/api";
 
 // Simulación en memoria de la base de datos SQLite local para pruebas unitarias
 interface MockOutboxRow {
@@ -64,6 +66,8 @@ interface MockOrderRow {
   updated_at?: string;
 }
 
+const mockMetaState = new Map<string, string>();
+
 const mockDbState = {
   outbox: [] as MockOutboxRow[],
   workDays: [] as MockWorkDayRow[],
@@ -74,6 +78,7 @@ export function resetMockDb() {
   mockDbState.outbox = [];
   mockDbState.workDays = [];
   mockDbState.orders = [];
+  mockMetaState.clear();
 }
 
 const mockDb = {
@@ -336,6 +341,51 @@ const mockDb = {
     }
     if (cleanSql.includes("INSERT INTO order_items")) return { changes: 1 };
 
+    // ORDERS: update to cancelled (tombstone)
+    if (cleanSql.includes("UPDATE orders SET") && cleanSql.includes("status = 'cancelled'")) {
+      const [serverId, updatedAt, targetId] = params;
+      const order = mockDbState.orders.find((o) => o.id === targetId || (serverId && o.server_id === serverId));
+      if (order) {
+        order.status = "cancelled";
+        order.sync_status = "synced";
+        order.updated_at = updatedAt;
+        if (!order.server_id && serverId) order.server_id = serverId;
+      }
+      return { changes: 1 };
+    }
+
+    // OUTBOX: mark done for cancelled order
+    if (cleanSql.includes("UPDATE outbox SET status = 'done'") && cleanSql.includes("entity_type = 'order'")) {
+      const [targetOrderId, serverOrderId] = params;
+      for (const row of mockDbState.outbox) {
+        if (
+          row.entity_type === "order" &&
+          (row.local_entity_id === targetOrderId || row.local_entity_id === serverOrderId) &&
+          ["pending", "syncing", "failed"].includes(row.status)
+        ) {
+          row.status = "done";
+          row.last_error = null;
+        }
+      }
+      return { changes: 1 };
+    }
+
+    // WORKDAYS: refresh totals from orders
+    if (cleanSql.includes("UPDATE work_days SET") && cleanSql.includes("status = 'active'")) {
+      const targetWdId = params[params.length - 1];
+      const wd = mockDbState.workDays.find((w) => w.id === targetWdId || w.server_id === targetWdId);
+      if (wd) {
+        const activeOrders = mockDbState.orders.filter(
+          (o) =>
+            (o.work_day_id === wd.id || (wd.server_id && o.work_day_id === wd.server_id)) &&
+            o.status === "active"
+        );
+        wd.order_count = activeOrders.length;
+        wd.total_cents = activeOrders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+      }
+      return { changes: 1 };
+    }
+
     return { changes: 0 };
   }),
 
@@ -378,6 +428,14 @@ const mockDb = {
         .sort((a, b) => b.work_date.localeCompare(a.work_date));
     }
 
+    // ORDERS: listOrdersForWorkDay
+    if (cleanSql.includes("FROM orders") && cleanSql.includes("status = 'active'")) {
+      const wdId = params[0];
+      return mockDbState.orders.filter(
+        (o) => (o.work_day_id === wdId || o.work_day_id === params[1] || (params[2] && o.work_day_id === params[2])) && o.status === "active"
+      );
+    }
+
     return [];
   }),
 
@@ -411,10 +469,10 @@ const mockDb = {
     }
 
     // WORKDAYS: user_id & server_id
-    if (cleanSql.startsWith("SELECT user_id, server_id FROM work_days WHERE id = ?")) {
+    if (cleanSql.startsWith("SELECT user_id, server_id FROM work_days WHERE id = ?") || cleanSql.startsWith("SELECT id, server_id, user_id FROM work_days WHERE id = ?")) {
       const [id] = params;
       const found = mockDbState.workDays.find((w) => w.id === id);
-      return found ? { user_id: found.user_id, server_id: found.server_id } : null;
+      return found ? { id: found.id, user_id: found.user_id, server_id: found.server_id } : null;
     }
 
     // WORKDAYS: check other open on reopen
@@ -436,7 +494,14 @@ const mockDb = {
     if (cleanSql.includes("FROM orders WHERE server_id = ? OR id = ?")) {
       const [serverId, id] = params;
       const found = mockDbState.orders.find((o) => (serverId && o.server_id === serverId) || o.id === id);
-      return found ? { id: found.id, sync_status: found.sync_status || "synced" } : null;
+      return found
+        ? {
+            id: found.id,
+            server_id: found.server_id ?? null,
+            work_day_id: found.work_day_id,
+            sync_status: found.sync_status || "synced",
+          }
+        : null;
     }
 
     // CLIENTS: find for order upsert
@@ -471,6 +536,21 @@ jest.mock("../db/client", () => ({
   getDb: jest.fn(async () => mockDb),
   nowIso: jest.fn(() => new Date().toISOString()),
   withTx: (cb: any) => mockWithTx(cb),
+  getMeta: jest.fn(async (key: string) => mockMetaState.get(key) || null),
+  setMeta: jest.fn(async (key: string, value: string) => {
+    mockMetaState.set(key, value);
+  }),
+}));
+
+jest.mock("../services/api", () => ({
+  apiFetch: jest.fn(),
+  ApiError: class ApiError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.status = status;
+    }
+  },
 }));
 
 describe("Performance utilities & enhancements", () => {
@@ -734,6 +814,180 @@ describe("Outbox deduplication and sorting logic", () => {
 
     // Total de órdenes en BD = 4 (ninguna orden local previa fue purgada)
     expect(mockDbState.orders).toHaveLength(4);
+  });
+});
+
+describe("Tombstone propagation and protocol upgrade", () => {
+  beforeEach(() => {
+    resetMockDb();
+    jest.clearAllMocks();
+  });
+
+  it("aplica tombstone remoto de preventa anulada, borra líneas y actualiza totales locales de la jornada", async () => {
+    mockDbState.workDays.push({
+      id: "wd-test-1",
+      server_id: "srv-wd-1",
+      user_id: "usr-1",
+      work_date: "2026-10-16",
+      status: "open",
+      order_count: 1,
+      total_cents: 2000,
+      sync_status: "synced",
+      created_at: "2026-10-16T08:00:00.000Z",
+    });
+
+    mockDbState.orders.push({
+      id: "ord-local-1",
+      server_id: "srv-ord-1",
+      work_day_id: "wd-test-1",
+      client_id: "cli-1",
+      status: "active",
+      sync_status: "synced",
+      total_cents: 2000,
+      item_count: 1,
+    });
+
+    // Llega tombstone remoto para srv-ord-1 con status = 'cancelled'
+    await upsertOrderFromServer({
+      id: "srv-ord-1",
+      work_day_id: "srv-wd-1",
+      client_id: "cli-1",
+      status: "cancelled",
+      total_cents: 2000,
+      items: [],
+      updated_at: "2026-10-16T14:00:00.000Z",
+    });
+
+    const localOrder = mockDbState.orders.find((o) => o.id === "ord-local-1");
+    expect(localOrder).toBeDefined();
+    expect(localOrder?.status).toBe("cancelled");
+    expect(localOrder?.sync_status).toBe("synced");
+
+    // Los totales de la jornada bajaron inmediatamente
+    const wd = mockDbState.workDays.find((w) => w.id === "wd-test-1");
+    expect(wd?.order_count).toBe(0);
+    expect(wd?.total_cents).toBe(0);
+
+    // La lista de preventas activas no la muestra
+    const activeOrders = await listOrdersForWorkDay("wd-test-1");
+    expect(activeOrders).toHaveLength(0);
+  });
+
+  it("la anulación remota gana sobre cambios locales pendientes si la orden tiene server_id y marca outbox como done", async () => {
+    mockDbState.workDays.push({
+      id: "wd-test-2",
+      server_id: "srv-wd-2",
+      user_id: "usr-1",
+      work_date: "2026-10-16",
+      status: "open",
+      order_count: 1,
+      total_cents: 1500,
+      sync_status: "synced",
+      created_at: "2026-10-16T08:00:00.000Z",
+    });
+
+    mockDbState.orders.push({
+      id: "ord-local-2",
+      server_id: "srv-ord-2",
+      work_day_id: "wd-test-2",
+      client_id: "cli-1",
+      status: "active",
+      sync_status: "pending", // Cambio local pendiente
+      total_cents: 1500,
+      item_count: 1,
+    });
+
+    // Encolada operación pendiente en outbox
+    await enqueue("order", "ord-local-2", 2, "update");
+    expect(mockDbState.outbox.some((r) => r.local_entity_id === "ord-local-2" && r.status === "pending")).toBe(true);
+
+    // Llega tombstone remoto con status = 'cancelled'
+    await upsertOrderFromServer({
+      id: "srv-ord-2",
+      work_day_id: "srv-wd-2",
+      client_id: "cli-1",
+      status: "cancelled",
+      total_cents: 1500,
+      items: [],
+      updated_at: "2026-10-16T15:00:00.000Z",
+    });
+
+    const localOrder = mockDbState.orders.find((o) => o.id === "ord-local-2");
+    expect(localOrder?.status).toBe("cancelled");
+    expect(localOrder?.sync_status).toBe("synced");
+
+    // Operación pendiente de outbox resuelta a 'done'
+    const outboxItem = mockDbState.outbox.find((r) => r.local_entity_id === "ord-local-2");
+    expect(outboxItem?.status).toBe("done");
+
+    // Totales de jornada reducidos
+    const wd = mockDbState.workDays.find((w) => w.id === "wd-test-2");
+    expect(wd?.order_count).toBe(0);
+    expect(wd?.total_cents).toBe(0);
+  });
+
+  it("no altera preventas puramente locales sin server_id ante tombstones", async () => {
+    mockDbState.orders.push({
+      id: "ord-purely-local",
+      server_id: null, // Sin server_id (creada offline)
+      work_day_id: "wd-test-3",
+      client_id: "cli-1",
+      status: "active",
+      sync_status: "pending",
+      total_cents: 3000,
+      item_count: 2,
+    });
+
+    // Intento de tombstone con el id local sin que tenga server_id
+    await upsertOrderFromServer({
+      id: "ord-purely-local",
+      work_day_id: "wd-test-3",
+      status: "cancelled",
+      total_cents: 3000,
+      items: [],
+    });
+
+    const localOrder = mockDbState.orders.find((o) => o.id === "ord-purely-local");
+    expect(localOrder?.status).toBe("active");
+    expect(localOrder?.sync_status).toBe("pending");
+    expect(localOrder?.total_cents).toBe(3000);
+  });
+
+  it("reconciliación de protocolo: fuerza since=1970 si protocol_version no está en meta y lo guarda tras el éxito", async () => {
+    const mockedApiFetch = apiFetch as jest.MockedFunction<typeof apiFetch>;
+    mockedApiFetch.mockResolvedValue({
+      cursor: "2026-10-17T21:00:00.000Z",
+      clients: [],
+      products: [],
+      orders: [],
+    });
+
+    // Simulamos un dispositivo existente que ya sincronizó antes (tiene cursor) pero no la versión de protocolo
+    mockMetaState.set("last_pull_at", "2026-10-17T20:00:00.000Z");
+
+    await pullCatalog("user-test-1");
+
+    // Primera vez: debió pedir since 1970 por falta de versión de protocolo
+    expect(mockedApiFetch).toHaveBeenCalledWith(
+      expect.stringContaining("since=1970-01-01T00%3A00%3A00.000Z")
+    );
+    // Y guardó la versión de protocolo en meta
+    expect(mockMetaState.get("protocol_version")).toBe(SYNC_PROTOCOL_VERSION);
+
+    // Segunda vez: ahora sí usa el cursor incremental (no 1970)
+    mockedApiFetch.mockClear();
+    mockedApiFetch.mockResolvedValue({
+      cursor: "2026-10-17T21:30:00.000Z",
+      clients: [],
+      products: [],
+      orders: [],
+    });
+
+    await pullCatalog("user-test-1");
+
+    expect(mockedApiFetch).toHaveBeenCalledWith(
+      expect.not.stringContaining("since=1970-01-01T00%3A00%3A00.000Z")
+    );
   });
 });
 

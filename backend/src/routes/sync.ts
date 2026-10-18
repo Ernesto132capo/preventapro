@@ -355,54 +355,62 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
       }
 
       const activeOrders = allOrderRows.filter((row) => row.status === "active");
+      const cancelledOrders = allOrderRows.filter((row) => row.status === "cancelled");
 
-      if (activeOrders.length > 0) {
-        const missingOrderIds = force
-          ? activeOrders.map((o) => o.id)
-          : activeOrders.filter((o) => !orderItemQueryCache.has(o.id)).map((o) => o.id);
-
-        if (missingOrderIds.length > 0) {
-          const { rows: fetchedItems } = await pool.query(
-            "SELECT * FROM order_items WHERE order_id = ANY($1)",
-            [missingOrderIds]
-          );
-          const itemsByOrd = new Map<string, any[]>();
-          for (const oid of missingOrderIds) itemsByOrd.set(oid, []);
-          for (const it of fetchedItems) {
-            const list = itemsByOrd.get(it.order_id) || [];
-            list.push(it);
-            itemsByOrd.set(it.order_id, list);
-          }
-          for (const [oid, its] of itemsByOrd.entries()) {
-            setBoundedCacheEntry(orderItemQueryCache, oid, its, MAX_SOURCE_CACHE_ENTRIES);
-          }
-        }
-
-        const itemsResults = activeOrders.map((row) => orderItemQueryCache.get(row.id) || []);
-        const clientIds = [...new Set(activeOrders.map((row) => row.client_id))];
-
-        const allItemIds = itemsResults.flat().map((it: any) => it.id);
+      if (activeOrders.length > 0 || cancelledOrders.length > 0) {
+        let itemsResults: any[][] = [];
         const selectionsByItem = new Map<string, any[]>();
-        if (allItemIds.length > 0) {
-          const { rows: allSelections } = await pool.query(
-            "SELECT * FROM order_item_selections WHERE order_item_id = ANY($1) ORDER BY sort_order",
-            [allItemIds]
-          );
-          for (const sel of allSelections) {
-            const list = selectionsByItem.get(sel.order_item_id) || [];
-            list.push({
-              id: sel.id,
-              order_item_id: sel.order_item_id,
-              selected_product_id: sel.selected_product_id,
-              selected_presentation_id: sel.selected_presentation_id,
-              product_name_snapshot: sel.product_name_snapshot,
-              presentation_name_snapshot: sel.presentation_name_snapshot,
-              quantity: Number(sel.quantity),
-              sort_order: Number(sel.sort_order ?? 0),
-            });
-            selectionsByItem.set(sel.order_item_id, list);
+
+        if (activeOrders.length > 0) {
+          const missingOrderIds = force
+            ? activeOrders.map((o) => o.id)
+            : activeOrders.filter((o) => !orderItemQueryCache.has(o.id)).map((o) => o.id);
+
+          if (missingOrderIds.length > 0) {
+            const { rows: fetchedItems } = await pool.query(
+              "SELECT * FROM order_items WHERE order_id = ANY($1)",
+              [missingOrderIds]
+            );
+            const itemsByOrd = new Map<string, any[]>();
+            for (const oid of missingOrderIds) itemsByOrd.set(oid, []);
+            for (const it of fetchedItems) {
+              const list = itemsByOrd.get(it.order_id) || [];
+              list.push(it);
+              itemsByOrd.set(it.order_id, list);
+            }
+            for (const [oid, its] of itemsByOrd.entries()) {
+              setBoundedCacheEntry(orderItemQueryCache, oid, its, MAX_SOURCE_CACHE_ENTRIES);
+            }
+          }
+
+          itemsResults = activeOrders.map((row) => orderItemQueryCache.get(row.id) || []);
+
+          const allItemIds = itemsResults.flat().map((it: any) => it.id);
+          if (allItemIds.length > 0) {
+            const { rows: allSelections } = await pool.query(
+              "SELECT * FROM order_item_selections WHERE order_item_id = ANY($1) ORDER BY sort_order",
+              [allItemIds]
+            );
+            for (const sel of allSelections) {
+              const list = selectionsByItem.get(sel.order_item_id) || [];
+              list.push({
+                id: sel.id,
+                order_item_id: sel.order_item_id,
+                selected_product_id: sel.selected_product_id,
+                selected_presentation_id: sel.selected_presentation_id,
+                product_name_snapshot: sel.product_name_snapshot,
+                presentation_name_snapshot: sel.presentation_name_snapshot,
+                quantity: Number(sel.quantity),
+                sort_order: Number(sel.sort_order ?? 0),
+              });
+              selectionsByItem.set(sel.order_item_id, list);
+            }
           }
         }
+
+        const clientIds = [
+          ...new Set([...activeOrders, ...cancelledOrders].map((row) => row.client_id).filter(Boolean)),
+        ];
 
         const clientMap = new Map<string, string>();
         for (const row of clientRows) {
@@ -427,7 +435,7 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
           }
         }
 
-        orders = activeOrders.map((row, i) => ({
+        const mappedActiveOrders = activeOrders.map((row, i) => ({
           id: row.id,
           idempotency_key: row.idempotency_key,
           work_day_id: row.work_day_id,
@@ -451,6 +459,27 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
             selections: selectionsByItem.get(it.id) || [],
           })),
         }));
+
+        const mappedCancelledOrders = cancelledOrders.map((row) => ({
+          id: row.id,
+          idempotency_key: row.idempotency_key,
+          work_day_id: row.work_day_id,
+          user_id: row.user_id,
+          client_id: row.client_id,
+          client_name: clientMap.get(row.client_id) || "Cliente",
+          payment_condition: row.payment_condition || "Contado 48h",
+          subtotal_cents: Number(row.subtotal_cents ?? 0),
+          tax_cents: Number(row.tax_cents ?? 0),
+          total_cents: Number(row.total_cents ?? 0),
+          item_count: Number(row.item_count ?? 0),
+          status: "cancelled",
+          receipt_number: row.receipt_number ?? null,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          items: [],
+        }));
+
+        orders = [...mappedActiveOrders, ...mappedCancelledOrders];
       }
     }
 

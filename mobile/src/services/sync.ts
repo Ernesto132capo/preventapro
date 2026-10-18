@@ -30,16 +30,21 @@ export interface SyncResult {
   error?: string;
 }
 
+export const SYNC_PROTOCOL_VERSION = "orders-tombstones-v1";
+
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
-async function pullCatalog(userId: string, force = false): Promise<{ clients: number; products: number }> {
+export async function pullCatalog(userId: string, force = false): Promise<{ clients: number; products: number }> {
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
 
+  const currentProtocol = await getMeta("protocol_version");
+  const needsProtocolUpgrade = currentProtocol !== SYNC_PROTOCOL_VERSION;
+
   const savedSince = await getMeta("last_pull_at");
   let since = savedSince || "1970-01-01T00:00:00.000Z";
-  // Solo pedir desde 1970 si se fuerza o si es la primera sincronización (base vacía sin cursor guardado)
-  if (force || (!savedSince && prodCount === 0 && clientCount === 0)) {
+  // Solo pedir desde 1970 si se fuerza, si falta la reconciliación del protocolo de tombstones o si es la primera sincronización
+  if (force || needsProtocolUpgrade || (!savedSince && prodCount === 0 && clientCount === 0)) {
     since = "1970-01-01T00:00:00.000Z";
   }
 
@@ -192,6 +197,9 @@ function chunkArray(items: any[], size = 200): any[][] {
   const newCursor = data.cursor || data.serverTime;
   if (newCursor) {
     await setMeta("last_pull_at", newCursor);
+  }
+  if (needsProtocolUpgrade) {
+    await setMeta("protocol_version", SYNC_PROTOCOL_VERSION);
   }
   return { clients: data.clients ? data.clients.length : 0, products: data.products ? data.products.length : 0 };
 }
