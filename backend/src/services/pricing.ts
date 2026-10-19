@@ -58,11 +58,12 @@ export function buildOrderItemSnapshot(
     throw new PricingError("La presentación no pertenece a este producto.");
   }
 
-  // Precio efectivo: si hay promoción activa vigente, se podría aplicar aquí en el futuro
-  // a nivel de presentación; por ahora usamos el precio de la presentación (Fase 14: la
-  // arquitectura soporta promo_active/promo_price_cents pero no inventamos reglas de
-  // descuento complejas sin necesidad).
-  const unitPriceCents = presentation.price_cents;
+  // Si se provee unit_price_cents (p. ej. al mantener precios históricos de preventa),
+  // se respeta dicho valor; de lo contrario se usa el precio vigente de la presentación.
+  if (input.unit_price_cents !== undefined && (!Number.isSafeInteger(input.unit_price_cents) || input.unit_price_cents < 0)) {
+    throw new PricingError("El precio debe expresarse en centavos enteros.");
+  }
+  const unitPriceCents = input.unit_price_cents !== undefined ? input.unit_price_cents : presentation.price_cents;
   const subtotalCents = calculateLineSubtotalCents(unitPriceCents, input.quantity);
 
   return {

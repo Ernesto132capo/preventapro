@@ -115,6 +115,7 @@ export interface OrderItemInput {
   product_id: string;
   presentation_id: string;
   quantity: number;
+  unit_price_cents?: number;
   selections?: OrderItemSelectionInput[];
 }
 

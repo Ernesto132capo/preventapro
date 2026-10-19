@@ -171,5 +171,63 @@ describe("pricing", () => {
     expect(centsToBs(15600)).toBe("Bs. 156.00");
     expect(centsToBs(750)).toBe("Bs. 7.50");
   });
+
+  it("respeta unit_price_cents cuando se provee para mantener el precio histórico", () => {
+    // La presentación actual cuesta 750 (Bs. 7.50), pero la orden guardada tenía precio histórico de 600 (Bs. 6.00)
+    const snapshot = buildOrderItemSnapshot(
+      { product_id: "p1", presentation_id: "pr1", quantity: 3, unit_price_cents: 600 },
+      lookup
+    );
+    expect(snapshot.unit_price_cents_snapshot).toBe(600);
+    expect(snapshot.subtotal_cents).toBe(1800);
+  });
+
+  it("usa presentation.price_cents cuando unit_price_cents no se especifica", () => {
+    const snapshot = buildOrderItemSnapshot(
+      { product_id: "p1", presentation_id: "pr1", quantity: 3 },
+      lookup
+    );
+    expect(snapshot.unit_price_cents_snapshot).toBe(750);
+    expect(snapshot.subtotal_cents).toBe(2250);
+  });
+
+  it("rechaza unit_price_cents negativo o no entero", () => {
+    expect(() =>
+      buildOrderItemSnapshot(
+        { product_id: "p1", presentation_id: "pr1", quantity: 1, unit_price_cents: -50 },
+        lookup
+      )
+    ).toThrow(PricingError);
+    expect(() =>
+      buildOrderItemSnapshot(
+        { product_id: "p1", presentation_id: "pr1", quantity: 1, unit_price_cents: 12.5 },
+        lookup
+      )
+    ).toThrow(PricingError);
+  });
+
+  it("soporta edición mixta: línea existente con precio histórico + línea nueva con precio actual de catálogo", () => {
+    // Línea 1 (existente): 2 unidades a precio histórico de 500 centavos = 1000 centavos
+    // Línea 2 (nueva): 1 unidad a precio vigente de catálogo de 15600 centavos = 15600 centavos
+    const result = priceOrder(
+      [
+        { product_id: "p1", presentation_id: "pr1", quantity: 2, unit_price_cents: 500 },
+        { product_id: "p1", presentation_id: "pr2", quantity: 1 }, // usa catálogo (15600)
+      ],
+      lookup
+    );
+    expect(result.items[0].unit_price_cents_snapshot).toBe(500);
+    expect(result.items[0].subtotal_cents).toBe(1000);
+    expect(result.items[1].unit_price_cents_snapshot).toBe(15600);
+    expect(result.items[1].subtotal_cents).toBe(15600);
+    expect(result.subtotal_cents).toBe(16600);
+    expect(result.total_cents).toBe(16600);
+    expect(result.item_count).toBe(3);
+
+    // Diferencia respecto al total anterior (por ejemplo, si antes era 1000)
+    const originalTotalCents = 1000;
+    const diffCents = result.total_cents - originalTotalCents;
+    expect(diffCents).toBe(15600);
+  });
 });
 

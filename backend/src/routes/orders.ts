@@ -22,6 +22,7 @@ const item = z.object({
   productId: z.string().min(1),
   presentationId: z.string().min(1),
   quantity: z.number().int().positive().max(1_000_000),
+  unitPriceCents: z.number().int().nonnegative().optional(),
   selections: z.array(selectionInput).optional(),
 }).strict();
 
@@ -192,6 +193,7 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       }
     }
 
+    const unitPrice = x.unitPriceCents != null ? x.unitPriceCents : q.price_cents;
     out.push({
       id: uuid(),
       product_id: x.productId,
@@ -200,9 +202,9 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       sku_snapshot: p.sku,
       presentation_name_snapshot: q.name,
       unit_equivalence_snapshot: q.unit_equivalence,
-      unit_price_cents_snapshot: q.price_cents,
+      unit_price_cents_snapshot: unitPrice,
       quantity: x.quantity,
-      subtotal_cents: calculateLineSubtotalCents(q.price_cents, x.quantity),
+      subtotal_cents: calculateLineSubtotalCents(unitPrice, x.quantity),
       selections: selectionsSnapshot,
     });
   }

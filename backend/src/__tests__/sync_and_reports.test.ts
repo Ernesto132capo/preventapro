@@ -40,6 +40,7 @@ import { workdaysRouter, closeStaleOpenWorkDays } from "../routes/workdays";
 import { reportsRouter } from "../routes/reports";
 import { clientsRouter } from "../routes/clients";
 import { authRouter } from "../routes/auth";
+import { ordersRouter } from "../routes/orders";
 import { hashPassword } from "../services/auth";
 import { formatClientDisplayName } from "../services/client-display";
 import {
@@ -1878,6 +1879,230 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         expect(totalRow.getCell(3).value).toBe(880); // 280 + 600 = 880
         expect(totalRow.getCell(4).value).toBe(20); // 10 + 10 = 20
       });
+    });
+  });
+
+  describe("8. Edición de Preventas con Precio Histórico vs. Actual (ordersRouter)", () => {
+    let ordersApp: express.Express;
+
+    beforeEach(() => {
+      ordersApp = express();
+      ordersApp.use(express.json());
+      ordersApp.use("/api/orders", ordersRouter);
+    });
+
+    it("PUT /api/orders/:id respeta unitPriceCents personalizado (precio histórico)", async () => {
+      let insertedUnitPrice = 0;
+      let insertedSubtotal = 0;
+
+      mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+        if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("SELECT * FROM orders WHERE id = $1 FOR UPDATE")) {
+          return {
+            rows: [
+              {
+                id: "ord-hist-1",
+                work_day_id: "wd-hist-1",
+                client_id: "cli-1",
+                status: "active",
+                payment_condition: "Contado 48h",
+              },
+            ],
+          };
+        }
+        if (sql.includes("SELECT * FROM work_days WHERE id = $1 FOR UPDATE")) {
+          return { rows: [{ id: "wd-hist-1", status: "open", work_date: "2026-10-18" }] };
+        }
+        if (sql.includes("SELECT id, name, sku, product_type, active FROM products WHERE id = $1")) {
+          return { rows: [{ id: "prod-1", name: "Papa Blanca", sku: "PAP-01", product_type: "standard", active: true }] };
+        }
+        if (sql.includes("SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1")) {
+          // El catálogo vigente tiene el precio en 2000 centavos (Bs. 20)
+          return { rows: [{ id: "pres-1", product_id: "prod-1", name: "Kilo", unit_equivalence: 1, price_cents: 2000, active: true }] };
+        }
+        if (sql.includes("DELETE FROM order_items WHERE order_id = $1")) {
+          return { rows: [] };
+        }
+        if (sql.includes("INSERT INTO order_items")) {
+          insertedUnitPrice = params[8];
+          insertedSubtotal = params[10];
+          return { rows: [] };
+        }
+        if (sql.includes("UPDATE orders SET")) {
+          return { rows: [] };
+        }
+        if (sql.includes("SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders")) {
+          return { rows: [{ count: 1, total: 3000 }] };
+        }
+        if (sql.includes("UPDATE work_days SET")) {
+          return { rows: [] };
+        }
+        if (sql.includes("SELECT * FROM orders WHERE id = $1")) {
+          return {
+            rows: [
+              {
+                id: "ord-hist-1",
+                work_day_id: "wd-hist-1",
+                client_id: "cli-1",
+                status: "active",
+                subtotal_cents: 3000,
+                tax_cents: 0,
+                total_cents: 3000,
+                item_count: 3,
+                payment_condition: "Contado 48h",
+                created_at: "2026-10-18T10:00:00Z",
+                updated_at: "2026-10-18T12:00:00Z",
+              },
+            ],
+          };
+        }
+        if (sql.includes("SELECT * FROM order_items WHERE order_id = $1")) {
+          return {
+            rows: [
+              {
+                id: "oi-1",
+                order_id: "ord-hist-1",
+                product_id: "prod-1",
+                presentation_id: "pres-1",
+                product_name_snapshot: "Papa Blanca",
+                sku_snapshot: "PAP-01",
+                presentation_name_snapshot: "Kilo",
+                unit_equivalence_snapshot: 1,
+                unit_price_cents_snapshot: insertedUnitPrice,
+                quantity: 3,
+                subtotal_cents: insertedSubtotal,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      });
+
+      // Se envía unitPriceCents = 1000 (Bs. 10 histórico) en lugar del precio de catálogo 2000
+      const res = await makeRequest(ordersApp, {
+        method: "PUT",
+        url: "/api/orders/ord-hist-1",
+        body: {
+          paymentCondition: "Contado 48h",
+          taxRatePermille: 0,
+          items: [
+            {
+              productId: "prod-1",
+              presentationId: "pres-1",
+              quantity: 3,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+      });
+
+      expect(res.status).toBe(200);
+      expect(insertedUnitPrice).toBe(1000); // Respetó el precio histórico enviado
+      expect(insertedSubtotal).toBe(3000); // 3 * 1000
+      expect(res.body.order.items[0].unit_price_cents_snapshot).toBe(1000);
+    });
+
+    it("PUT /api/orders/:id usa el precio de catálogo cuando unitPriceCents se omite (compatibilidad hacia atrás)", async () => {
+      let insertedUnitPrice = 0;
+
+      mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+        if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("SELECT * FROM orders WHERE id = $1 FOR UPDATE")) {
+          return {
+            rows: [
+              {
+                id: "ord-cat-1",
+                work_day_id: "wd-hist-1",
+                client_id: "cli-1",
+                status: "active",
+                payment_condition: "Contado 48h",
+              },
+            ],
+          };
+        }
+        if (sql.includes("SELECT * FROM work_days WHERE id = $1 FOR UPDATE")) {
+          return { rows: [{ id: "wd-hist-1", status: "open", work_date: "2026-10-18" }] };
+        }
+        if (sql.includes("SELECT id, name, sku, product_type, active FROM products WHERE id = $1")) {
+          return { rows: [{ id: "prod-1", name: "Papa Blanca", sku: "PAP-01", product_type: "standard", active: true }] };
+        }
+        if (sql.includes("SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1")) {
+          return { rows: [{ id: "pres-1", product_id: "prod-1", name: "Kilo", unit_equivalence: 1, price_cents: 2000, active: true }] };
+        }
+        if (sql.includes("DELETE FROM order_items WHERE order_id = $1")) {
+          return { rows: [] };
+        }
+        if (sql.includes("INSERT INTO order_items")) {
+          insertedUnitPrice = params[8];
+          return { rows: [] };
+        }
+        if (sql.includes("UPDATE orders SET")) return { rows: [] };
+        if (sql.includes("SELECT COUNT(*)::int AS count, COALESCE(SUM(total_cents), 0)::int AS total FROM orders")) {
+          return { rows: [{ count: 1, total: 4000 }] };
+        }
+        if (sql.includes("UPDATE work_days SET")) return { rows: [] };
+        if (sql.includes("SELECT * FROM orders WHERE id = $1")) {
+          return {
+            rows: [
+              {
+                id: "ord-cat-1",
+                work_day_id: "wd-hist-1",
+                client_id: "cli-1",
+                status: "active",
+                subtotal_cents: 4000,
+                tax_cents: 0,
+                total_cents: 4000,
+                item_count: 2,
+                payment_condition: "Contado 48h",
+                created_at: "2026-10-18T10:00:00Z",
+                updated_at: "2026-10-18T12:00:00Z",
+              },
+            ],
+          };
+        }
+        if (sql.includes("SELECT * FROM order_items WHERE order_id = $1")) {
+          return {
+            rows: [
+              {
+                id: "oi-1",
+                order_id: "ord-cat-1",
+                product_id: "prod-1",
+                presentation_id: "pres-1",
+                product_name_snapshot: "Papa Blanca",
+                sku_snapshot: "PAP-01",
+                presentation_name_snapshot: "Kilo",
+                unit_equivalence_snapshot: 1,
+                unit_price_cents_snapshot: insertedUnitPrice,
+                quantity: 2,
+                subtotal_cents: 4000,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      });
+
+      // Omitir unitPriceCents
+      const res = await makeRequest(ordersApp, {
+        method: "PUT",
+        url: "/api/orders/ord-cat-1",
+        body: {
+          paymentCondition: "Contado 48h",
+          taxRatePermille: 0,
+          items: [
+            {
+              productId: "prod-1",
+              presentationId: "pres-1",
+              quantity: 2,
+            },
+          ],
+        },
+      });
+
+      expect(res.status).toBe(200);
+      expect(insertedUnitPrice).toBe(2000); // Usó el precio de catálogo (2000)
     });
   });
 });

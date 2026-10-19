@@ -783,6 +783,13 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
       }
     }
 
+    const itemUnitPrice =
+      rawItem.unitPriceCents != null
+        ? Number(rawItem.unitPriceCents)
+        : rawItem.unit_price_cents_snapshot != null
+        ? Number(rawItem.unit_price_cents_snapshot)
+        : q.price_cents;
+
     processedItems.push({
       id: uuid(),
       product_id: p.id,
@@ -791,9 +798,9 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
       sku_snapshot: p.sku,
       presentation_name_snapshot: q.name,
       unit_equivalence_snapshot: q.unit_equivalence,
-      unit_price_cents_snapshot: q.price_cents,
+      unit_price_cents_snapshot: itemUnitPrice,
       quantity: qty,
-      subtotal_cents: calculateLineSubtotalCents(q.price_cents, qty),
+      subtotal_cents: calculateLineSubtotalCents(itemUnitPrice, qty),
       selections: selectionsSnapshot,
     });
   }
