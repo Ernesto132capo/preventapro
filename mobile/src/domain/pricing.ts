@@ -36,7 +36,12 @@ export function calculateTaxCents(subtotalCents: number, taxRatePermille: number
   return Math.round((subtotalCents * taxRatePermille) / TAX_RATE_DENOMINATOR);
 }
 
-export function buildCartLine(product: Product, presentation: Presentation, quantity: number): CartLine {
+export function buildCartLine(
+  product: Product,
+  presentation: Presentation,
+  quantity: number,
+  customUnitPriceCents?: number
+): CartLine {
   if (!Number.isSafeInteger(quantity) || quantity <= 0) {
     throw new PricingError("La cantidad debe ser un entero mayor a 0.");
   }
@@ -48,7 +53,10 @@ export function buildCartLine(product: Product, presentation: Presentation, quan
   if (!matches) {
     throw new PricingError("La presentación no pertenece a este producto.");
   }
-  const unitPriceCents = presentation.price_cents;
+  if (customUnitPriceCents !== undefined && (!Number.isSafeInteger(customUnitPriceCents) || customUnitPriceCents < 0)) {
+    throw new PricingError("El precio debe expresarse en centavos enteros.");
+  }
+  const unitPriceCents = customUnitPriceCents !== undefined ? customUnitPriceCents : presentation.price_cents;
   return {
     productId: product.id,
     presentationId: presentation.id,
@@ -67,6 +75,21 @@ export function recalcLineQuantity(line: CartLine, quantity: number): CartLine {
     throw new PricingError("La cantidad debe ser un entero mayor a 0.");
   }
   return { ...line, quantity, subtotalCents: calculateLineSubtotalCents(line.unitPriceCents, quantity) };
+}
+
+export function updateLineUnitPrice(line: CartLine, newUnitPriceCents: number): CartLine {
+  if (!Number.isSafeInteger(newUnitPriceCents) || newUnitPriceCents < 0) {
+    throw new PricingError("El precio debe expresarse en centavos enteros.");
+  }
+  return {
+    ...line,
+    unitPriceCents: newUnitPriceCents,
+    subtotalCents: calculateLineSubtotalCents(newUnitPriceCents, line.quantity),
+  };
+}
+
+export function calcPriceDifference(newTotalCents: number, originalTotalCents: number): number {
+  return newTotalCents - originalTotalCents;
 }
 
 export interface OrderTotals {

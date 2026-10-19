@@ -1,4 +1,12 @@
-import { buildCartLine, calcOrderTotals, recalcLineQuantity, PricingError, centsToBs } from "../domain/pricing";
+import {
+  buildCartLine,
+  calcOrderTotals,
+  recalcLineQuantity,
+  updateLineUnitPrice,
+  calcPriceDifference,
+  PricingError,
+  centsToBs,
+} from "../domain/pricing";
 import { Product, Presentation } from "../domain/types";
 
 const product: Product = {
@@ -112,5 +120,59 @@ describe("pricing (mobile, offline-capable)", () => {
 
   it("rechaza un carrito vacío", () => {
     expect(() => calcOrderTotals([])).toThrow(PricingError);
+  });
+
+  describe("Edición de preventas: precio histórico vs. precio actual", () => {
+    it("permite construir línea de carrito con precio histórico personalizado", () => {
+      // Precio catálogo actual: 750 (Bs. 7.50), precio histórico de la preventa: 600 (Bs. 6.00)
+      const line = buildCartLine(product, presentations.unidad, 2, 600);
+      expect(line.unitPriceCents).toBe(600);
+      expect(line.subtotalCents).toBe(1200);
+    });
+
+    it("mantiene el precio histórico al aumentar o cambiar la cantidad de una línea existente", () => {
+      const line = buildCartLine(product, presentations.unidad, 2, 600);
+      const incremented = recalcLineQuantity(line, 5);
+      expect(incremented.unitPriceCents).toBe(600);
+      expect(incremented.subtotalCents).toBe(3000);
+    });
+
+    it("actualiza el precio de la línea al precio vigente de catálogo con updateLineUnitPrice", () => {
+      const line = buildCartLine(product, presentations.unidad, 3, 600);
+      // Actualizar a precio vigente de catálogo (750 centavos)
+      const updated = updateLineUnitPrice(line, 750);
+      expect(updated.unitPriceCents).toBe(750);
+      expect(updated.subtotalCents).toBe(2250);
+    });
+
+    it("soporta edición mixta: línea existente con precio histórico + línea nueva con precio actual de catálogo", () => {
+      // Línea existente: Leche Unidad a precio histórico de 500 centavos, cantidad 2 = 1000 centavos
+      const existingLine = buildCartLine(product, presentations.unidad, 2, 500);
+      // Línea nueva agregada del catálogo: Leche Caja a precio vigente de 15600 centavos, cantidad 1 = 15600 centavos
+      const newLine = buildCartLine(product, presentations.caja, 1);
+
+      const totals = calcOrderTotals([existingLine, newLine]);
+      expect(existingLine.unitPriceCents).toBe(500);
+      expect(existingLine.subtotalCents).toBe(1000);
+      expect(newLine.unitPriceCents).toBe(15600);
+      expect(newLine.subtotalCents).toBe(15600);
+      expect(totals.subtotalCents).toBe(16600);
+      expect(totals.totalCents).toBe(16600);
+      expect(totals.itemCount).toBe(3);
+
+      // Total anterior de la preventa original (solo la línea existente = 1000)
+      const originalTotalCents = 1000;
+      const diffCents = calcPriceDifference(totals.totalCents, originalTotalCents);
+      expect(diffCents).toBe(15600);
+      expect(centsToBs(diffCents)).toBe("Bs. 156.00");
+    });
+
+    it("rechaza precio unitario personalizado negativo o no entero", () => {
+      expect(() => buildCartLine(product, presentations.unidad, 1, -100)).toThrow(PricingError);
+      expect(() => buildCartLine(product, presentations.unidad, 1, 10.5)).toThrow(PricingError);
+      const validLine = buildCartLine(product, presentations.unidad, 1, 500);
+      expect(() => updateLineUnitPrice(validLine, -50)).toThrow(PricingError);
+      expect(() => updateLineUnitPrice(validLine, 25.4)).toThrow(PricingError);
+    });
   });
 });

@@ -635,6 +635,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       productId: productServerId,
       presentationId: presentationServerId,
       quantity: item.quantity,
+      unitPriceCents: item.unit_price_cents_snapshot != null ? Number(item.unit_price_cents_snapshot) : undefined,
       selections: resolvedSelections,
     });
   }

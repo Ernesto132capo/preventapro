@@ -769,3 +769,19 @@ export async function resolveServerPresentationId(localId: string): Promise<stri
 
   return localId;
 }
+
+export async function getPresentationsByIds(ids: string[]): Promise<Map<string, Presentation>> {
+  if (ids.length === 0) return new Map();
+  const db = await getDb();
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = await db.getAllAsync<Presentation>(
+    `SELECT * FROM product_presentations WHERE id IN (${placeholders}) OR server_id IN (${placeholders})`,
+    [...ids, ...ids]
+  );
+  const map = new Map<string, Presentation>();
+  for (const r of rows) {
+    map.set(r.id, r);
+    if (r.server_id) map.set(r.server_id, r);
+  }
+  return map;
+}

@@ -12,12 +12,13 @@ import {
   listFrequentProducts,
   listRecentProductsForClient,
   toggleFavoriteLocal,
+  getPresentationsByIds,
   ProductWithPresentations,
 } from "../db/repositories/products";
 import { listCategories } from "../db/repositories/categories";
 import { createOrderLocal, getOrderWithItems, updateOrderLocal } from "../db/repositories/orders";
 import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId, upsertServerWorkDay } from "../db/repositories/workdays";
-import { buildCartLine, calcOrderTotals, recalcLineQuantity, PricingError } from "../domain/pricing";
+import { buildCartLine, calcOrderTotals, recalcLineQuantity, updateLineUnitPrice, calcPriceDifference, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
 import { CartLine, CartLineSelection, Category, Client, Presentation, Product, WorkDay } from "../domain/types";
 import { formatClientDisplayName } from "../domain/client-display";
@@ -30,6 +31,16 @@ type Step = "client" | "products";
 type ProductFilterMode = "all" | "favorites" | "recent" | "frequent" | "category";
 const clientKeyExtractor = (client: Client) => client.id;
 const productKeyExtractor = (product: ProductWithPresentations) => product.id;
+
+export interface PriceDiffItem {
+  productId: string;
+  presentationId: string;
+  productName: string;
+  presentationName: string;
+  historicalPriceCents: number;
+  currentPriceCents: number;
+  quantity: number;
+}
 
 export function NewSaleScreen() {
   const navigation = useNavigation<any>();
@@ -72,6 +83,15 @@ export function NewSaleScreen() {
   const [comboModalVisible, setComboModalVisible] = useState(false);
   const [comboModalProduct, setComboModalProduct] = useState<ProductWithPresentations | null>(null);
   const [comboModalPresentation, setComboModalPresentation] = useState<Presentation | null>(null);
+
+  // Estado para selección de precios históricos vs actuales al editar preventa
+  const [priceDifferences, setPriceDifferences] = useState<PriceDiffItem[]>([]);
+  const [originalOrderTotalCents, setOriginalOrderTotalCents] = useState<number>(0);
+  const [estimatedNewTotalCents, setEstimatedNewTotalCents] = useState<number>(0);
+  const [priceDiffModalVisible, setPriceDiffModalVisible] = useState(false);
+  const [priceDecision, setPriceDecision] = useState<"historical" | "current" | null>(null);
+  const [currentPresMap, setCurrentPresMap] = useState<Map<string, Presentation>>(new Map());
+  const [finalConfirmModalVisible, setFinalConfirmModalVisible] = useState(false);
 
   const checkWorkDay = useCallback(async () => {
     if (!user) return;
@@ -163,7 +183,8 @@ export function NewSaleScreen() {
     });
   }, [isEditing, route.params?.preselectedClientId]);
 
-  // Al editar, reconstruye el carrito usando el snapshot de la preventa incluyendo combos.
+  // Al editar, reconstruye el carrito usando el snapshot de la preventa incluyendo combos,
+  // y compara cada línea con los precios vigentes del catálogo.
   useEffect(() => {
     if (!editingOrderId) return;
     setLoadingOrder(true);
@@ -183,28 +204,64 @@ export function NewSaleScreen() {
           return;
         }
         setSelectedClient(client);
-        setCart(
-          items.map((item: any) => ({
-            productId: item.product_id,
-            presentationId: item.presentation_id,
-            productName: item.product_name_snapshot,
-            sku: item.sku_snapshot,
-            presentationName: item.presentation_name_snapshot,
-            unitEquivalence: item.unit_equivalence_snapshot,
-            unitPriceCents: item.unit_price_cents_snapshot,
-            quantity: item.quantity,
-            subtotalCents: item.subtotal_cents,
-            isCombo: item.selections && item.selections.length > 0,
-            selections: (item.selections || []).map((s: any) => ({
-              selectedProductId: s.selected_product_id,
-              selectedPresentationId: s.selected_presentation_id,
-              productNameSnapshot: s.product_name_snapshot,
-              presentationNameSnapshot: s.presentation_name_snapshot,
-              quantity: s.quantity,
-              sortOrder: s.sort_order,
-            })),
-          }))
-        );
+
+        const loadedCart: CartLine[] = items.map((item: any) => ({
+          productId: item.product_id,
+          presentationId: item.presentation_id,
+          productName: item.product_name_snapshot,
+          sku: item.sku_snapshot,
+          presentationName: item.presentation_name_snapshot,
+          unitEquivalence: item.unit_equivalence_snapshot,
+          unitPriceCents: item.unit_price_cents_snapshot,
+          quantity: item.quantity,
+          subtotalCents: item.subtotal_cents,
+          isCombo: item.selections && item.selections.length > 0,
+          selections: (item.selections || []).map((s: any) => ({
+            selectedProductId: s.selected_product_id,
+            selectedPresentationId: s.selected_presentation_id,
+            productNameSnapshot: s.product_name_snapshot,
+            presentationNameSnapshot: s.presentation_name_snapshot,
+            quantity: s.quantity,
+            sortOrder: s.sort_order,
+          })),
+        }));
+        setCart(loadedCart);
+
+        // Consultar presentaciones actuales del catálogo para comparar precios
+        const presIds = items.map((i: any) => i.presentation_id);
+        const presMap = await getPresentationsByIds(presIds);
+        setCurrentPresMap(presMap);
+
+        const diffs: PriceDiffItem[] = [];
+        let estimatedTotal = 0;
+
+        for (const item of items) {
+          const pres = presMap.get(item.presentation_id);
+          const historicalPrice = Number(item.unit_price_cents_snapshot);
+          const currentPrice = pres ? pres.price_cents : historicalPrice;
+          estimatedTotal += currentPrice * item.quantity;
+
+          if (pres && pres.price_cents !== historicalPrice) {
+            diffs.push({
+              productId: item.product_id,
+              presentationId: item.presentation_id,
+              productName: item.product_name_snapshot,
+              presentationName: item.presentation_name_snapshot,
+              historicalPriceCents: historicalPrice,
+              currentPriceCents: pres.price_cents,
+              quantity: item.quantity,
+            });
+          }
+        }
+
+        setOriginalOrderTotalCents(order.total_cents);
+        setEstimatedNewTotalCents(estimatedTotal);
+
+        if (diffs.length > 0) {
+          setPriceDifferences(diffs);
+          setPriceDiffModalVisible(true);
+        }
+
         setStep("products");
       })
       .catch((err) => {
@@ -303,7 +360,31 @@ export function NewSaleScreen() {
     [isEditing]
   );
 
-  async function handleSaveOrder() {
+  const handleKeepHistoricalPrices = useCallback(() => {
+    setPriceDecision("historical");
+    setPriceDiffModalVisible(false);
+  }, []);
+
+  const handleUseCurrentPrices = useCallback(() => {
+    setPriceDecision("current");
+    setPriceDiffModalVisible(false);
+    setCart((prev) =>
+      prev.map((line) => {
+        const pres = currentPresMap.get(line.presentationId);
+        if (pres && pres.price_cents !== line.unitPriceCents) {
+          return updateLineUnitPrice(line, pres.price_cents);
+        }
+        return line;
+      })
+    );
+  }, [currentPresMap]);
+
+  const handleCancelEditing = useCallback(() => {
+    setPriceDiffModalVisible(false);
+    navigation.goBack();
+  }, [navigation]);
+
+  function handleSaveOrder() {
     if (saveInFlightRef.current) return;
     setError(null);
     if (!selectedClient) {
@@ -312,6 +393,20 @@ export function NewSaleScreen() {
     }
     if (cart.length === 0) {
       setError("Agrega al menos un producto.");
+      return;
+    }
+    if (isEditing && priceDecision === "current") {
+      setCartModalVisible(false);
+      setFinalConfirmModalVisible(true);
+      return;
+    }
+    void executeSaveOrder();
+  }
+
+  async function executeSaveOrder() {
+    if (saveInFlightRef.current) return;
+    if (!selectedClient) {
+      setError("Selecciona un cliente antes de guardar.");
       return;
     }
     saveInFlightRef.current = true;
@@ -367,6 +462,7 @@ export function NewSaleScreen() {
       setCart([]);
       setSelectedClient(null);
       setCartModalVisible(false);
+      setFinalConfirmModalVisible(false);
       setStep("client");
       Alert.alert(editingOrderId ? "Preventa actualizada" : "Preventa guardada", "Se sincronizará automáticamente.");
       if (editingOrderId) navigation.goBack();
@@ -709,6 +805,143 @@ export function NewSaleScreen() {
         onAdd={handleAddComboToCart}
         onClose={handleCloseComboModal}
       />
+
+      {/* Modal para elegir precio histórico o actual */}
+      <Modal
+        visible={priceDiffModalVisible}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={handleCancelEditing}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { maxHeight: "85%" }]}>
+            <View style={styles.modalHeaderRow}>
+              <View style={{ flex: 1, marginRight: spacing.sm }}>
+                <Text style={styles.modalTitle}>Precios Actualizados</Text>
+                <Text style={styles.modalClientSub}>
+                  Hay diferencias entre los precios guardados y los precios actuales del catálogo.
+                </Text>
+              </View>
+            </View>
+
+            <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
+              <Text style={[styles.cartTitle, { marginBottom: spacing.xs }]}>Productos con cambio de precio:</Text>
+              {priceDifferences.map((diff, idx) => (
+                <View key={`${diff.presentationId}-${idx}`} style={styles.priceDiffCard}>
+                  <Text style={styles.priceDiffProdName}>
+                    {diff.productName} · <Text style={{ fontWeight: "400" }}>{diff.presentationName}</Text>
+                  </Text>
+                  <Text style={styles.priceDiffQty}>Cantidad en preventa: {diff.quantity}</Text>
+                  <View style={styles.priceDiffRow}>
+                    <View style={styles.priceDiffCol}>
+                      <Text style={styles.priceDiffLabel}>Precio guardado:</Text>
+                      <Text style={styles.priceDiffOldVal}>{centsToBs(diff.historicalPriceCents)}</Text>
+                    </View>
+                    <Text style={styles.priceDiffArrow}>➔</Text>
+                    <View style={styles.priceDiffCol}>
+                      <Text style={styles.priceDiffLabel}>Precio actual:</Text>
+                      <Text style={styles.priceDiffNewVal}>{centsToBs(diff.currentPriceCents)}</Text>
+                    </View>
+                  </View>
+                </View>
+              ))}
+
+              <View style={[styles.totalsBlock, { marginTop: spacing.md }]}>
+                <TotalRow label="Total original de la preventa" value={centsToBs(originalOrderTotalCents)} bold />
+                <TotalRow label="Total estimado si se actualizan precios" value={centsToBs(estimatedNewTotalCents)} bold />
+                <TotalRow
+                  label="Diferencia estimada"
+                  value={
+                    estimatedNewTotalCents - originalOrderTotalCents > 0
+                      ? `+${centsToBs(estimatedNewTotalCents - originalOrderTotalCents)}`
+                      : estimatedNewTotalCents - originalOrderTotalCents < 0
+                      ? `-${centsToBs(Math.abs(estimatedNewTotalCents - originalOrderTotalCents))}`
+                      : centsToBs(0)
+                  }
+                />
+              </View>
+            </ScrollView>
+
+            <View style={[styles.modalFooter, { paddingTop: spacing.md }]}>
+              <Button
+                label="Mantener precios anteriores"
+                variant="outline"
+                onPress={handleKeepHistoricalPrices}
+                style={{ marginBottom: spacing.xs }}
+              />
+              <Button
+                label="Usar precios actuales"
+                variant="primary"
+                onPress={handleUseCurrentPrices}
+                style={{ marginBottom: spacing.xs }}
+              />
+              <Button
+                label="Cancelar edición"
+                variant="danger"
+                onPress={handleCancelEditing}
+              />
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modal de confirmación final antes de guardar con precios actuales */}
+      <Modal
+        visible={finalConfirmModalVisible}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setFinalConfirmModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeaderRow}>
+              <View style={{ flex: 1, marginRight: spacing.sm }}>
+                <Text style={styles.modalTitle}>Confirmar cambio de precios</Text>
+                <Text style={styles.modalClientSub}>
+                  Esta preventa se guardará aplicando los precios vigentes del catálogo.
+                </Text>
+              </View>
+            </View>
+
+            <View style={{ paddingVertical: spacing.md }}>
+              <View style={styles.totalsBlock}>
+                <TotalRow label="Total anterior" value={centsToBs(originalOrderTotalCents)} />
+                <TotalRow label="Total nuevo" value={centsToBs(totals.totalCents)} bold />
+                <TotalRow
+                  label="Diferencia"
+                  value={
+                    totals.totalCents - originalOrderTotalCents > 0
+                      ? `+${centsToBs(totals.totalCents - originalOrderTotalCents)}`
+                      : totals.totalCents - originalOrderTotalCents < 0
+                      ? `-${centsToBs(Math.abs(totals.totalCents - originalOrderTotalCents))}`
+                      : centsToBs(0)
+                  }
+                  bold
+                />
+              </View>
+            </View>
+
+            <View style={styles.modalFooter}>
+              <Button
+                label="Confirmar cambio"
+                onPress={() => {
+                  setFinalConfirmModalVisible(false);
+                  void executeSaveOrder();
+                }}
+                loading={saving}
+                disabled={saving}
+                style={{ marginBottom: spacing.xs }}
+              />
+              <Button
+                label="Volver a editar"
+                variant="outline"
+                onPress={() => setFinalConfirmModalVisible(false)}
+                disabled={saving}
+              />
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -1102,5 +1335,55 @@ const styles = StyleSheet.create({
     borderTopColor: colors.border,
     paddingTop: spacing.md,
     marginTop: spacing.sm,
+  },
+  priceDiffCard: {
+    backgroundColor: colors.surface,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  priceDiffProdName: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.textPrimary,
+    marginBottom: 2,
+  },
+  priceDiffQty: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginBottom: spacing.xs,
+  },
+  priceDiffRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: colors.surfaceAlt,
+    padding: spacing.sm,
+    borderRadius: radius.sm,
+  },
+  priceDiffCol: {
+    flex: 1,
+  },
+  priceDiffLabel: {
+    fontSize: 11,
+    color: colors.textSecondary,
+    marginBottom: 2,
+  },
+  priceDiffOldVal: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: colors.textSecondary,
+  },
+  priceDiffNewVal: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.emerald,
+  },
+  priceDiffArrow: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginHorizontal: spacing.sm,
   },
 });
