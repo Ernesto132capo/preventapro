@@ -8,6 +8,7 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
 import { z } from "zod";
 import { getBoliviaToday } from "../services/dates";
+import { isDatabaseUnavailable } from "../services/http-errors";
 
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
@@ -19,6 +20,22 @@ async function recalc(id: string, db: PoolClient) {
   const { count, total } = rows[0];
   await db.query("UPDATE work_days SET order_count = $2, total_cents = $3, updated_at = $4 WHERE id = $1", [id, count, total, nowIso()]);
   return { orderCount: count, totalCents: total };
+}
+
+// El borrado físico necesita una señal persistente para los otros teléfonos.
+// Si falta la migración, falla la transacción completa y conserva la jornada.
+async function recordDeletedWorkday(db: PoolClient, id: string) {
+  await db.query(
+    `INSERT INTO sync_tombstones (entity_type, entity_id, deleted_at)
+     VALUES ('workday', $1, now())
+     ON CONFLICT (entity_type, entity_id) DO UPDATE SET deleted_at = EXCLUDED.deleted_at`,
+    [id]
+  );
+}
+
+function workdayErrorStatus(error: unknown, client: PoolClient | undefined) {
+  const missingMigration = Boolean(error && typeof error === "object" && "code" in error && error.code === "42P01");
+  return !client || isDatabaseUnavailable(error) || missingMigration ? 503 : 500;
 }
 
 // Si un preventista olvida cerrar la jornada y cambia el día calendario (00:00
@@ -85,9 +102,10 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     return res.json(currentWorkdayCache.data);
   }
 
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
     // Lock compartido para todo el negocio
@@ -112,7 +130,8 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
       const currentOpen = todayOpenRows[0];
       // Reparar duplicados antiguos: unificar órdenes y eliminar filas duplicadas
       for (const duplicate of todayOpenRows.slice(1)) {
-        await client.query("UPDATE orders SET work_day_id = $1 WHERE work_day_id = $2", [currentOpen.id, duplicate.id]);
+        await client.query("UPDATE orders SET work_day_id = $1, updated_at = $3 WHERE work_day_id = $2", [currentOpen.id, duplicate.id, nowIso()]);
+        await recordDeletedWorkday(client, duplicate.id);
         await client.query("DELETE FROM work_days WHERE id = $1", [duplicate.id]);
       }
       await recalc(currentOpen.id, client);
@@ -121,6 +140,7 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
       await client.query("COMMIT");
       inTransaction = false;
       if (closedStale || todayOpenRows.length > 1) invalidatePullCache("workdays");
+      if (todayOpenRows.length > 1) invalidatePullCache("orders");
       currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
       return res.json(payload);
     }
@@ -132,7 +152,8 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     if (todayClosedRows.length > 0) {
       const currentClosed = todayClosedRows[0];
       for (const duplicate of todayClosedRows.slice(1)) {
-        await client.query("UPDATE orders SET work_day_id = $1 WHERE work_day_id = $2", [currentClosed.id, duplicate.id]);
+        await client.query("UPDATE orders SET work_day_id = $1, updated_at = $3 WHERE work_day_id = $2", [currentClosed.id, duplicate.id, nowIso()]);
+        await recordDeletedWorkday(client, duplicate.id);
         await client.query("DELETE FROM work_days WHERE id = $1", [duplicate.id]);
       }
       await recalc(currentClosed.id, client);
@@ -141,6 +162,7 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
       await client.query("COMMIT");
       inTransaction = false;
       if (closedStale || todayClosedRows.length > 1) invalidatePullCache("workdays");
+      if (todayClosedRows.length > 1) invalidatePullCache("orders");
       currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
       return res.json(payload);
     }
@@ -162,13 +184,13 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
     currentWorkdayCache = { date, data: payload, cachedAt: Date.now() };
     return res.json(payload);
   } catch (error) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     console.error("Error al resolver la jornada actual:", error);
-    return res.status(500).json({ error: "No se pudo resolver la jornada actual." });
+    return res.status(workdayErrorStatus(error, client)).json({ error: "No se pudo resolver la jornada actual. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
@@ -206,10 +228,11 @@ workdaysRouter.get("/:id/orders", async (req: AuthedRequest, res, next) => {
 });
 
 workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   let row: any;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
     const { rows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [req.params.id]);
@@ -230,17 +253,18 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
     );
     await client.query("DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = $1)", [req.params.id]);
     await client.query("DELETE FROM orders WHERE work_day_id = $1", [req.params.id]);
+    await recordDeletedWorkday(client, req.params.id);
     await client.query("DELETE FROM work_days WHERE id = $1", [req.params.id]);
     await client.query("COMMIT");
     inTransaction = false;
   } catch (err) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     console.error("Error al eliminar jornada:", err);
-    return res.status(500).json({ error: "No se pudo eliminar el registro histórico." });
+    return res.status(workdayErrorStatus(err, client)).json({ error: "No se pudo eliminar el registro histórico. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
   invalidateWorkdayCache();
   invalidatePullCache("workdays");
@@ -261,9 +285,10 @@ workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
   const parsed = z.object({ confirmation: z.literal("CONFIRMAR") }).strict().safeParse(req.body);
   if (!parsed.success)
     return res.status(400).json({ error: 'Debes escribir exactamente "CONFIRMAR" para cerrar la jornada.' });
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
     await lockWorkDays(client);
@@ -291,20 +316,21 @@ workdaysRouter.post("/:id/close", async (req: AuthedRequest, res) => {
     invalidatePullCache("workdays");
     res.json({ workDay: serial(updated[0]) });
   } catch (error) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     console.error("Error al cerrar jornada:", error);
-    res.status(500).json({ error: "No se pudo cerrar la jornada." });
+    res.status(workdayErrorStatus(error, client)).json({ error: "No se pudo cerrar la jornada. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
 workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
     await lockWorkDays(client);
@@ -338,12 +364,12 @@ workdaysRouter.post("/:id/reopen", async (req: AuthedRequest, res) => {
     invalidatePullCache("workdays");
     res.json({ workDay: serial(updated[0]) });
   } catch (error) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     console.error("Error al reabrir jornada:", error);
-    res.status(500).json({ error: "No se pudo reabrir la jornada." });
+    res.status(workdayErrorStatus(error, client)).json({ error: "No se pudo reabrir la jornada. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });

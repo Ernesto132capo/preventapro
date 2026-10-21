@@ -440,18 +440,20 @@ const mockDb = {
     if (cleanSql.includes("JOIN order_items oi")) {
       return [
         {
+          id: "item-papas",
           product_name_snapshot: "Papas en tira",
           presentation_name_snapshot: "Bolsa 500g",
           unit_price_cents_snapshot: 2800,
-          total_quantity: 10,
-          total_subtotal_cents: 28000,
+          quantity: 10,
+          subtotal_cents: 28000,
         },
         {
+          id: "item-bombon",
           product_name_snapshot: "Bombón",
           presentation_name_snapshot: "Caja x24",
           unit_price_cents_snapshot: 6000,
-          total_quantity: 10,
-          total_subtotal_cents: 60000,
+          quantity: 10,
+          subtotal_cents: 60000,
         },
       ];
     }

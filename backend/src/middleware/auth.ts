@@ -36,7 +36,7 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
       if (!row || row.active === false) {
         return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
       }
-      if (row.session_active === false) {
+      if (row.session_active !== true) {
         return res.status(401).json({ error: "Sesión revocada o cerrada." });
       }
       req.userId = decoded.uid;

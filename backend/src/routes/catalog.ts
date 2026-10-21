@@ -5,6 +5,7 @@ import { z } from "zod";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, requireRole, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
+import { asyncRoute, isDatabaseUnavailable } from "../services/http-errors";
 
 export const catalogRouter = Router();
 catalogRouter.use(requireAuth);
@@ -413,7 +414,7 @@ catalogRouter.get("/products/:id", async (req, res, next) => {
   }
 });
 
-catalogRouter.post("/products", async (req: AuthedRequest, res) => {
+catalogRouter.post("/products", asyncRoute(async (req: AuthedRequest, res) => {
   const parsed = productSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   const d = parsed.data;
@@ -433,8 +434,9 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
     }
 
     // [M-06] Si existía pero estaba inactivo, reactivarlo y actualizar sus datos
-    const client = await pool.connect();
+    let client: PoolClient | undefined;
     try {
+      client = await pool.connect();
       await client.query("BEGIN");
 
       if (d.productType === "combo" && d.comboDefinition) {
@@ -475,17 +477,18 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
       const { rows: refreshed } = await pool.query("SELECT * FROM products WHERE id = $1", [existingRow.id]);
       return res.json({ product: await serialProduct(refreshed[0]), deduped: true });
     } catch (err: any) {
-      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-      return res.status(400).json({ error: err.message || "Error al reactivar el producto." });
+      if (client) { try { await client.query("ROLLBACK"); } catch { /* ignore */ } }
+      return res.status(!client || isDatabaseUnavailable(err) ? 503 : 400).json({ error: isDatabaseUnavailable(err) || !client ? "No se pudo conectar con la base de datos. Intenta de nuevo más tarde." : err.message || "Error al reactivar el producto." });
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
   // Creación de nuevo producto
   const id = uuid();
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     if (d.productType === "combo" && d.comboDefinition) {
@@ -541,14 +544,14 @@ catalogRouter.post("/products", async (req: AuthedRequest, res) => {
     invalidatePullCache("products");
     res.status(201).json({ product: await serialProduct(rows[0]) });
   } catch (err: any) {
-    try { await client.query("ROLLBACK"); } catch { /* connection lost */ }
-    res.status(400).json({ error: err.message || "Error al registrar el producto." });
+    if (client) { try { await client.query("ROLLBACK"); } catch { /* connection lost */ } }
+    res.status(!client || isDatabaseUnavailable(err) ? 503 : 400).json({ error: isDatabaseUnavailable(err) || !client ? "No se pudo conectar con la base de datos. Intenta de nuevo más tarde." : err.message || "Error al registrar el producto." });
   } finally {
-    client.release();
+    client?.release();
   }
-});
+}));
 
-catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
+catalogRouter.put("/products/:id", asyncRoute(async (req: AuthedRequest, res) => {
   const parsed = productUpdateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
 
@@ -557,8 +560,9 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
   if (!old || old.active === false) return res.status(404).json({ error: "Producto no encontrado." });
 
   const d = parsed.data, ts = nowIso();
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     if (d.productType === "combo" && d.comboDefinition) {
@@ -592,12 +596,12 @@ catalogRouter.put("/products/:id", async (req: AuthedRequest, res) => {
     invalidatePullCache("products");
     res.json({ product: await serialProduct(refreshed[0]) });
   } catch (err: any) {
-    try { await client.query("ROLLBACK"); } catch { /* connection lost */ }
-    res.status(400).json({ error: err.message || "Error al actualizar el producto." });
+    if (client) { try { await client.query("ROLLBACK"); } catch { /* connection lost */ } }
+    res.status(!client || isDatabaseUnavailable(err) ? 503 : 400).json({ error: isDatabaseUnavailable(err) || !client ? "No se pudo conectar con la base de datos. Intenta de nuevo más tarde." : err.message || "Error al actualizar el producto." });
   } finally {
-    client.release();
+    client?.release();
   }
-});
+}));
 
 catalogRouter.delete("/products/:id", requireRole("admin"), async (req: AuthedRequest, res, next) => {
   try {

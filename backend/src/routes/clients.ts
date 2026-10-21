@@ -1,9 +1,11 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
+import { PoolClient } from "pg";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
+import { isDatabaseUnavailable } from "../services/http-errors";
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -94,9 +96,10 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
   const phone = (d.phone || "").trim() || null;
   const nId = d.neighborhoodId || d.neighborhood_id || null;
 
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
 
@@ -129,16 +132,16 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
     invalidatePullCache("clients");
     res.status(201).json({ client: serializeClient(rows[0]) });
   } catch (error) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     if (isConstraintViolation(error)) {
       return res.status(400).json({ error: "Uno o más datos del cliente no son válidos." });
     }
     console.error("Error al registrar cliente:", error);
-    res.status(500).json({ error: "No se pudo registrar el cliente." });
+    res.status(!client || isDatabaseUnavailable(error) ? 503 : 500).json({ error: "No se pudo registrar el cliente. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 

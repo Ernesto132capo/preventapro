@@ -133,6 +133,19 @@ export async function upsertServerWorkDay(localId: string, serverWorkDay: any) {
            WHERE id = ?`,
           [serverId, newStatus, serverWorkDay.order_count ?? 0, serverWorkDay.total_cents ?? 0, canonicalId]
         );
+        const pending = await db.getFirstAsync<{ id: string }>(
+          `SELECT id FROM orders WHERE work_day_id = ? AND sync_status <> 'synced' LIMIT 1`, [canonicalId]
+        );
+        if (pending) {
+          // El cierre desde otro teléfono no puede borrar del Dashboard el
+          // importe de las preventas que este dispositivo todavía debe subir.
+          await db.runAsync(
+            `UPDATE work_days SET
+               order_count = (SELECT COUNT(*) FROM orders WHERE work_day_id = ? AND status = 'active'),
+               total_cents = (SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE work_day_id = ? AND status = 'active')
+             WHERE id = ?`, [canonicalId, canonicalId, canonicalId]
+          );
+        }
       } else {
         await db.runAsync(
           `INSERT INTO work_days (id, server_id, user_id, work_date, status, order_count, total_cents, sync_status, created_at)

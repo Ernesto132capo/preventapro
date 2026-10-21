@@ -1,4 +1,5 @@
 import { v4 as uuid } from "uuid";
+import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso } from "./client";
 
 export type OutboxEntity = "client" | "product" | "order" | "category";
@@ -6,6 +7,11 @@ export type OrderOperation = "create" | "update" | "cancel" | "delete";
 
 export async function enqueue(entityType: OutboxEntity, localEntityId: string, priority = 2, operation: OrderOperation = "create") {
   const db = await getDb();
+  return enqueueInTx(db, entityType, localEntityId, priority, operation);
+}
+
+/** Usa la misma conexión/transacción que la escritura del registro local. */
+export async function enqueueInTx(db: SQLiteDatabase, entityType: OutboxEntity, localEntityId: string, priority = 2, operation: OrderOperation = "create") {
   await db.runAsync(
     `INSERT INTO outbox (id, entity_type, local_entity_id, operation, priority, status, attempts, created_at)
      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)`,
@@ -23,6 +29,8 @@ export interface OutboxRow {
   attempts: number;
   last_error: string | null;
   created_at: string;
+  next_retry_at?: string | null;
+  completed_at?: string | null;
 }
 
 export async function listPending(): Promise<OutboxRow[]> {
@@ -30,7 +38,10 @@ export async function listPending(): Promise<OutboxRow[]> {
   return db.getAllAsync<OutboxRow>(
     // Si la app se cerró durante un envío, la fila puede quedar en "syncing".
     // Se debe reintentar: todas las escrituras de preventa son idempotentes.
-    `SELECT * FROM outbox WHERE status IN ('pending','syncing','failed') ORDER BY priority ASC, created_at ASC`
+    `SELECT * FROM outbox WHERE status IN ('pending','syncing','failed')
+       AND (next_retry_at IS NULL OR next_retry_at <= ?)
+     ORDER BY priority ASC, created_at ASC`,
+    [nowIso()]
   );
 }
 
@@ -39,7 +50,8 @@ export async function markDone(id: string) {
   // El handler envía el estado local actual, así que una operación exitosa también
   // resuelve errores antiguos de la misma entidad que ya quedaron obsoletos.
   await db.runAsync(
-    `UPDATE outbox SET status = 'done', last_error = NULL
+    `UPDATE outbox SET status = 'done', last_error = NULL,
+       next_retry_at = NULL, completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
      WHERE id = ? OR (
        status IN ('failed', 'error')
        AND entity_type = (SELECT entity_type FROM outbox WHERE id = ?)
@@ -61,7 +73,7 @@ export async function markFailed(id: string, error: string) {
 export async function markPermanentError(id: string, error: string) {
   const db = await getDb();
   await db.runAsync(
-    `UPDATE outbox SET status = 'error', attempts = attempts + 1, last_error = ? WHERE id = ?`,
+    `UPDATE outbox SET status = 'error', attempts = attempts + 1, last_error = ?, next_retry_at = NULL WHERE id = ?`,
     [error, id]
   );
 }
@@ -75,16 +87,24 @@ export async function markSyncing(id: string) {
 // dependencia (ej. el cliente de una preventa) todavía no se sincronizó en esta pasada.
 export async function deferForDependency(id: string) {
   const db = await getDb();
-  await db.runAsync(`UPDATE outbox SET status = 'pending' WHERE id = ?`, [id]);
+  await db.runAsync(`UPDATE outbox SET status = 'pending', next_retry_at = NULL WHERE id = ?`, [id]);
 }
 
 /** Conserva la fila pendiente para reintentarla más tarde y registra el último error temporal. */
 export async function deferForRetry(id: string, error: string) {
   const db = await getDb();
+  const row = await db.getFirstAsync<{ attempts: number }>(`SELECT attempts FROM outbox WHERE id = ?`, [id]);
+  const delayMs = retryDelayMs(row?.attempts ?? 0);
+  const retryAt = new Date(Date.now() + delayMs).toISOString();
   await db.runAsync(
-    `UPDATE outbox SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE id = ?`,
-    [error, id]
+    `UPDATE outbox SET status = 'pending', attempts = attempts + 1, last_error = ?, next_retry_at = ? WHERE id = ?`,
+    [error, retryAt, id]
   );
+}
+
+/** Los errores de red se reintentan indefinidamente, con espera de 30 s a 15 min. */
+export function retryDelayMs(attempts: number): number {
+  return Math.min(15 * 60_000, 30_000 * 2 ** Math.min(Math.max(0, attempts), 5));
 }
 
 export async function countPending(): Promise<number> {
@@ -130,7 +150,7 @@ export async function discardFailed(): Promise<number> {
 /** Reintenta todos los ítems fallidos o en error devolviéndolos a estado 'pending'. */
 export async function retryFailed(): Promise<number> {
   const db = await getDb();
-  const result = await db.runAsync(`UPDATE outbox SET status = 'pending' WHERE status IN ('failed', 'error')`);
+  const result = await db.runAsync(`UPDATE outbox SET status = 'pending', attempts = 0, next_retry_at = NULL WHERE status IN ('failed', 'error')`);
   return result.changes ?? 0;
 }
 
@@ -155,6 +175,17 @@ export async function purgeOutboxForEntity(entityType: OutboxEntity, localEntity
      WHERE entity_type = ? AND local_entity_id = ? AND status <> 'done'`,
     [entityType, localEntityId]
   );
+  return result.changes ?? 0;
+}
+
+/** Solo elimina eventos completados; nunca pendientes, errores ni sus entidades. */
+export async function purgeCompletedOutbox(retentionDays = 30): Promise<number> {
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) throw new Error("La retención debe ser al menos de un día.");
+  const db = await getDb();
+  // Los eventos legacy completados empiezan a contar su retención desde hoy.
+  await db.runAsync(`UPDATE outbox SET completed_at = ? WHERE status = 'done' AND completed_at IS NULL`, [nowIso()]);
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+  const result = await db.runAsync(`DELETE FROM outbox WHERE status = 'done' AND completed_at < ?`, [cutoff]);
   return result.changes ?? 0;
 }
 

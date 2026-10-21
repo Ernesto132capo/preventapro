@@ -122,6 +122,11 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
 
   const targetId = existing ? existing.id : serverCat.id;
 
+  if (existing && existing.sync_status !== "synced") {
+    await db.runAsync(`UPDATE categories SET server_id = ? WHERE id = ?`, [serverCat.id, existing.id]);
+    return;
+  }
+
   await db.runAsync(
     `INSERT INTO categories (id, server_id, name, active, sync_status, updated_at)
      VALUES (?, ?, ?, ?, 'synced', ?)
@@ -139,6 +144,9 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
       serverCat.updated_at || nowIso(),
     ]
   );
+  if (serverCat.active === false || serverCat.active === 0) {
+    await db.runAsync(`UPDATE products SET category_id = NULL WHERE category_id = ? OR category_id = ?`, [targetId, serverCat.id]);
+  }
 }
 
 export async function resolveServerCategoryId(localId: string): Promise<string | null> {

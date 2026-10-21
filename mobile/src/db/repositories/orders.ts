@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
-import { enqueue } from "../outbox";
+import { enqueueInTx } from "../outbox";
 import { CartLine, LocalOrder } from "../../domain/types";
 import { calcOrderTotals, PricingError } from "../../domain/pricing";
 import { formatClientDisplayName } from "../../domain/client-display";
@@ -127,9 +127,8 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
        WHERE id = ?`,
       [input.workDayLocalId, input.workDayLocalId, input.workDayLocalId]
     );
+    await enqueueInTx(db, "order", orderId, 2);
   });
-
-  await enqueue("order", orderId, 2);
 
   const row = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ?`, [orderId]);
   return row as LocalOrder;
@@ -184,51 +183,69 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
     `SELECT id, server_id FROM work_days WHERE id = ?`,
     [workDayLocalId]
   );
-  const rows = await db.getAllAsync<{
-    product_name_snapshot: string;
-    presentation_name_snapshot: string;
-    unit_price_cents_snapshot: number;
-    total_quantity: number;
-    total_subtotal_cents: number;
-  }>(
-    `SELECT
-       oi.product_name_snapshot,
-       oi.presentation_name_snapshot,
-       oi.unit_price_cents_snapshot,
-       SUM(oi.quantity) AS total_quantity,
-       SUM(oi.subtotal_cents) AS total_subtotal_cents
+  const rows = await db.getAllAsync<any>(
+    `SELECT oi.*
      FROM orders o
      JOIN order_items oi ON oi.order_id = o.id
      WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ?))
        AND o.status = 'active'
-     GROUP BY oi.product_name_snapshot, oi.presentation_name_snapshot, oi.unit_price_cents_snapshot
-     ORDER BY oi.product_name_snapshot COLLATE NOCASE ASC, oi.presentation_name_snapshot COLLATE NOCASE ASC`,
+     ORDER BY o.created_at, oi.id`,
     [workDayLocalId, wd?.server_id ?? workDayLocalId, wd?.server_id ?? ""]
   );
 
-  let grandTotalCents = 0;
-  let grandTotalUnits = 0;
-  const items: ConsolidatedProductRow[] = (rows || []).map((r) => {
-    const isSpecialPres = r.presentation_name_snapshot &&
-      r.presentation_name_snapshot !== "Unidad" &&
-      r.presentation_name_snapshot !== "Default" &&
-      r.presentation_name_snapshot !== r.product_name_snapshot;
-    const displayName = isSpecialPres
-      ? `${r.product_name_snapshot} (${r.presentation_name_snapshot})`
-      : r.product_name_snapshot;
-    const units = Number(r.total_quantity || 0);
-    const subtotal = Number(r.total_subtotal_cents || 0);
-    grandTotalCents += subtotal;
-    grandTotalUnits += units;
-    return {
-      productName: displayName,
-      presentationName: r.presentation_name_snapshot,
-      unitPriceCents: Number(r.unit_price_cents_snapshot || 0),
-      totalSubtotalCents: subtotal,
+  const itemIds = rows.map((r) => r.id);
+  const selections = itemIds.length === 0 ? [] : await db.getAllAsync<any>(
+    `SELECT * FROM order_item_selections WHERE order_item_id IN (${itemIds.map(() => "?").join(",")}) ORDER BY sort_order, id`,
+    itemIds
+  );
+  const byItem = new Map<string, any[]>();
+  for (const selection of selections) {
+    const list = byItem.get(selection.order_item_id) || [];
+    list.push(selection);
+    byItem.set(selection.order_item_id, list);
+  }
+  // Igual que lista_de_productos.xlsx: componentes de combos y promedio por
+  // producto/presentación, distribuyendo el último centavo sin perder subtotal.
+  const grouped = new Map<string, ConsolidatedProductRow>();
+  const add = (product: string, presentation: string, units: number, subtotal: number, price: number) => {
+    const key = `${product}__${presentation}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.totalUnits += units;
+      existing.totalSubtotalCents += subtotal;
+      existing.unitPriceCents = existing.totalUnits > 0 ? Math.round(existing.totalSubtotalCents / existing.totalUnits) : 0;
+      return;
+    }
+    const special = presentation && presentation !== "Unidad" && presentation !== "Default" && presentation !== product;
+    grouped.set(key, {
+      productName: special ? `${product} (${presentation})` : product,
+      presentationName: presentation,
       totalUnits: units,
-    };
-  });
-
+      totalSubtotalCents: subtotal,
+      unitPriceCents: price,
+    });
+  };
+  for (const row of rows) {
+    const quantity = Number(row.quantity || 0);
+    const subtotal = Number(row.subtotal_cents ?? Number(row.unit_price_cents_snapshot) * quantity);
+    const selected = byItem.get(row.id) || [];
+    if (selected.length === 0) {
+      add(row.product_name_snapshot, row.presentation_name_snapshot, quantity, subtotal, Number(row.unit_price_cents_snapshot || 0));
+      continue;
+    }
+    const totalFactors = selected.reduce((sum, sel) => sum + (Number(sel.quantity) || 1), 0);
+    let allocated = 0;
+    selected.forEach((sel, index) => {
+      const factor = Number(sel.quantity) || 1;
+      const units = quantity * factor;
+      const share = index === selected.length - 1 ? subtotal - allocated : Math.round(subtotal * factor / totalFactors);
+      allocated += share;
+      add(sel.product_name_snapshot, sel.presentation_name_snapshot, units, share, units > 0 ? Math.round(share / units) : 0);
+    });
+  }
+  const items = Array.from(grouped.values());
+  const grandTotalCents = items.reduce((sum, item) => sum + item.totalSubtotalCents, 0);
+  const grandTotalUnits = items.reduce((sum, item) => sum + item.totalUnits, 0);
   return { items, grandTotalCents, grandTotalUnits };
 }
 
@@ -267,15 +284,14 @@ export async function getOrderWithItems(orderId: string) {
 }
 
 export async function upsertOrderFromServerInTx(db: SQLiteDatabase, serverOrder: any): Promise<void> {
+  if (serverOrder.status !== "cancelled" && (!Array.isArray(serverOrder.items) || (Number(serverOrder.item_count) > 0 && serverOrder.items.length === 0))) {
+    throw new Error("La descarga de la preventa está incompleta. Se reintentará sin reemplazar sus productos locales.");
+  }
   let localWorkDay = await db.getFirstAsync<{ id: string }>(
     `SELECT id FROM work_days WHERE server_id = ? OR id = ? LIMIT 1`,
     [serverOrder.work_day_id, serverOrder.work_day_id]
   );
-  if (!localWorkDay) {
-    localWorkDay = await db.getFirstAsync<{ id: string }>(
-      `SELECT id FROM work_days WHERE status = 'open' ORDER BY created_at DESC LIMIT 1`
-    );
-  }
+  // Nunca asignar una preventa histórica a otra jornada abierta por aproximación.
   const workDayLocalId = localWorkDay ? localWorkDay.id : serverOrder.work_day_id;
 
   const localClient = await db.getFirstAsync<{ id: string; business_name: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null }>(
@@ -285,21 +301,41 @@ export async function upsertOrderFromServerInTx(db: SQLiteDatabase, serverOrder:
   const clientLocalId = localClient ? localClient.id : serverOrder.client_id;
   const clientName = serverOrder.client_name || (localClient ? formatClientDisplayName(localClient).primary : "Cliente");
 
-  const existing = await db.getFirstAsync<{ id: string; server_id: string | null; work_day_id: string; sync_status: string }>(
-    `SELECT id, server_id, work_day_id, sync_status FROM orders WHERE server_id = ? OR id = ?`,
-    [serverOrder.id, serverOrder.id]
+  const matches = await db.getAllAsync<{ id: string; server_id: string | null; work_day_id: string; sync_status: string }>(
+    `SELECT id, server_id, work_day_id, sync_status FROM orders WHERE server_id = ? OR id = ? OR id = ?
+     ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END`,
+    [serverOrder.id, serverOrder.id, serverOrder.idempotency_key || serverOrder.id, serverOrder.idempotency_key || serverOrder.id]
   );
+  const existing = matches[0];
+  // Una confirmación HTTP perdida se reconoce por la clave original del móvil.
+  // También corrige copias duplicadas descargadas por versiones anteriores.
+  if (existing) {
+    await db.runAsync(`UPDATE orders SET server_id = ?, work_day_id = ? WHERE id = ?`, [serverOrder.id, workDayLocalId, existing.id]);
+    for (const duplicate of matches.slice(1)) {
+      if (duplicate.sync_status !== "synced") {
+        // Una copia pendiente requiere atención: jamás borrar su única edición.
+        throw new Error("Hay dos copias pendientes de la misma preventa; se conservaron para revisión.");
+      }
+      await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [duplicate.id]);
+      await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [duplicate.id]);
+      await db.runAsync(`UPDATE outbox SET local_entity_id = ? WHERE entity_type = 'order' AND local_entity_id = ?`, [existing.id, duplicate.id]);
+      await db.runAsync(`DELETE FROM orders WHERE id = ?`, [duplicate.id]);
+      await refreshWorkDayTotals(db, duplicate.work_day_id);
+    }
+  }
 
   const isCancelled = serverOrder.status === "cancelled";
 
-  if (existing && existing.sync_status === "pending") {
+  if (existing && existing.sync_status !== "synced") {
     // Si la copia local tiene cambios pendientes:
     if (!isCancelled) {
       // Para actualizaciones remotas normales, proteger cambios locales pendientes
+      await refreshWorkDayTotals(db, existing.work_day_id);
+      if (workDayLocalId !== existing.work_day_id) await refreshWorkDayTotals(db, workDayLocalId);
       return;
     }
     // Si es un tombstone pero la orden local todavía no tiene server_id (puramente local):
-    if (!existing.server_id) {
+    if (!existing.server_id && serverOrder.idempotency_key !== existing.id) {
       return;
     }
     // Si ya tiene server_id: la anulación remota gana y continúa abajo
@@ -539,8 +575,8 @@ async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymen
       [paymentCondition, totals.subtotalCents, totals.taxCents, totals.totalCents, totals.itemCount, ts, orderId]
     );
     await refreshWorkDayTotals(db, (order as any).work_day_id);
+    await enqueueInTx(db, "order", orderId, 2, "update");
   });
-  await enqueue("order", orderId, 2, "update");
 }
 
 
@@ -567,8 +603,8 @@ export async function cancelOrderLocal(orderId: string): Promise<void> {
       await refreshWorkDayTotals(db, order.work_day_id);
       // Las altas/ediciones pendientes ya no deben enviarse después de cancelar.
       await db.runAsync(`UPDATE outbox SET status = 'done' WHERE entity_type = 'order' AND local_entity_id = ? AND status IN ('pending', 'failed')`, [orderId]);
+      await enqueueInTx(db, "order", orderId, 2, "cancel");
     });
-    await enqueue("order", orderId, 2, "cancel");
   });
 }
 
@@ -602,6 +638,8 @@ export async function markOrderSynced(localId: string, serverId: string) {
     serverId,
     localId,
   ]);
+  const order = await db.getFirstAsync<{ work_day_id: string }>(`SELECT work_day_id FROM orders WHERE id = ?`, [localId]);
+  if (order) await refreshWorkDayTotals(db, order.work_day_id);
 }
 
 export async function markOrderFailed(localId: string, error: string) {

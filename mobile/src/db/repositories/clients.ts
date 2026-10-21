@@ -142,9 +142,17 @@ export async function deleteClientLocal(id: string): Promise<void> {
 /** Usado por el motor de sync al hacer pull: inserta o actualiza clientes que vinieron del servidor. */
 export async function upsertFromServer(serverClient: any) {
   const db = await getDb();
-  const localMatch = serverClient.client_local_id
-    ? await db.getFirstAsync<{ id: string }>(`SELECT id FROM clients WHERE id = ?`, [serverClient.client_local_id])
-    : null;
+  const localMatch = await db.getFirstAsync<{ id: string; sync_status: string }>(
+    `SELECT id, sync_status FROM clients WHERE id = ? OR server_id = ? OR id = ?
+     ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1`,
+    [serverClient.client_local_id || serverClient.id, serverClient.id, serverClient.id, serverClient.client_local_id || serverClient.id]
+  );
+
+  // Un pull no confirma una edición local: primero hay que enviar su outbox.
+  if (localMatch && localMatch.sync_status !== "synced") {
+    await db.runAsync(`UPDATE clients SET server_id = ? WHERE id = ?`, [serverClient.id, localMatch.id]);
+    return;
+  }
 
   const targetId = localMatch ? localMatch.id : serverClient.id;
   const bName = (serverClient.business_name || serverClient.businessName || serverClient.name || "").trim() || null;

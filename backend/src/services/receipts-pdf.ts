@@ -137,11 +137,13 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
   for (const line of lines) byOrder.set(line.order_id, [...(byOrder.get(line.order_id) || []), line]);
 
   const filePath = path.join(outDir, "boletas_clientes.pdf");
+  await fs.promises.mkdir(outDir, { recursive: true });
   // [M-12] y [A-11] Escritura atómica a archivo temporal con manejo robusto de errores
   const tmpFilePath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
+    let finished = false;
     const doc = new PDFDocument({ size: "A4", margin: 42 });
     const stream = fs.createWriteStream(tmpFilePath);
 
@@ -160,8 +162,11 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
     doc.on("error", cleanup);
     stream.on("error", cleanup);
 
-    stream.on("finish", () => {
+    // Esperar al cierre del descriptor permite renombrar también en Windows.
+    stream.on("finish", () => { finished = true; });
+    stream.on("close", () => {
       if (settled) return;
+      if (!finished) return cleanup(new Error("La escritura del PDF se cerró antes de completarse."));
       settled = true;
       resolve();
     });
@@ -171,11 +176,95 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
 
       for (const order of byOrder.values()) {
         const first = order[0];
-        // Cada línea estándar necesita ~20 pt; cada selección de combo ~16 pt.
-        const totalVisualRows = order.reduce((sum, item) => sum + 1 + (item.selections?.length || 0), 0);
-        const receiptHeight = 160 + totalVisualRows * 20;
+        const pageBottom = () => doc.page.height - doc.page.margins.bottom;
+        const { primary, secondary } = formatClientDisplayName(first);
+        const x = [42, 215, 315, 380, 470];
+        const widths = [173, 100, 65, 90, 83];
+        const alignments: PDFKit.Mixins.TextOptions["align"][] = ["left", "left", "center", "right", "right"];
 
-        if (doc.y > 60 && doc.y + receiptHeight > 752) doc.addPage();
+        const drawTableHeader = () => {
+          const headerY = doc.y;
+          doc.rect(42, headerY, 511, 18).fill("#001428");
+          doc.fillColor("white").font("Helvetica-Bold").fontSize(8);
+          ["Producto", "Presentación", "Cantidad", "Precio unitario", "Subtotal"].forEach((label, i) =>
+            doc.text(label, x[i] + 4, headerY + 5, { width: widths[i] - 8, align: alignments[i], lineBreak: false })
+          );
+          doc.y = headerY + 23;
+        };
+        const continueReceipt = () => {
+          doc.addPage();
+          doc.fillColor("#001428").font("Helvetica-Bold").fontSize(11)
+            .text("COMPROBANTE DE VENTA (continuación)", 42, doc.y, { width: 511, align: "center" });
+          doc.fillColor("#111827").font("Helvetica").fontSize(9)
+            .text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 })
+            .text(`Cliente: ${sanitizePdfText(primary)}`, 42, doc.y, { width: 511 });
+          doc.moveDown(0.4);
+          drawTableHeader();
+        };
+
+        // Divide incluso palabras largas sin espacios. Así ninguna celda puede
+        // forzar saltos automáticos de PDFKit mientras se dibujan otras columnas.
+        const wrapCell = (value: string, width: number): string[] => {
+          const result: string[] = [];
+          for (const paragraph of value.split(/\r?\n/)) {
+            let current = "";
+            for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+              const candidate = current ? `${current} ${word}` : word;
+              if (doc.widthOfString(candidate) <= width) { current = candidate; continue; }
+              if (current) { result.push(current); current = ""; }
+              for (const char of word) {
+                if (current && doc.widthOfString(current + char) > width) {
+                  result.push(current);
+                  current = "";
+                }
+                current += char;
+              }
+            }
+            result.push(current);
+          }
+          return result.length ? result : [""];
+        };
+        const drawRow = (cells: string[], selection = false) => {
+          const font = selection ? "Helvetica-Oblique" : "Helvetica";
+          const size = selection ? 8 : 9;
+          doc.font(font).fontSize(size);
+          const wrapped = cells.map((cell, i) => wrapCell(cell, widths[i] - 8));
+          const lineHeight = doc.currentLineHeight(true);
+          const totalLines = Math.max(...wrapped.map((cell) => cell.length));
+          let offset = 0;
+          while (offset < totalLines) {
+            let availableLines = Math.floor((pageBottom() - doc.y - 8) / lineHeight);
+            // Mantener una fila normal completa cuando puede caber en una página;
+            // filas excepcionalmente altas se continúan sin perder texto.
+            if (availableLines < 1 || (offset === 0 && totalLines > availableLines && totalLines * lineHeight + 8 < 570)) {
+              continueReceipt();
+              availableLines = Math.floor((pageBottom() - doc.y - 8) / lineHeight);
+            }
+            const count = Math.min(totalLines - offset, Math.max(1, availableLines));
+            const rowY = doc.y;
+            const rowHeight = Math.max(selection ? 17 : 19, count * lineHeight + 8);
+            doc.fillColor(selection ? "#4B5563" : "#111827").font(font).fontSize(size);
+            wrapped.forEach((cell, i) => {
+              const text = cell.slice(offset, offset + count).join("\n");
+              if (text) doc.text(text, x[i] + 4, rowY, {
+                width: widths[i] - 8, height: count * lineHeight + 1,
+                align: alignments[i], lineGap: 0, paragraphGap: 0,
+              });
+            });
+            doc.moveTo(42, rowY + rowHeight - 4).lineTo(553, rowY + rowHeight - 4)
+              .strokeColor(selection ? "#E5E7EB" : "#D1D5DB").stroke();
+            doc.y = rowY + rowHeight;
+            offset += count;
+            if (offset < totalLines) continueReceipt();
+          }
+        };
+
+        // Reservar encabezado y primera fila; el resto pagina fila por fila.
+        doc.font("Helvetica").fontSize(10);
+        const headerHeight = 100 + doc.heightOfString(`Cliente: ${sanitizePdfText(primary)}`, { width: 511 })
+          + (secondary ? doc.heightOfString(`Propietario: ${sanitizePdfText(secondary)}`, { width: 511 }) : 0)
+          + (first.address ? doc.heightOfString(`Dirección: ${sanitizePdfText(first.address)}`, { width: 511 }) : 0);
+        if (doc.y > doc.page.margins.top && doc.y + headerHeight + 25 > pageBottom()) doc.addPage();
 
         // text() con x y width explícitos evita que el centrado herede el ancho
         // de la columna anterior al imprimir varios comprobantes en una página.
@@ -184,7 +273,6 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
         doc.moveDown(0.35);
         doc.fillColor("#111827").font("Helvetica").fontSize(10);
         doc.text(`Nro. de comprobante: ${String(first.receipt_number).padStart(6, "0")}`, 42, doc.y, { width: 511 });
-        const { primary, secondary } = formatClientDisplayName(first);
         doc.text(`Cliente: ${sanitizePdfText(primary)}`);
         if (secondary) {
           doc.text(`Propietario: ${sanitizePdfText(secondary)}`);
@@ -193,50 +281,27 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
         if (first.address) doc.text(`Dirección: ${sanitizePdfText(first.address)}`);
         doc.moveDown(0.45);
 
-        const x = [42, 215, 315, 380, 470];
-        const widths = [173, 100, 65, 90, 83];
-        const headerY = doc.y;
-        doc.rect(42, headerY, 511, 18).fill("#001428");
-        doc.fillColor("white").font("Helvetica-Bold").fontSize(8);
-        const headerAlignments: PDFKit.Mixins.TextOptions["align"][] = ["left", "left", "center", "right", "right"];
-        ["Producto", "Presentación", "Cantidad", "Precio unitario", "Subtotal"].forEach((label, i) =>
-          doc.text(label, x[i] + 4, headerY + 5, { width: widths[i] - 8, align: headerAlignments[i] })
-        );
-        doc.y = headerY + 23;
+        drawTableHeader();
 
         for (const line of order) {
           const isCombo = line.selections && line.selections.length > 0;
           const rawName = isCombo ? `${line.product_name_snapshot} (Combo)` : line.product_name_snapshot;
           const displayName = sanitizePdfText(rawName);
-          const rowY = doc.y;
-
-          doc.fillColor("#111827").font("Helvetica").fontSize(9);
-          doc.text(displayName, x[0] + 4, rowY, { width: widths[0] - 8 });
-          doc.text(sanitizePdfText(line.presentation_name_snapshot), x[1] + 4, rowY, { width: widths[1] - 8 });
-          doc.text(String(line.quantity), x[2] + 4, rowY, { width: widths[2] - 8, align: "center" });
-          doc.text(money(line.unit_price_cents_snapshot), x[3] + 4, rowY, { width: widths[3] - 8, align: "right" });
-          doc.text(money(line.subtotal_cents), x[4] + 4, rowY, { width: widths[4] - 8, align: "right" });
-          doc.moveTo(42, rowY + 15).lineTo(553, rowY + 15).strokeColor("#D1D5DB").stroke();
-          doc.y = rowY + 19;
+          drawRow([displayName, sanitizePdfText(line.presentation_name_snapshot), String(line.quantity),
+            money(line.unit_price_cents_snapshot), money(line.subtotal_cents)]);
 
           // Desglose de ítems incluidos en el combo
           if (isCombo) {
             for (const sel of line.selections) {
-              const selY = doc.y;
-              doc.fillColor("#4B5563").font("Helvetica-Oblique").fontSize(8);
-              doc.text(`   • ${sanitizePdfText(sel.product_name_snapshot)}`, x[0] + 4, selY, { width: widths[0] - 8 });
-              doc.text(sanitizePdfText(sel.presentation_name_snapshot), x[1] + 4, selY, { width: widths[1] - 8 });
-              doc.text(String(sel.quantity), x[2] + 4, selY, { width: widths[2] - 8, align: "center" });
-              doc.text("-", x[3] + 4, selY, { width: widths[3] - 8, align: "right" });
-              doc.text("-", x[4] + 4, selY, { width: widths[4] - 8, align: "right" });
-              doc.moveTo(42, selY + 13).lineTo(553, selY + 13).strokeColor("#E5E7EB").stroke();
-              doc.y = selY + 17;
+              drawRow([`   • ${sanitizePdfText(sel.product_name_snapshot)}`, sanitizePdfText(sel.presentation_name_snapshot),
+                String(sel.quantity), "-", "-"], true);
             }
           }
         }
 
+        if (doc.y + 45 > pageBottom()) continueReceipt();
         doc.moveDown(0.25);
-        doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(`TOTAL: ${money(first.total_cents)}`, { align: "right" });
+        doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(`TOTAL: ${money(first.total_cents)}`, 42, doc.y, { width: 511, align: "right" });
         doc.moveDown(0.45);
         doc.dash(3, { space: 3 }).moveTo(42, doc.y).lineTo(553, doc.y).strokeColor("#6B7280").stroke().undash();
         doc.moveDown(0.55);

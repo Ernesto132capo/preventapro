@@ -575,7 +575,7 @@ export async function upsertProductFromServer(serverProduct: any) {
   );
 
   // Si el producto local tiene cambios pendientes de subir, no sobreescribir
-  if (localMatch && localMatch.sync_status === "pending") {
+  if (localMatch && localMatch.sync_status !== "synced") {
     return;
   }
 
@@ -607,8 +607,8 @@ export async function upsertProductFromServer(serverProduct: any) {
   );
 
   const existingPresentations = await db.getAllAsync<any>(
-    `SELECT id, server_id, name FROM product_presentations WHERE product_id = ?`,
-    [targetId]
+    `SELECT id, server_id, name FROM product_presentations WHERE product_id = ? OR product_id = ?`,
+    [targetId, serverProduct.id]
   );
 
   const serverPresList = serverProduct.presentations || [];
@@ -677,6 +677,7 @@ export async function upsertProductFromServer(serverProduct: any) {
     );
 
     if (Array.isArray(cd.options)) {
+      await db.runAsync(`UPDATE combo_options SET active = 0 WHERE combo_id = ?`, [targetDefId]);
       for (const co of cd.options) {
         const localPres = await db.getFirstAsync<{ id: string }>(
           `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
@@ -767,7 +768,7 @@ export async function resolveServerPresentationId(localId: string): Promise<stri
     }
   }
 
-  return localId;
+  return null;
 }
 
 export async function getPresentationsByIds(ids: string[]): Promise<Map<string, Presentation>> {

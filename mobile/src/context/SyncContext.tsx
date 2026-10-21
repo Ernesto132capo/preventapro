@@ -1,9 +1,10 @@
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { AppState, AppStateStatus } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
-import { runSync, pushOnlySync, SyncResult } from "../services/sync";
-import { countPending, getFailedErrors, discardFailed } from "../db/outbox";
+import { runSync, pushOnlySync, SyncResult, withSyncMaintenance, resetSyncCooldown } from "../services/sync";
+import { countPending, getFailedErrors, discardFailed, purgeCompletedOutbox } from "../db/outbox";
 import { resetLocalDatabase } from "../db/client";
+import { BackupInfo, createLocalBackup, restoreLocalBackup } from "../services/localBackup";
 import { useAuth } from "./AuthContext";
 
 export type ConnectionState = "online" | "offline" | "syncing";
@@ -20,7 +21,9 @@ interface SyncContextValue {
   /** Solo push del outbox — usar despues de crear/editar un registro local */
   pushSync: () => Promise<void>;
   discardFailedItems: () => Promise<void>;
-  resetLocalData: () => Promise<void>;
+  backupLocalData: () => Promise<BackupInfo>;
+  restoreLocalData: (uri: string) => Promise<void>;
+  resetLocalData: () => Promise<BackupInfo>;
 }
 
 const SyncContext = createContext<SyncContextValue | undefined>(undefined);
@@ -35,7 +38,8 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const [syncTick, setSyncTick] = useState(0);
 
   // Refs para evitar stale closures en el timer y el listener de AppState
-  const syncingRef = useRef(false);
+  const activeTaskRef = useRef<Promise<void> | null>(null);
+  const lastPurgeRef = useRef(0);
   const pendingPushRef = useRef(false);
   const isConnectedRef = useRef(true);
   const isActiveRef = useRef(true);   // false cuando la app esta en background
@@ -48,6 +52,10 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const applyResult = useCallback(async (result: SyncResult) => {
+    if (result.ok && Date.now() - lastPurgeRef.current > 86_400_000) {
+      await purgeCompletedOutbox();
+      lastPurgeRef.current = Date.now();
+    }
     await refreshPendingCount();
     const failedRows = await getFailedErrors();
     if (result.ok && failedRows.length === 0) {
@@ -79,75 +87,104 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
    * Sync completo via ref — siempre llama la version actual aunque el timer
    * tenga una closure antigua. Seguro de usar dentro de setInterval.
    */
-  const runForceSyncRef = useRef(async (forcePull = false) => {
-    if (!userRef.current || syncingRef.current || !isConnectedRef.current) return;
-    syncingRef.current = true;
-    setConnection("syncing");
-    try {
-      const result = await runSync(userRef.current.id, { forcePull });
-      await applyResultRef.current(result);
-    } catch (err: any) {
-      await refreshPendingCount();
-      setLastError(err?.message || "Fallo la sincronizacion.");
-      setConnection(isConnectedRef.current ? "online" : "offline");
-    } finally {
-      syncingRef.current = false;
-      if (pendingPushRef.current && userRef.current) {
-        pendingPushRef.current = false;
-        pushOnlySync(userRef.current.id).then(
-          (r) => applyResultRef.current(r),
-          () => {}
-        );
-      }
+  const startSyncRef = useRef<(mode: "full" | "push", forcePull?: boolean) => Promise<void>>(async () => {});
+  startSyncRef.current = (mode, forcePull = false) => {
+    if (activeTaskRef.current) {
+      if (mode === "push") pendingPushRef.current = true;
+      return activeTaskRef.current;
     }
+    const userId = userRef.current?.id;
+    if (!userId || !isConnectedRef.current) return refreshPendingCount();
+    setConnection("syncing");
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        let result = mode === "full" ? await runSync(userId, { forcePull }) : await pushOnlySync(userId);
+        if (userRef.current?.id === userId) await applyResultRef.current(result);
+        // Mantener el mismo lock también durante los envíos solicitados mientras había un pull.
+        while (pendingPushRef.current && userRef.current?.id === userId && isConnectedRef.current) {
+          pendingPushRef.current = false;
+          result = await pushOnlySync(userId);
+          if (userRef.current?.id === userId) await applyResultRef.current(result);
+        }
+      } catch (err: any) {
+        await refreshPendingCount();
+        setLastError(err?.message || "Falló la sincronización.");
+        setConnection(isConnectedRef.current ? "online" : "offline");
+      } finally {
+        if (activeTaskRef.current === task) activeTaskRef.current = null;
+      }
+    })();
+    activeTaskRef.current = task;
+    return task;
+  };
+  const runForceSyncRef = useRef(async (forcePull = false) => {
+    await startSyncRef.current("full", forcePull);
   });
 
   /** forceSync expuesto al exterior (para botones manuales, reabrir jornada, etc.) */
   const forceSync = useCallback(async () => {
-    // Anticoncurrencia: si ya hay una sincronización en vuelo, ignorar taps adicionales
-    if (syncingRef.current) return;
+    // El llamador espera la sincronización real antes de cerrar una jornada o recargar datos.
+    if (activeTaskRef.current) await activeTaskRef.current.catch(() => undefined);
     await runForceSyncRef.current(true);
   }, []);
 
   /** pushSync: solo push del outbox sin pull de catalogo.
    *  Usar despues de crear/editar clientes, productos o preventas. */
   const pushSync = useCallback(async () => {
-    if (!userRef.current) return;
-    if (syncingRef.current) {
-      pendingPushRef.current = true;  // will run after current sync finishes
-      return;
-    }
-    syncingRef.current = true;
-    setConnection("syncing");
-    try {
-      const result = await pushOnlySync(userRef.current.id);
-      await applyResultRef.current(result);
-    } catch (err: any) {
-      await refreshPendingCount();
-      setLastError(err?.message || "Fallo la sincronizacion.");
-      setConnection(isConnectedRef.current ? "online" : "offline");
-    } finally {
-      syncingRef.current = false;
-      if (pendingPushRef.current) {
-        pendingPushRef.current = false;
-        // Schedule the pending push on next tick to avoid recursion
-        setTimeout(() => { void pushSync(); }, 50);
+    await startSyncRef.current("push");
+  }, []);
+
+  const maintainLocalData = useCallback(async <T,>(operation: () => Promise<T>): Promise<T> => {
+    const previous = activeTaskRef.current;
+    let value!: T;
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        if (previous) await previous.catch(() => undefined);
+        setConnection("syncing");
+        value = await withSyncMaintenance(operation);
       }
-    }
-  }, [refreshPendingCount]);
+      finally {
+        if (activeTaskRef.current === task) activeTaskRef.current = null;
+        setConnection(isConnectedRef.current ? "online" : "offline");
+      }
+    })();
+    activeTaskRef.current = task;
+    await task;
+    return value;
+  }, []);
 
   const discardFailedItems = useCallback(async () => {
-    await discardFailed();
+    await maintainLocalData(async () => { await createLocalBackup(); await discardFailed(); });
     await refreshPendingCount();
     setLastError(null);
-  }, [refreshPendingCount]);
+  }, [refreshPendingCount, maintainLocalData]);
+
+  const backupLocalData = useCallback(() => maintainLocalData(createLocalBackup), [maintainLocalData]);
+
+  const restoreLocalData = useCallback(async (uri: string) => {
+    await maintainLocalData(async () => {
+      await createLocalBackup(async (db) => { await restoreLocalBackup(uri, db); });
+      resetSyncCooldown();
+    });
+    await refreshPendingCount();
+    setLastError(null);
+    setSyncTick((tick) => tick + 1);
+  }, [maintainLocalData, refreshPendingCount]);
 
   const resetLocalData = useCallback(async () => {
-    await resetLocalDatabase();
+    const backup = await maintainLocalData(async () => {
+      const saved = await createLocalBackup((db) => resetLocalDatabase(db));
+      resetSyncCooldown();
+      return saved;
+    });
     setLastError(null);
     await refreshPendingCount();
-    await runForceSyncRef.current();
-  }, [refreshPendingCount]);
+    setSyncTick((tick) => tick + 1);
+    await runForceSyncRef.current(true);
+    return backup;
+  }, [refreshPendingCount, maintainLocalData]);
 
   // Detectar cambios de conectividad
   useEffect(() => {
@@ -206,7 +243,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <SyncContext.Provider
-      value={{ connection, isSyncing: connection === "syncing", pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, resetLocalData }}
+      value={{ connection, isSyncing: connection === "syncing", pendingCount, lastSyncedAt, lastError, syncTick, forceSync, pushSync, discardFailedItems, backupLocalData, restoreLocalData, resetLocalData }}
     >
       {children}
     </SyncContext.Provider>

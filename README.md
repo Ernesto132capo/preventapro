@@ -95,6 +95,8 @@ npm run migrate
 > 5. Compatibilidad de nombres de clientes y propietarios.
 > 6. Alias de acceso legibles para David y Yuma.
 > 7. Sesiones revocables por dispositivo (`user_sessions`).
+> 8. Normalización de nombres de clientes existentes.
+> 9. Registro de jornadas eliminadas (`009_sync_tombstones`) para propagar sus bajas a otros teléfonos.
 > Se puede ejecutar múltiples veces seguidas de manera completamente segura.
 
 #### c. Configuración de Contraseñas de Preventistas
@@ -175,6 +177,20 @@ Las pruebas cubren:
 - Contratos de selección de combos configurables (`combos.test.ts`).
 - Deduplicación, ordenamiento por prioridad y ciclo de vida del Outbox (`performance_features.test.ts`).
 - Invariantes de jornadas laborales abiertas, cerradas y auto-cierre de fechas anteriores (`performance_features.test.ts`).
+- Pérdida de confirmaciones HTTP, protección de cambios pendientes, rollback del outbox y jornadas históricas offline (`sync_integrity_sqlite.test.ts`).
+- Respaldos, restauración transaccional, reintentos y retención del outbox (`local_backup_outbox.test.ts`).
+
+Las pruebas que usan SQLite real requieren Node.js 24. En versiones sin `node:sqlite` se omiten esos casos; para una verificación completa utiliza Node.js 24.
+
+#### Respaldos y mantenimiento local
+
+En **Mi cuenta → Guardar respaldo** se crea una copia de los datos de trabajo, incluidas las preventas y operaciones pendientes. Puedes guardarla en una carpeta de Android para conservarla después de reinstalar la app. No incluye contraseñas ni tokens.
+
+En **Mi cuenta → Restaurar respaldo** puedes elegir una copia local o importar las copias de una carpeta. La app valida el archivo, respalda los datos actuales y restaura todo en una transacción. Los cambios pendientes restaurados se procesan en la próxima sincronización.
+
+**Reiniciar datos locales** y **Descartar pendientes con error** guardan un respaldo antes de actuar. Si el respaldo falla, no se ejecuta la operación. Antes de reiniciar una copia con cambios pendientes, guarda también el archivo en una carpeta externa si necesitas conservarlo fuera de la app.
+
+El mantenimiento automático solo elimina eventos `done` del outbox cuya confirmación tenga más de 30 días. Conserva pedidos, clientes, jornadas y eventos pendientes o con error. Los errores temporales se reintentan sin límite de intentos, con esperas de 30 segundos a 15 minutos; las validaciones permanentes requieren corrección o descarte explícito.
 
 #### e. Generar un APK para instalación directa
 

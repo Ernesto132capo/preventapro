@@ -7,8 +7,8 @@ export { migrateClientsTableIfNeeded };
 let dbInstance: SQLite.SQLiteDatabase | null = null;
 let dbInitialization: Promise<SQLite.SQLiteDatabase> | null = null;
 
-// v1: columnas de sincronización; v2: tablas de combos/selecciones; v3: retiro de stock; v4: flexibilidad nombre/propietario cliente.
-const DATABASE_SCHEMA_VERSION = 4;
+// v1: sync; v2: combos; v3: retiro de stock; v4: nombres flexibles; v5: reintentos y retención del outbox.
+const DATABASE_SCHEMA_VERSION = 5;
 
 type ColumnMigration = { name: string; definition: string };
 
@@ -22,7 +22,11 @@ const REQUIRED_ADDITIVE_COLUMNS: Record<string, ColumnMigration[]> = {
     { name: "updated_at", definition: "TEXT" },
   ],
   products: [{ name: "product_type", definition: "TEXT NOT NULL DEFAULT 'standard'" }],
-  outbox: [{ name: "operation", definition: "TEXT NOT NULL DEFAULT 'create'" }],
+  outbox: [
+    { name: "operation", definition: "TEXT NOT NULL DEFAULT 'create'" },
+    { name: "next_retry_at", definition: "TEXT" },
+    { name: "completed_at", definition: "TEXT" },
+  ],
 };
 
 const REQUIRED_COLUMNS: Record<string, string[]> = {
@@ -56,7 +60,7 @@ const REQUIRED_COLUMNS: Record<string, string[]> = {
   order_items: ["id", "order_id", "product_id", "presentation_id", "product_name_snapshot", "sku_snapshot", "presentation_name_snapshot", "unit_equivalence_snapshot", "unit_price_cents_snapshot", "quantity", "subtotal_cents"],
   order_item_selections: ["id", "order_item_id", "selected_product_id", "selected_presentation_id", "product_name_snapshot", "presentation_name_snapshot", "quantity", "sort_order"],
   product_favorites: ["product_id", "created_at"],
-  outbox: ["id", "entity_type", "operation", "local_entity_id", "priority", "status", "attempts", "last_error", "created_at"],
+  outbox: ["id", "entity_type", "operation", "local_entity_id", "priority", "status", "attempts", "last_error", "next_retry_at", "completed_at", "created_at"],
 };
 
 async function tableColumnNames(db: SQLite.SQLiteDatabase, table: string): Promise<Set<string>> {
@@ -192,9 +196,9 @@ export function nowIso(): string {
 }
 
 /** Borra solo la copia local para recuperar una cola offline corrupta. */
-export async function resetLocalDatabase(): Promise<void> {
-  const db = await getDb();
-  await withTx(async () => {
+export async function resetLocalDatabase(existingDb?: SQLite.SQLiteDatabase): Promise<void> {
+  const db = existingDb || await getDb();
+  const clear = async () => {
     // Ordenado de dependientes a principales; no toca el servidor ni la sesión.
     await db.runAsync(`DELETE FROM order_item_selections`);
     await db.runAsync(`DELETE FROM order_items`);
@@ -209,7 +213,9 @@ export async function resetLocalDatabase(): Promise<void> {
     await db.runAsync(`DELETE FROM work_days`);
     await db.runAsync(`DELETE FROM categories`);
     await db.runAsync(`DELETE FROM meta`);
-  }, db);
+  };
+  if (existingDb) await clear();
+  else await withTx(clear, db);
 }
 
 

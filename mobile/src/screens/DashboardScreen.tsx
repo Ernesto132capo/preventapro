@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, ScrollView, StyleSheet, RefreshControl, Alert, Modal, Pressable, TextInput } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
@@ -14,10 +14,11 @@ import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
 import { apiFetch, fetchActiveSessions, revokeOtherSessions, revokeSessionById, UserSessionInfo } from "../services/api";
 import { countUnresolvedOutboxItems } from "../db/outbox";
+import { BackupInfo, listLocalBackups, exportLocalBackup, importLocalBackups } from "../services/localBackup";
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
-  const { connection, pendingCount, forceSync, lastError, discardFailedItems, resetLocalData, syncTick } = useSync();
+  const { connection, pendingCount, forceSync, lastError, discardFailedItems, resetLocalData, backupLocalData, restoreLocalData, syncTick } = useSync();
   const navigation = useNavigation<any>();
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
@@ -31,6 +32,62 @@ export function DashboardScreen() {
   const [showSessionsModal, setShowSessionsModal] = useState(false);
   const [sessions, setSessions] = useState<UserSessionInfo[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
+  const [showBackups, setShowBackups] = useState(false);
+  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const backupBusyRef = useRef(false);
+
+  async function backupAction(action: () => Promise<void>) {
+    if (backupBusyRef.current) return;
+    backupBusyRef.current = true;
+    setBackupBusy(true);
+    try { await action(); }
+    catch (error: any) { Alert.alert("Respaldo de datos", error?.message || "No se pudo completar la operación. Tus datos se conservan."); }
+    finally { backupBusyRef.current = false; setBackupBusy(false); }
+  }
+
+  function saveBackup() {
+    void backupAction(async () => {
+      const saved = await backupLocalData();
+      Alert.alert("Respaldo creado", `${saved.orderCount} preventa(s) y ${saved.pendingCount} cambio(s) pendientes guardados en este teléfono. Guarda también una copia en una carpeta para conservarla si reinstalas la app.`, [
+        { text: "Listo" },
+        { text: "Guardar en carpeta", onPress: () => { void backupAction(async () => {
+          if (await exportLocalBackup(saved.uri)) Alert.alert("Copia guardada", "El respaldo se guardó en la carpeta elegida.");
+        }); } },
+      ]);
+    });
+  }
+
+  function openBackups() {
+    void backupAction(async () => {
+      setBackups(await listLocalBackups());
+      setShowUserModal(false);
+      setShowBackups(true);
+    });
+  }
+
+  function confirmRestore(saved: BackupInfo) {
+    Alert.alert("Restaurar respaldo", `Se reemplazarán los datos de este teléfono por la copia del ${new Date(saved.createdAt).toLocaleString("es-BO")}. Contiene ${saved.orderCount} preventa(s) y ${saved.pendingCount} cambio(s) pendientes. Antes se guardará otra copia de los datos actuales. El servidor no se modifica hasta sincronizar.`, [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Restaurar", onPress: () => { void backupAction(async () => {
+        await restoreLocalData(saved.uri);
+        setShowBackups(false);
+        await load();
+        Alert.alert("Respaldo restaurado", "Los datos están disponibles en este teléfono. Los cambios pendientes se enviarán en la próxima sincronización.");
+      }); } },
+    ]);
+  }
+
+  function confirmReset() {
+    Alert.alert("Reiniciar datos locales", "Primero se guardará y verificará un respaldo recuperable. Después se vaciará la copia local y se intentará descargar los datos del servidor. Los cambios que aún no se subieron quedarán en el respaldo.", [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Respaldar y reiniciar", style: "destructive", onPress: () => { void backupAction(async () => {
+        const saved = await resetLocalData();
+        await load();
+        Alert.alert("Datos locales reiniciados", `Respaldo guardado con ${saved.orderCount} preventa(s). Si faltan datos, usa Mi cuenta → Restaurar respaldo, o sincroniza cuando tengas conexión.`);
+      }); } },
+    ]);
+  }
 
   async function loadSessions() {
     setLoadingSessions(true);
@@ -304,7 +361,8 @@ export function DashboardScreen() {
 
       <Modal visible={showUserModal} transparent animationType="fade" onRequestClose={() => setShowUserModal(false)}>
         <Pressable style={styles.modalOverlay} onPress={() => setShowUserModal(false)}>
-          <Pressable style={styles.modalCard} onPress={(e) => e.stopPropagation()}>
+          <Pressable style={[styles.modalCard, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+            <ScrollView keyboardShouldPersistTaps="handled" style={{ flexShrink: 1 }}>
             <Text style={styles.modalTitle}>Mi cuenta</Text>
             <View style={{ marginTop: spacing.md }}>
               <Text style={styles.modalLabel}>Código de preventista</Text>
@@ -352,9 +410,40 @@ export function DashboardScreen() {
               onPress={openSessionsModal}
               style={{ marginTop: spacing.sm }}
             />
+            <Button label="Guardar respaldo" variant="outline" onPress={saveBackup} disabled={backupBusy} style={{ marginTop: spacing.sm }} />
+            <Button label="Restaurar respaldo" variant="outline" onPress={openBackups} disabled={backupBusy} style={{ marginTop: spacing.sm }} />
             <Button label="Cerrar" variant="outline" onPress={() => setShowUserModal(false)} style={{ marginTop: spacing.sm }} />
+            </ScrollView>
           </Pressable>
         </Pressable>
+      </Modal>
+
+      <Modal visible={showBackups} transparent animationType="fade" onRequestClose={() => { if (!backupBusy) setShowBackups(false); }}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { maxHeight: "90%" }]}>
+            <Text style={styles.modalTitle}>Respaldos locales</Text>
+            <Text style={styles.statsHint}>Las copias incluyen preventas y cambios pendientes. No contienen contraseñas ni sesiones.</Text>
+            <ScrollView style={{ marginTop: spacing.md, flexShrink: 1 }} keyboardShouldPersistTaps="handled">
+              {backups.length === 0 && <Text style={styles.modalLabel}>Todavía no hay respaldos guardados en este teléfono.</Text>}
+              {backups.map((saved) => (
+                <View key={saved.uri} style={{ marginBottom: spacing.md }}>
+                  <Text style={styles.modalValue}>{new Date(saved.createdAt).toLocaleString("es-BO")}</Text>
+                  <Text style={styles.statsHint}>{saved.orderCount} preventa(s) · {saved.pendingCount} cambio(s) pendientes</Text>
+                  <Button label="Restaurar esta copia" variant="outline" disabled={backupBusy} onPress={() => confirmRestore(saved)} style={{ marginTop: spacing.xs }} />
+                  <Button label="Guardar en carpeta" variant="outline" disabled={backupBusy} onPress={() => { void backupAction(async () => {
+                    if (await exportLocalBackup(saved.uri)) Alert.alert("Copia guardada", "El respaldo se guardó en la carpeta elegida.");
+                  }); }} style={{ marginTop: spacing.xs }} />
+                </View>
+              ))}
+            </ScrollView>
+            <Button label="Importar desde carpeta" variant="outline" disabled={backupBusy} onPress={() => { void backupAction(async () => {
+              const imported = await importLocalBackups();
+              setBackups(await listLocalBackups());
+              if (imported > 0) Alert.alert("Copias importadas", `${imported} respaldo(s) disponible(s) para restaurar.`);
+            }); }} style={{ marginTop: spacing.sm }} />
+            <Button label="Cerrar" variant="outline" disabled={backupBusy} onPress={() => setShowBackups(false)} style={{ marginTop: spacing.sm }} />
+          </View>
+        </View>
       </Modal>
 
       <Modal visible={showCounterModal} transparent animationType="fade" onRequestClose={() => setShowCounterModal(false)}>
@@ -492,13 +581,9 @@ export function DashboardScreen() {
           />
           <Button
             label="Reiniciar datos locales"
-            onPress={() => Alert.alert(
-              "Reiniciar datos locales",
-              "Se borrarán las preventas y cola guardadas solo en este teléfono. El servidor no se modifica.",
-              [{ text: "Cancelar", style: "cancel" }, { text: "Reiniciar", style: "destructive", onPress: async () => { await resetLocalData(); await load(); Alert.alert("Datos locales reiniciados", "La app descargó nuevamente los datos del servidor."); } }]
-            )}
+            onPress={confirmReset}
             variant="danger"
-            disabled={isSyncing}
+            disabled={isSyncing || backupBusy}
             style={{ marginTop: spacing.sm }}
           />
         </Card>
@@ -518,7 +603,10 @@ export function DashboardScreen() {
           />
           <Button
             label="Descartar pendientes con error"
-            onPress={discardFailedItems}
+            onPress={() => Alert.alert("Descartar errores de validación", "Se guardará un respaldo antes de descartar los registros con error permanente. Los errores de conexión seguirán pendientes.", [
+              { text: "Cancelar", style: "cancel" },
+              { text: "Respaldar y descartar", style: "destructive", onPress: () => { void backupAction(discardFailedItems); } },
+            ])}
             variant="outline"
             disabled={isSyncing}
             style={{ marginTop: spacing.sm }}

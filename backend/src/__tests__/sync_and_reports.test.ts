@@ -1331,6 +1331,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
           if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
           if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (clean.includes("SELECT id, user_id FROM orders WHERE idempotency_key = $1")) return { rows: [] };
+          if (clean.includes("SELECT id FROM work_days WHERE status = 'open' AND id !=")) return { rows: [] };
           if (clean.includes("FROM work_days")) {
             return { rows: [{ id: "wd-test-1", active: true, status: "open", user_id: "usr-test-1" }] };
           }
@@ -1573,6 +1574,7 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
           if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
           if (clean.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (clean.includes("SELECT id, user_id FROM orders WHERE idempotency_key = $1")) return { rows: [] };
+          if (clean.includes("SELECT id FROM work_days WHERE status = 'open' AND id !=")) return { rows: [] };
           if (clean.includes("FROM work_days")) {
             return { rows: [{ id: "wd-test-1", active: true, status: "open", user_id: "usr-test-1" }] };
           }

@@ -24,6 +24,7 @@ import { CartLine, CartLineSelection, Category, Client, Presentation, Product, W
 import { formatClientDisplayName } from "../domain/client-display";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
+import { resolveSelectedPresentation } from "../utils/catalogSelection";
 import { apiFetch, ApiError } from "../services/api";
 import { useDebounce } from "../utils/useDebounce";
 
@@ -47,7 +48,7 @@ export function NewSaleScreen() {
   const route = useRoute<any>();
   const isFocused = useIsFocused();
   const { user } = useAuth();
-  const { forceSync, pushSync } = useSync();
+  const { forceSync, pushSync, syncTick } = useSync();
 
   const editingOrderId = route.params?.orderId as string | undefined;
   const isEditing = Boolean(editingOrderId);
@@ -150,11 +151,11 @@ export function NewSaleScreen() {
 
   useEffect(() => {
     if (isFocused) void loadClients();
-  }, [isFocused, loadClients]);
+  }, [isFocused, loadClients, syncTick]);
 
   useEffect(() => {
     if (isFocused) void loadProducts();
-  }, [isFocused, loadProducts]);
+  }, [isFocused, loadProducts, syncTick]);
 
   async function handleReopen() {
     if (!workDay) return;
@@ -1016,12 +1017,17 @@ const ProductPickerItem = React.memo(function ProductPickerItem({
   onConfigureCombo: (p: ProductWithPresentations, pres: Presentation) => void;
   onToggleFavorite: (id: string) => void;
 }) {
-  const [selectedPres, setSelectedPres] = useState<Presentation | null>(product.presentations[0] || null);
+  // Guardar solo el ID: el objeto y su precio siempre vienen del catálogo actual.
+  const [selectedPresentationId, setSelectedPresentationId] = useState<string | null>(product.presentations[0]?.id ?? null);
+  const selectedPres = useMemo(
+    () => resolveSelectedPresentation(product.presentations, selectedPresentationId),
+    [product.presentations, selectedPresentationId]
+  );
   const [qty, setQty] = useState("1");
   const isCombo = product.product_type === "combo";
 
   useEffect(() => {
-    setSelectedPres(product.presentations[0] || null);
+    setSelectedPresentationId(product.presentations[0]?.id ?? null);
     setQty("1");
   }, [product.id]);
 
@@ -1050,7 +1056,7 @@ const ProductPickerItem = React.memo(function ProductPickerItem({
           <Pressable
             key={p.id}
             onPress={() => {
-              setSelectedPres(p);
+              setSelectedPresentationId(p.id);
               setQty("1");
             }}
             style={[styles.presChoice, selectedPres?.id === p.id && styles.presChoiceActive]}

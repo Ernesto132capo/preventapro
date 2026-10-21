@@ -4,6 +4,7 @@ node_modules/
 *.db-wal
 dist/
 .expo/
+.jest-cache/
 # Configuración de entorno local: versionar únicamente las plantillas.
 .env
 .env.*
@@ -19,3 +20,6 @@ dist/
 *.token
 *.pem
 *.key
+*.jks
+*.keystore
+credentials.json

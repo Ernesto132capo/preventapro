@@ -47,6 +47,7 @@ authRouter.post("/login", loginLimiter, async (req, res, next) => {
 
     const sessionId = randomUUID();
     const resolvedDeviceName = deviceName?.trim() || "Dispositivo Móvil";
+    const accessToken = createAccessToken(user.id, sessionId);
 
     try {
       await pool.query(
@@ -56,10 +57,11 @@ authRouter.post("/login", loginLimiter, async (req, res, next) => {
       );
     } catch (sessionErr) {
       console.warn("No se pudo registrar la sesión en user_sessions:", sessionErr);
+      return res.status(503).json({ error: "No se pudo iniciar la sesión. Intenta de nuevo más tarde." });
     }
 
     return res.json({
-      accessToken: createAccessToken(user.id, sessionId),
+      accessToken,
       sessionId,
       user: { id: user.id, code: user.code, email: user.real_email ?? null, fullName: user.full_name },
     });

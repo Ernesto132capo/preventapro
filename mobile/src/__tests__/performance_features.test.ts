@@ -103,7 +103,7 @@ const mockDb = {
     }
 
     // OUTBOX: markDone con deduplicación y resolución de errores antiguos
-    if (cleanSql.includes("UPDATE outbox SET status = 'done', last_error = NULL WHERE id = ? OR (")) {
+    if (cleanSql.startsWith("UPDATE outbox SET status = 'done'") && cleanSql.includes("WHERE id = ? OR (")) {
       const [targetId] = params;
       const target = mockDbState.outbox.find((r) => r.id === targetId);
       if (target) {
@@ -156,7 +156,7 @@ const mockDb = {
     }
 
     // OUTBOX: deferForDependency
-    if (cleanSql.startsWith("UPDATE outbox SET status = 'pending' WHERE id = ?")) {
+    if (cleanSql.startsWith("UPDATE outbox SET status = 'pending', next_retry_at = NULL WHERE id = ?")) {
       const [id] = params;
       const row = mockDbState.outbox.find((r) => r.id === id);
       if (row) row.status = "pending";
@@ -165,7 +165,7 @@ const mockDb = {
 
     // OUTBOX: deferForRetry
     if (cleanSql.startsWith("UPDATE outbox SET status = 'pending', attempts = attempts + 1")) {
-      const [error, id] = params;
+      const [error, _nextRetryAt, id] = params;
       const row = mockDbState.outbox.find((r) => r.id === id);
       if (row) {
         row.status = "pending";
@@ -293,6 +293,12 @@ const mockDb = {
     }
 
     // ORDERS: upsertOrderFromServer
+    if (cleanSql === "UPDATE orders SET server_id = ?, work_day_id = ? WHERE id = ?") {
+      const [serverId, workDayId, id] = params;
+      const order = mockDbState.orders.find((o) => o.id === id);
+      if (order) { order.server_id = serverId; order.work_day_id = workDayId; }
+      return { changes: order ? 1 : 0 };
+    }
     if (cleanSql.startsWith("INSERT INTO orders") && cleanSql.includes("ON CONFLICT(id) DO UPDATE SET")) {
       const [
         targetOrderId,
@@ -392,6 +398,14 @@ const mockDb = {
   getAllAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
+    if (cleanSql.includes("FROM orders WHERE server_id = ? OR id = ? OR id = ?")) {
+      const [serverId, id, originalId] = params;
+      return mockDbState.orders
+        .filter((o) => o.server_id === serverId || o.id === id || o.id === originalId)
+        .sort((a, b) => Number(b.id === originalId) - Number(a.id === originalId))
+        .map((o) => ({ ...o, server_id: o.server_id ?? null, sync_status: o.sync_status || "synced" }));
+    }
+
     // OUTBOX: listPending
     if (cleanSql.includes("SELECT * FROM outbox WHERE status IN ('pending','syncing','failed')")) {
       return [...mockDbState.outbox]
@@ -441,6 +455,11 @@ const mockDb = {
 
   getFirstAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
+
+    if (cleanSql.startsWith("SELECT attempts FROM outbox WHERE id = ?")) {
+      const row = mockDbState.outbox.find((r) => r.id === params[0]);
+      return row ? { attempts: row.attempts } : null;
+    }
 
     // OUTBOX: countPending
     if (cleanSql.includes("SELECT COUNT(*) as n FROM outbox WHERE status IN ('pending','syncing','failed')")) {
@@ -783,8 +802,8 @@ describe("Outbox deduplication and sorting logic", () => {
 
     // 2. Llega delta con ord-2 actualizada (total 2500) y nueva srv-4 (total 4000)
     const deltaOrders = [
-      { id: "srv-2", work_day_id: "wd-test", client_id: "cli-1", total_cents: 2500, status: "active" },
-      { id: "srv-4", work_day_id: "wd-test", client_id: "cli-1", total_cents: 4000, status: "active" },
+      { id: "srv-2", work_day_id: "wd-test", client_id: "cli-1", total_cents: 2500, status: "active", items: [] },
+      { id: "srv-4", work_day_id: "wd-test", client_id: "cli-1", total_cents: 4000, status: "active", items: [] },
     ];
 
     for (const srvOrder of deltaOrders) {

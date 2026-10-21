@@ -159,6 +159,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   status TEXT NOT NULL DEFAULT 'pending', -- pending | syncing | failed (retryable legacy) | error (permanent) | done
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
+  next_retry_at TEXT,
+  completed_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -205,5 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_order_selections_product ON order_item_selections
 CREATE INDEX IF NOT EXISTS idx_order_selections_presentation ON order_item_selections (selected_presentation_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox (status, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_outbox_entity_local_status ON outbox (entity_type, local_entity_id, status);
+CREATE INDEX IF NOT EXISTS idx_outbox_retry ON outbox (status, next_retry_at, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_completed ON outbox (status, completed_at);
 `;
 

@@ -2,6 +2,7 @@ import { getDb, getMeta, setMeta, withTx } from "../db/client";
 import { apiFetch, ApiError } from "./api";
 import {
   enqueue,
+  enqueueInTx,
   listPending,
   markDone,
   markSyncing,
@@ -21,7 +22,7 @@ import {
   remapCategoryReferences,
 } from "../db/repositories/products";
 import { markOrderSynced, markOrderFailed, upsertOrderFromServerInTx } from "../db/repositories/orders";
-import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay, markWorkDayClosed } from "../db/repositories/workdays";
+import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay } from "../db/repositories/workdays";
 
 export interface SyncResult {
   ok: boolean;
@@ -30,7 +31,7 @@ export interface SyncResult {
   error?: string;
 }
 
-export const SYNC_PROTOCOL_VERSION = "orders-tombstones-v1";
+export const SYNC_PROTOCOL_VERSION = "orders-catalog-tombstones-v2";
 
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
 export async function pullCatalog(userId: string, force = false): Promise<{ clients: number; products: number }> {
@@ -71,7 +72,10 @@ function chunkArray(items: any[], size = 200): any[][] {
   // para que upsertOrderFromServerInTx encuentre siempre su jornada local sin deadlocks de candado.
   if (data.workDay) {
     const todayLocal = await getTodayWorkDay(userId);
-    await upsertServerWorkDay(todayLocal.id, data.workDay);
+    // Un pull sin cambios de hoy puede traer como workDay la última jornada
+    // histórica. No fusionarla con la jornada local de una fecha diferente.
+    const localId = data.workDay.work_date === todayLocal.work_date ? todayLocal.id : data.workDay.id;
+    await upsertServerWorkDay(localId, data.workDay);
   }
 
   if (data.workDays && Array.isArray(data.workDays)) {
@@ -125,7 +129,7 @@ function chunkArray(items: any[], size = 200): any[][] {
             `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
             [cd.product_id, cd.product_id]
           );
-          if (localProd && localProd.sync_status === "pending") {
+          if (localProd && localProd.sync_status !== "synced") {
             continue;
           }
           const targetProdId = localProd ? localProd.id : cd.product_id;
@@ -149,6 +153,16 @@ function chunkArray(items: any[], size = 200): any[][] {
   }
 
   if (data.comboOptions && Array.isArray(data.comboOptions)) {
+    if (data.comboOptionsComplete === true) {
+      await withTx(async (txDb) => {
+        await txDb.runAsync(
+          `UPDATE combo_options SET active = 0 WHERE combo_id IN (
+             SELECT cd.id FROM combo_definitions cd JOIN products p ON (p.id = cd.product_id OR p.server_id = cd.product_id)
+             WHERE cd.sync_status = 'synced' AND p.sync_status = 'synced'
+           )`
+        );
+      });
+    }
     for (const chunk of chunkArray(data.comboOptions, 200)) {
       await withTx(async (txDb) => {
         for (const co of chunk) {
@@ -157,10 +171,13 @@ function chunkArray(items: any[], size = 200): any[][] {
             [co.presentation_id, co.presentation_id]
           );
           const targetPresId = localPres ? localPres.id : co.presentation_id;
-          const localDef = await txDb.getFirstAsync<{ id: string }>(
-            `SELECT id FROM combo_definitions WHERE server_id = ? OR id = ?`,
+          const localDef = await txDb.getFirstAsync<{ id: string; sync_status: string; product_sync_status: string }>(
+            `SELECT cd.id, cd.sync_status, p.sync_status AS product_sync_status FROM combo_definitions cd
+             LEFT JOIN products p ON p.id = cd.product_id OR p.server_id = cd.product_id
+             WHERE cd.server_id = ? OR cd.id = ?`,
             [co.combo_id, co.combo_id]
           );
+          if (localDef && (localDef.sync_status !== "synced" || (localDef.product_sync_status && localDef.product_sync_status !== "synced"))) continue;
           const targetComboId = localDef ? localDef.id : co.combo_id;
           const existingOpt = await txDb.getFirstAsync<{ id: string }>(
             `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
@@ -190,6 +207,32 @@ function chunkArray(items: any[], size = 200): any[][] {
         }
       });
     }
+  }
+
+  if (Array.isArray(data.deletedWorkDayIds)) {
+    await withTx(async (txDb) => {
+      for (const remoteId of data.deletedWorkDayIds) {
+        const days = await txDb.getAllAsync<{ id: string }>(`SELECT id FROM work_days WHERE id = ? OR server_id = ?`, [remoteId, remoteId]);
+        for (const day of days) {
+          const unresolved = await txDb.getFirstAsync<{ id: string }>(
+            `SELECT o.id FROM orders o WHERE o.work_day_id = ? AND (
+               o.sync_status <> 'synced' OR EXISTS (SELECT 1 FROM outbox b WHERE b.entity_type = 'order' AND b.local_entity_id = o.id AND b.status <> 'done')
+             ) LIMIT 1`, [day.id]
+          );
+          if (unresolved) {
+            const message = "La jornada fue eliminada en el servidor. Se conservó la preventa pendiente; restaura la jornada o revisa el respaldo antes de resolver el conflicto.";
+            await txDb.runAsync(`UPDATE work_days SET status = 'closed', sync_status = 'failed' WHERE id = ?`, [day.id]);
+            await txDb.runAsync(`UPDATE orders SET sync_error = ? WHERE work_day_id = ? AND sync_status <> 'synced'`, [message, day.id]);
+            await txDb.runAsync(`UPDATE outbox SET status = 'error', last_error = ? WHERE entity_type = 'order' AND status <> 'done' AND local_entity_id IN (SELECT id FROM orders WHERE work_day_id = ?)`, [message, day.id]);
+            continue;
+          }
+          await txDb.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT oi.id FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.work_day_id = ?)`, [day.id]);
+          await txDb.runAsync(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = ?)`, [day.id]);
+          await txDb.runAsync(`DELETE FROM orders WHERE work_day_id = ?`, [day.id]);
+          await txDb.runAsync(`DELETE FROM work_days WHERE id = ?`, [day.id]);
+        }
+      }
+    });
   }
 
   // Guardar siempre el cursor real del servidor (timestamp más fresco)
@@ -259,6 +302,7 @@ async function reconcileResetServerMappings() {
 async function resolveTodayWorkDay(userId: string) {
   const local = await getTodayWorkDay(userId);
   const res = await apiFetch<any>(`/workdays/current`);
+  if (!res?.workDay) return;
   await upsertServerWorkDay(local.id, res.workDay);
   const db = await getDb();
   const allTodayDays = await db.getAllAsync<{ id: string }>(
@@ -277,6 +321,7 @@ async function pushCategory(row: OutboxRow) {
     if (category.server_id) {
       await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "DELETE" });
     }
+    await db.runAsync(`UPDATE categories SET sync_status = 'synced' WHERE id = ?`, [category.id]);
     return markDone(row.id);
   }
 
@@ -319,11 +364,12 @@ async function pushClient(row: OutboxRow) {
         }
       }
     }
+    await db.runAsync(`UPDATE clients SET sync_status = 'synced' WHERE id = ?`, [client.id]);
     return markDone(row.id);
   }
 
-  const effectiveBusinessName = (client.business_name || client.name || "").trim() || undefined;
-  const effectiveContactName = (client.contact_name || client.owner_name || "").trim() || undefined;
+  const effectiveBusinessName = (client.business_name || client.name || "").trim() || null;
+  const effectiveContactName = (client.contact_name || client.owner_name || "").trim() || null;
 
   const body = {
     clientLocalId: client.id,
@@ -334,10 +380,12 @@ async function pushClient(row: OutboxRow) {
     contact_name: effectiveContactName,
     ownerName: effectiveContactName,
     owner_name: effectiveContactName,
-    phone: client.phone ?? undefined,
-    address: client.address ?? undefined,
-    lat: client.lat ?? undefined,
-    lng: client.lng ?? undefined,
+    phone: client.phone ?? null,
+    address: client.address ?? null,
+    lat: client.lat ?? null,
+    lng: client.lng ?? null,
+    neighborhoodId: client.neighborhood_id ?? null,
+    neighborhoodName: client.neighborhood_name ?? null,
   };
 
   if (client.server_id) {
@@ -365,6 +413,7 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
     if (product.server_id) {
       await apiFetch<any>(`/catalog/products/${product.server_id}`, { method: "DELETE" });
     }
+    await db.runAsync(`UPDATE products SET sync_status = 'synced' WHERE id = ?`, [product.id]);
     await markDone(row.id);
     return "done";
   }
@@ -480,7 +529,7 @@ function isRetryablePushError(err: unknown): boolean {
 function shouldPauseQueue(err: unknown): boolean {
   // Evita disparar una petición por cada fila si la conexión, sesión o servicio está caído.
   if (err instanceof ApiError) {
-    return err.status === 0 || err.status >= 500 || [401, 403, 408, 429].includes(err.status);
+    return err.status === 0 || [401, 403, 429].includes(err.status);
   }
   return false;
 }
@@ -506,9 +555,6 @@ async function markPermanentOutboxFailure(row: OutboxRow, message: string): Prom
 async function recordPushError(row: OutboxRow, err: unknown): Promise<PushOutcome> {
   const message = errorMessage(err);
   if (!(err instanceof ApiError) || isRetryablePushError(err)) {
-    if (row.attempts >= 8) {
-      return markPermanentOutboxFailure(row, `Reintentos agotados (8): ${message}`);
-    }
     await deferForRetry(row.id, message);
     return "deferred";
   }
@@ -539,8 +585,26 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     return "done";
   }
   if (row.operation === "cancel" || order.status === "cancelled") {
-    // Si nunca llegó al servidor, basta con descartar sus operaciones locales.
-    if (order.server_id) await apiFetch<any>(`/orders/${order.server_id}/cancel`, { method: "POST" });
+    let serverOrderId = order.server_id;
+    if (!serverOrderId) {
+      // Una creación pudo confirmarse en PostgreSQL y perder su respuesta antes
+      // de que el vendedor la cancelara. Buscar y cancelar atómicamente por su
+      // UUID original también funciona fuera del historial de 30 jornadas.
+      const batch = await apiFetch<any>(`/sync/push`, {
+        method: "POST",
+        body: { operations: [{ id: order.id, entityType: "order", operation: "cancel", data: { idempotencyKey: order.id } }] },
+      });
+      const result = batch.results?.find((item: any) => item.id === order.id);
+      if (result?.status !== "synced") {
+        throw new ApiError(result?.error || "No se pudo confirmar la cancelación. Se reintentará.", Number(result?.httpStatus) || 503);
+      }
+      serverOrderId = result.serverId;
+      if (serverOrderId) {
+        await db.runAsync(`UPDATE orders SET server_id = ? WHERE id = ?`, [serverOrderId, order.id]);
+      }
+    } else {
+      await apiFetch<any>(`/orders/${serverOrderId}/cancel`, { method: "POST" });
+    }
     await db.runAsync(
       `UPDATE orders SET sync_status = 'synced', sync_error = NULL WHERE id = ?`,
       [order.id]
@@ -550,6 +614,9 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   }
 
   let workDayServerId = await resolveServerWorkDayId(order.work_day_id);
+  const localWorkDay = await db.getFirstAsync<{ work_date: string }>(
+    `SELECT work_date FROM work_days WHERE id = ?`, [order.work_day_id]
+  );
   if (!workDayServerId) {
     try {
       const res = await apiFetch<any>(`/workdays/current`);
@@ -567,7 +634,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   }
 
   const clientServerId = await resolveServerClientId(order.client_id);
-  if (!workDayServerId || !clientServerId) {
+  if ((!workDayServerId && !localWorkDay) || !clientServerId) {
     if (!clientServerId) {
       const failedClient = await getPermanentDependencyError("client", order.client_id);
       if (failedClient) {
@@ -645,13 +712,42 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       paymentCondition: order.payment_condition,
       items: resolvedItems,
     };
-    const res = row.operation === "update" && order.server_id
-      ? await apiFetch<any>(`/orders/${order.server_id}`, { method: "PUT", body })
-      : await apiFetch<any>(`/orders`, {
-          method: "POST",
-          body: { ...body, idempotencyKey: order.id, workDayId: workDayServerId, clientId: clientServerId },
-        });
+    let res: any;
+    if (row.operation === "update" && order.server_id) {
+      res = await apiFetch<any>(`/orders/${order.server_id}`, { method: "PUT", body });
+    } else if (workDayServerId) {
+      res = await apiFetch<any>(`/orders`, {
+        method: "POST",
+        body: { ...body, idempotencyKey: order.id, workDayId: workDayServerId, clientId: clientServerId, createdAt: order.created_at },
+      });
+    } else {
+      // Jornada creada completamente offline, posiblemente en un día anterior.
+      // El endpoint por lote resuelve fecha + pedido en la misma transacción.
+      const batch = await apiFetch<any>(`/sync/push`, {
+        method: "POST",
+        body: { operations: [{
+          id: order.id,
+          entityType: "order",
+          operation: "create",
+          data: { ...body, idempotencyKey: order.id, work_date: localWorkDay!.work_date, clientId: clientServerId, createdAt: order.created_at },
+        }] },
+      });
+      const result = batch.results?.find((item: any) => item.id === order.id) || batch.results?.[0];
+      if (result?.status !== "synced" || !result.serverId) {
+        throw new ApiError(result?.error || "No se pudo sincronizar la jornada offline. La preventa se conserva.", Number(result?.httpStatus) || 503);
+      }
+      if (result.workDay) await upsertServerWorkDay(order.work_day_id, result.workDay);
+      if (!result.workDay || result.deduped) {
+        res = await apiFetch<any>(`/orders/${result.serverId}`);
+        if (res.order?.work_day_id) await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [res.order.work_day_id, order.work_day_id]);
+      } else {
+        res = { order: { id: result.serverId } };
+      }
+    }
     await markOrderSynced(order.id, res.order.id);
+    if (res.order.status === "cancelled") {
+      await withTx((txDb) => upsertOrderFromServerInTx(txDb, res.order));
+    }
     await markDone(row.id);
     return "done";
   } catch (err) {
@@ -659,20 +755,14 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
 
     // Blindaje de jornada concluida / cerrada: evitar bucle infinito de reintentos
     const isClosedWorkdayError =
+      err instanceof ApiError && [400, 409, 422].includes(err.status) &&
       message.toLowerCase().includes("jornada") &&
       (message.toLowerCase().includes("concluida") || message.toLowerCase().includes("cerrada"));
 
     if (isClosedWorkdayError) {
-      console.warn(`[pushOrder] Pedido ${order.id} rechazado por jornada concluida. Rescatando estado...`);
-      const currentWd = await getTodayWorkDay(userId);
-      await markWorkDayClosed(currentWd.id);
-      await db.runAsync(
-        `UPDATE orders SET status = 'cancelled', sync_status = 'failed', sync_error = ? WHERE id = ?`,
-        [message, order.id]
-      );
-      // El estado terminal conserva el error para informar al usuario sin reintentarla.
-      await markPermanentError(row.id, message);
-      return "failed";
+      // Una jornada cerrada es un conflicto de sincronización, nunca una orden
+      // del vendedor de cancelar su preventa. Conservar líneas, estado y cola.
+      return markPermanentOutboxFailure(row, `${message} La preventa se conserva en este teléfono. Reabre la jornada y reintenta sincronizar.`);
     }
 
     if (err instanceof ApiError && err.status === 404) {
@@ -686,6 +776,18 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
 
 /** PUSH: sincroniza primero las entidades padre y después las preventas que dependen de ellas. */
 async function pushOutbox(userId: string): Promise<{ done: number; deferred: number; failed: number }> {
+  // Reparar bases de versiones anteriores que confirmaban el pedido antes de
+  // encolarlo. Un error permanente existente también cuenta como operación.
+  await withTx(async (txDb) => {
+    const orphans = await txDb.getAllAsync<{ id: string; server_id: string | null; status: string }>(
+      `SELECT id, server_id, status FROM orders o WHERE sync_status IN ('pending', 'syncing', 'failed')
+       AND COALESCE(sync_error, '') <> 'Descartado por validación'
+       AND NOT EXISTS (SELECT 1 FROM outbox b WHERE b.entity_type = 'order' AND b.local_entity_id = o.id AND b.status <> 'done')`
+    );
+    for (const order of orphans) {
+      await enqueueInTx(txDb, "order", order.id, 2, order.status === "cancelled" ? "cancel" : order.server_id ? "update" : "create");
+    }
+  });
   const rows = (await listPending()).sort((a, b) =>
     dependencyRank(a) - dependencyRank(b) ||
     a.priority - b.priority ||
@@ -696,6 +798,8 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
 
   for (const row of rows) {
     try {
+      const current = await (await getDb()).getFirstAsync<{ status: string }>(`SELECT status FROM outbox WHERE id = ?`, [row.id]);
+      if (current?.status === "done" || current?.status === "error") continue;
       await markSyncing(row.id);
       if (row.entity_type === "category") {
         await pushCategory(row);
@@ -722,6 +826,7 @@ async function pushOutbox(userId: string): Promise<{ done: number; deferred: num
     const remaining = await listPending();
     for (const row of remaining) {
       if (row.entity_type !== "order") continue;
+      if (outcomes.get(row.id) !== "deferred") continue;
       try {
         await markSyncing(row.id);
         outcomes.set(row.id, await pushOrder(row, userId));
@@ -778,6 +883,17 @@ interface SyncFlight {
 let syncQueue: Promise<void> = Promise.resolve();
 const syncFlights: SyncFlight[] = [];
 
+/** Respaldo/restauración comparten el candado de sync; task no debe invocar runSync. */
+export function withSyncMaintenance<T>(task: () => Promise<T>): Promise<T> {
+  const promise = syncQueue.then(task, task);
+  syncQueue = promise.then(() => undefined, () => undefined);
+  return promise;
+}
+
+export function resetSyncCooldown(): void {
+  lastFullPullAt = 0;
+}
+
 function runSerializedSync(userId: string, mode: SyncMode, task: () => Promise<SyncResult>): Promise<SyncResult> {
   const existing = syncFlights.find(
     (flight) => flight.userId === userId && (flight.mode === "full" || flight.mode === mode)
@@ -808,9 +924,8 @@ export function pushOnlySync(userId: string): Promise<SyncResult> {
 /**
  * Rutina de emergencia/rescate ante conflictos de almacenamiento local o al presionar "Forzar Sincro".
  * - Resuelve la jornada directamente con el servidor omitiendo caché (?fresh=1).
- * - Si la jornada está cerrada en el backend, actualiza la base de datos local y cancela órdenes locales huérfanas sin server_id.
- * - Limpia elementos del outbox trabados con errores permanentes (ej. jornada concluida).
- * - Invalida el cursor de pull local para forzar que el cliente descargue y alinee todos los datos del servidor.
+ * Conserva todas las preventas y sus operaciones, incluso si la jornada remota
+ * cerró mientras el teléfono estaba offline. El servidor evalúa createdAt.
  */
 async function rescueLocalConflict(userId: string) {
   const db = await getDb();
@@ -825,41 +940,9 @@ async function rescueLocalConflict(userId: string) {
       );
       for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 
-      // Si la jornada remota está concluida, cancelar preventas locales colgadas sin server_id
-      if (res.workDay.status === "closed") {
-        const unpushed = await db.getAllAsync<{ id: string }>(
-          `SELECT id FROM orders WHERE (work_day_id = ? OR work_day_id = ?) AND server_id IS NULL`,
-          [local.id, res.workDay.id]
-        );
-        for (const uo of unpushed) {
-          await db.runAsync(
-            `UPDATE orders SET status = 'cancelled', sync_status = 'failed', sync_error = 'Cancelado: la jornada fue concluida por otro usuario' WHERE id = ?`,
-            [uo.id]
-          );
-          await db.runAsync(
-            `UPDATE outbox SET status = 'error', attempts = attempts + 1,
-               last_error = 'Cancelado: la jornada fue concluida por otro usuario'
-             WHERE entity_type = 'order' AND local_entity_id = ?`,
-            [uo.id]
-          );
-        }
-      }
     }
   } catch (e) {
     console.warn("[rescueLocalConflict] Error al verificar jornada fresca:", e);
-  }
-
-  // Limpiar filas de outbox en conflicto irrecuperable
-  try {
-    await db.runAsync(
-      `UPDATE outbox SET status = 'done' WHERE status IN ('failed', 'error') AND (
-        last_error LIKE '%jornada%' OR 
-        last_error LIKE '%concluida%' OR 
-        last_error LIKE '%cerrada%'
-      )`
-    );
-  } catch (e) {
-    console.warn("[rescueLocalConflict] Error limpiando outbox trabado:", e);
   }
 
   // Rescatar filas que hayan quedado en 'error' para que vuelvan a intentar sincronizarse

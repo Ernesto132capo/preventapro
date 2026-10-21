@@ -7,6 +7,7 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { calculateLineSubtotalCents, calculateTaxCents } from "../services/pricing";
 import { invalidatePullCache } from "./sync";
 import { invalidateWorkdayCache } from "./workdays";
+import { isDatabaseUnavailable } from "../services/http-errors";
 
 export const ordersRouter = Router();
 ordersRouter.use(requireAuth);
@@ -228,9 +229,10 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
   const r = schema.safeParse(req.body);
   if (!r.success) return res.status(400).json({ error: "Datos inválidos", details: r.error.flatten() });
   const d = r.data;
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
 
@@ -340,16 +342,16 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
     invalidateReadCaches();
     res.status(201).json({ order: createdOrder });
   } catch (e: unknown) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     if (e instanceof OrderValidationError || isConstraintViolation(e)) {
       return res.status(400).json({ error: e instanceof Error ? e.message : "Datos de preventa no válidos." });
     }
     console.error("Error al registrar preventa:", e);
-    res.status(500).json({ error: "No se pudo registrar la preventa." });
+    res.status(!client || isDatabaseUnavailable(e) ? 503 : 500).json({ error: "No se pudo registrar la preventa. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
@@ -366,11 +368,14 @@ ordersRouter.get("/:id", async (req: AuthedRequest, res, next) => {
 ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
   const parsed = schema.omit({ idempotencyKey: true, workDayId: true, clientId: true }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
+    // Mismo orden de locks que /sync/push y el cierre de jornada.
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
     const { rows: oldRows } = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     const order = oldRows[0];
     if (!order) {
@@ -383,8 +388,6 @@ ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
       inTransaction = false;
       return res.status(400).json({ error: "Solo se pueden editar preventas activas." });
     }
-    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
-
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
     if (!wd) {
@@ -441,25 +444,27 @@ ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
     invalidateReadCaches();
     res.json({ order: updatedOrder });
   } catch (error: unknown) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     if (error instanceof OrderValidationError || isConstraintViolation(error)) {
       return res.status(400).json({ error: error instanceof Error ? error.message : "Datos de preventa no válidos." });
     }
     console.error("Error al actualizar preventa:", error);
-    res.status(500).json({ error: "No se pudo actualizar la preventa." });
+    res.status(!client || isDatabaseUnavailable(error) ? 503 : 500).json({ error: "No se pudo actualizar la preventa. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
 ordersRouter.post("/:id/cancel", async (req: AuthedRequest, res) => {
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   let inTransaction = false;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
     inTransaction = true;
+    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
     const { rows } = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     const order = rows[0];
     if (!order) {
@@ -467,12 +472,19 @@ ordersRouter.post("/:id/cancel", async (req: AuthedRequest, res) => {
       inTransaction = false;
       return res.status(404).json({ error: "Preventa no encontrada." });
     }
+    // Un reintento después de perder la respuesta no debe fallar, incluso
+    // si la jornada se cerró después de la primera cancelación.
+    if (order.status === "cancelled") {
+      await client.query("COMMIT");
+      inTransaction = false;
+      invalidateReadCaches();
+      return res.json({ ok: true });
+    }
     if (order.status !== "active") {
       await client.query("ROLLBACK");
       inTransaction = false;
       return res.status(400).json({ error: "Solo se pueden cancelar preventas activas." });
     }
-    await client.query("SELECT pg_advisory_xact_lock(1003, hashtext($1))", ["workdays:shared"]);
     const { rows: wdRows } = await client.query("SELECT * FROM work_days WHERE id = $1 FOR UPDATE", [order.work_day_id]);
     const wd = wdRows[0];
     if (!wd) {
@@ -491,13 +503,13 @@ ordersRouter.post("/:id/cancel", async (req: AuthedRequest, res) => {
     await client.query("COMMIT");
     inTransaction = false;
   } catch (error) {
-    if (inTransaction) {
+    if (client && inTransaction) {
       try { await client.query("ROLLBACK"); } catch { /* la conexión puede haberse perdido */ }
     }
     console.error("Error al cancelar preventa:", error);
-    return res.status(500).json({ error: "No se pudo cancelar la preventa." });
+    return res.status(!client || isDatabaseUnavailable(error) ? 503 : 500).json({ error: "No se pudo cancelar la preventa. Intenta de nuevo más tarde." });
   } finally {
-    client.release();
+    client?.release();
   }
   invalidateReadCaches();
   res.json({ ok: true });
