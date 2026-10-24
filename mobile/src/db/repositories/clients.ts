@@ -1,6 +1,6 @@
 import { v4 as uuid } from "uuid";
 import { getDb, nowIso, withTx } from "../client";
-import { enqueue, purgeOutboxForEntity } from "../outbox";
+import { hasUnresolvedOutbox, enqueue, purgeOutboxForEntity } from "../outbox";
 import { Client } from "../../domain/types";
 
 export async function listActiveClients(search?: string): Promise<Client[]> {
@@ -124,12 +124,14 @@ export async function deleteClientLocal(id: string): Promise<void> {
       [nowIso(), id]
     );
 
+    const attemptedCreate = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM outbox WHERE entity_type = 'client' AND local_entity_id = ? AND (attempts > 0 OR status = 'syncing') LIMIT 1`, [id]);
     // Purgar eventos pendientes o fallidos previos de este cliente en outbox para que sync.ts no los reintente
     await purgeOutboxForEntity("client", id);
 
     // Si ya existía en el servidor (server_id no nulo), encolar el borrado remoto.
     // Si era solo local y nunca subió al servidor, no encolar delete (evita 404).
-    if (existing.server_id) {
+    if (existing.server_id || attemptedCreate) {
       await db.runAsync(
         `UPDATE clients SET sync_status = 'pending' WHERE id = ?`,
         [id]
@@ -149,7 +151,7 @@ export async function upsertFromServer(serverClient: any) {
   );
 
   // Un pull no confirma una edición local: primero hay que enviar su outbox.
-  if (localMatch && localMatch.sync_status !== "synced") {
+  if (localMatch && (localMatch.sync_status !== "synced" || await hasUnresolvedOutbox(db, "client", localMatch.id))) {
     await db.runAsync(`UPDATE clients SET server_id = ? WHERE id = ?`, [serverClient.id, localMatch.id]);
     return;
   }

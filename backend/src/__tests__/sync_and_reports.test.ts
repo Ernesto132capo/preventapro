@@ -475,8 +475,8 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
         if (clean.includes("SELECT * FROM combo_options WHERE combo_id = $1 AND active = true")) {
           return { rows: [{ id: "copt-1", combo_id: "cdef-1", presentation_id: "pres-choc", max_quantity: 2, active: true }] };
         }
-        if (clean.includes("SELECT pp.name as pres_name, p.name as prod_name, p.id as prod_id FROM product_presentations pp")) {
-          return { rows: [{ prod_id: "p-choc", prod_name: "Choc", pres_name: "Unidad" }] };
+        if (clean.includes("SELECT pp.id, pp.name as pres_name, p.name as prod_name, p.id as prod_id FROM product_presentations pp")) {
+          return { rows: [{ id: "pres-choc", prod_id: "p-choc", prod_name: "Choc", pres_name: "Unidad" }] };
         }
         if (clean.includes("INSERT INTO order_item_selections")) {
           insertedSelections++;

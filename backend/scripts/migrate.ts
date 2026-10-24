@@ -65,6 +65,7 @@ export const migrations: Migration[] = [
           visit_status TEXT NOT NULL DEFAULT 'pending',
           active BOOLEAN NOT NULL DEFAULT true,
           created_by TEXT REFERENCES users(id),
+          assigned_user_id TEXT REFERENCES users(id),
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -320,6 +321,16 @@ export const migrations: Migration[] = [
           PRIMARY KEY (entity_type, entity_id)
         );
         CREATE INDEX IF NOT EXISTS idx_sync_tombstones_deleted_at ON sync_tombstones(deleted_at);
+      `);
+    },
+  },
+  {
+    id: "010_clients_assigned_user",
+    description: "Agregar asignación opcional de clientes compatible con instalaciones existentes",
+    run: async (client: PoolClient) => {
+      await client.query(`
+        ALTER TABLE clients ADD COLUMN IF NOT EXISTS assigned_user_id TEXT REFERENCES users(id);
+        CREATE INDEX IF NOT EXISTS idx_clients_assigned_user ON clients(assigned_user_id);
       `);
     },
   },

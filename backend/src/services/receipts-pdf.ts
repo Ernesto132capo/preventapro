@@ -293,7 +293,7 @@ export async function generateClientReceiptsPdf(workDayId: string, outDir: strin
           // Desglose de ítems incluidos en el combo
           if (isCombo) {
             for (const sel of line.selections) {
-              drawRow([`   • ${sanitizePdfText(sel.product_name_snapshot)}`, sanitizePdfText(sel.presentation_name_snapshot),
+              drawRow([`   • ${sanitizePdfText(sel.product_name_snapshot)} (por combo)`, sanitizePdfText(sel.presentation_name_snapshot),
                 String(sel.quantity), "-", "-"], true);
             }
           }

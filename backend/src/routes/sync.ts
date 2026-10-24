@@ -4,9 +4,11 @@ import { PoolClient } from "pg";
 import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { calculateLineSubtotalCents, calculateTaxCents } from "../services/pricing";
-import { closeStaleOpenWorkDays, invalidateWorkdayCache } from "./workdays";
+import { closeStaleOpenWorkDays, invalidateWorkdayCache, lockWorkDays } from "./workdays";
+import { isLegitimateOfflineOrder } from "../services/workday-policy";
+import { insertOrderItems, loadOrderCatalog } from "../services/order-storage";
 import { getBoliviaDate, getBoliviaToday } from "../services/dates";
-import { resolveCategoryId, UUID_REGEX } from "./catalog";
+import { resolveCategoryId, UUID_REGEX, syncProductPresentations } from "./catalog";
 
 export const syncRouter = Router();
 syncRouter.use(requireAuth);
@@ -225,11 +227,17 @@ syncRouter.get("/pull", async (req: AuthedRequest, res) => {
     // Auto-cerrar jornadas pasadas abiertas para mantener consistencia con workdays.ts
     const cleanupClient = await pool.connect();
     try {
+      await cleanupClient.query("BEGIN");
+      await lockWorkDays(cleanupClient);
       const closedStale = await closeStaleOpenWorkDays(todayDate, req.userId!, cleanupClient);
+      await cleanupClient.query("COMMIT");
       if (closedStale) {
         invalidatePullCache("workdays");
         invalidateWorkdayCache();
       }
+    } catch (error) {
+      try { await cleanupClient.query("ROLLBACK"); } catch { /* conexión perdida */ }
+      throw error;
     } finally {
       cleanupClient.release();
     }
@@ -778,15 +786,11 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
     wd = createdWd[0];
   }
 
-  // Regla de jornada cerrada: admitir pedidos legítimos tomados offline antes del cierre o durante el día
+  // La captura offline debe ser anterior al cierre, con la tolerancia compartida.
   if (wd.status === "closed") {
     if (orderToUpdate) throw new SyncValidationError("La jornada está concluida. Para editar preventas debes reabrir la jornada.");
     const orderCreatedAt = data.createdAt || data.created_at;
-    const isLegitimateOfflineOrder = Boolean(
-      orderCreatedAt &&
-      (!wd.closed_at || new Date(orderCreatedAt).getTime() <= new Date(wd.closed_at).getTime() + 15 * 60 * 1000)
-    );
-    if (!isLegitimateOfflineOrder) {
+    if (!isLegitimateOfflineOrder(wd, orderCreatedAt)) {
       throw new SyncValidationError("La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada.");
     }
   }
@@ -811,6 +815,18 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
   if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > 100) {
     throw new SyncValidationError("La preventa debe contener entre 1 y 100 productos.");
   }
+  if (rawItems.some((rawItem: any) => !rawItem || typeof rawItem !== "object" || Array.isArray(rawItem) ||
+      typeof (rawItem.productId || rawItem.product_id) !== "string" ||
+      typeof (rawItem.presentationId || rawItem.presentation_id) !== "string")) {
+    throw new SyncValidationError("Cada producto debe indicar su producto y presentación.");
+  }
+  const catalog = await loadOrderCatalog(client, rawItems.map((rawItem: any) => ({
+    productId: rawItem.productId || rawItem.product_id,
+    presentationId: rawItem.presentationId || rawItem.presentation_id,
+    selections: Array.isArray(rawItem.selections) ? rawItem.selections.map((selection: any) => ({
+      selectedPresentationId: selection?.selectedPresentationId || selection?.selected_presentation_id,
+    })) : [],
+  })));
 
   const processedItems: any[] = [];
   for (const rawItem of rawItems) {
@@ -821,12 +837,7 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
       throw new SyncValidationError("La cantidad de cada producto debe ser un entero entre 1 y 1000000.");
     }
 
-    const { rows: pRows } = await client.query("SELECT id, name, sku, product_type, active FROM products WHERE id = $1", [prodId]);
-    const { rows: qRows } = await client.query(
-      "SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1",
-      [presId]
-    );
-    const p = pRows[0], q = qRows[0];
+    const p = catalog.products.get(prodId), q = catalog.presentations.get(presId);
     if (!p || p.active === false || !q || q.active === false) {
       throw new SyncValidationError(`Producto o presentación no disponibles o inactivos.`);
     }
@@ -838,20 +849,12 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
       if (!Array.isArray(rawSelections) || rawSelections.length === 0) {
         throw new SyncValidationError(`El producto combo "${p.name}" requiere selecciones.`);
       }
-      if (rawSelections.some((selection: any) => !Number.isSafeInteger(Number(selection.quantity)) || Number(selection.quantity) <= 0 || Number(selection.quantity) > 1_000_000)) {
+      if (rawSelections.some((selection: any) => !selection || !Number.isSafeInteger(Number(selection.quantity)) || Number(selection.quantity) <= 0 || Number(selection.quantity) > 1_000_000)) {
         throw new SyncValidationError("La cantidad de cada opción debe ser un entero entre 1 y 1000000.");
       }
-      const { rows: comboDefs } = await client.query(
-        "SELECT * FROM combo_definitions WHERE product_id = $1 AND active = true LIMIT 1",
-        [p.id]
-      );
-      if (comboDefs.length === 0) throw new SyncValidationError(`El combo "${p.name}" no tiene definición activa.`);
-      const comboDef = comboDefs[0];
-
-      const { rows: comboOpts } = await client.query(
-        "SELECT * FROM combo_options WHERE combo_id = $1 AND active = true",
-        [comboDef.id]
-      );
+      const comboDef = catalog.definitions.get(p.id);
+      if (!comboDef) throw new SyncValidationError(`El combo "${p.name}" no tiene definición activa.`);
+      const comboOpts = catalog.options.filter((option) => option.combo_id === comboDef.id);
       const optMap = new Map<string, any>(comboOpts.map((o: any) => [o.presentation_id, o]));
       const totalUnits = rawSelections.reduce((sum: number, s: any) => sum + Number(s.quantity || 0), 0);
 
@@ -880,17 +883,14 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
         if (opt.max_quantity != null && sQty > opt.max_quantity) {
           throw new SyncValidationError(`Opción seleccionada excede el límite de ${opt.max_quantity}.`);
         }
-        const { rows: selPres } = await client.query(
-          "SELECT pp.name as pres_name, p.name as prod_name, p.id as prod_id FROM product_presentations pp JOIN products p ON pp.product_id = p.id WHERE pp.id = $1 AND pp.active = true AND p.active = true",
-          [sPresId]
-        );
-        if (selPres.length === 0) throw new SyncValidationError("Opción de presentación no encontrada.");
+        const selPres = catalog.selections.get(sPresId);
+        if (!selPres) throw new SyncValidationError("Opción de presentación no encontrada.");
         selectionsSnapshot.push({
           id: uuid(),
-          selected_product_id: selPres[0].prod_id,
+          selected_product_id: selPres.prod_id,
           selected_presentation_id: sPresId,
-          product_name_snapshot: selPres[0].prod_name,
-          presentation_name_snapshot: selPres[0].pres_name,
+          product_name_snapshot: selPres.prod_name,
+          presentation_name_snapshot: selPres.pres_name,
           quantity: sQty,
           sort_order: s.sortOrder ?? s.sort_order ?? sIdx,
         });
@@ -953,24 +953,7 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
     [orderId, idempotencyKey, wd.id, userId, clientRow.id, paymentCondition, taxRate, subtotal, tax, total, itemCount, ts, serverNow]
   );
 
-  for (const it of processedItems) {
-    await client.query(
-      `INSERT INTO order_items (
-         id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
-         presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot, quantity, subtotal_cents, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [it.id, orderId, it.product_id, it.presentation_id, it.product_name_snapshot, it.sku_snapshot, it.presentation_name_snapshot, it.unit_equivalence_snapshot, it.unit_price_cents_snapshot, it.quantity, it.subtotal_cents, ts]
-    );
-    for (const sel of it.selections) {
-      await client.query(
-        `INSERT INTO order_item_selections (
-           id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
-           presentation_name_snapshot, quantity, sort_order, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [uuid(), it.id, sel.selected_product_id, sel.selected_presentation_id, sel.product_name_snapshot, sel.presentation_name_snapshot, sel.quantity, sel.sort_order, ts]
-      );
-    }
-  }
+  await insertOrderItems(client, orderId, processedItems, ts);
 
   await recalcWorkDayTotals(client, wd.id);
   return syncedOrderResult(client, localId, orderId);
@@ -1091,7 +1074,7 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
       [name, sku, baseCost, productType, targetCategoryId, serverId]
     );
   } else {
-    serverId = uuid();
+    serverId = UUID_REGEX.test(targetId) ? targetId : uuid();
     await client.query(
       `INSERT INTO products (id, sku, name, category_id, base_cost_cents, base_unit_name, product_type, active, created_by, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, now(), now())`,
@@ -1099,24 +1082,26 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
     );
   }
 
-  // Presentaciones
-  const rawPresentations = data.presentations || [];
-  for (const pres of rawPresentations) {
-    const presName = String(pres.name || "").trim();
-    if (!presName) continue;
-    const priceCents = Math.max(0, Number(pres.priceCents ?? pres.price_cents ?? 0));
-    const costCents = Math.max(0, Number(pres.costCents ?? pres.cost_cents ?? 0));
-    const equiv = Math.max(1, Number(pres.unitEquivalence ?? pres.unit_equivalence ?? 1));
-    const presTargetId = pres.id || pres.serverId || uuid();
-
-    await client.query(
-      `INSERT INTO product_presentations (id, product_id, name, unit_equivalence, price_cents, cost_cents, active, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, true, now())
-       ON CONFLICT (product_id, name) DO UPDATE SET
-         price_cents = excluded.price_cents, cost_cents = excluded.cost_cents, unit_equivalence = excluded.unit_equivalence,
-         active = true, updated_at = now()`,
-      [presTargetId, serverId, presName, equiv, priceCents, costCents]
-    );
+  // Los ID del servidor permiten renombrar sin invalidar opciones de otros combos.
+  const rawPresentations = data.presentations;
+  if (Array.isArray(rawPresentations) && rawPresentations.length > 0) {
+    const presentations = rawPresentations.map((pres: any) => ({
+      id: pres.id || pres.serverId || pres.server_id || undefined,
+      localId: pres.localId || pres.local_id || undefined,
+      name: String(pres.name || "").trim(),
+      priceCents: Number(pres.priceCents ?? pres.price_cents ?? 0),
+      costCents: Number(pres.costCents ?? pres.cost_cents ?? 0),
+      unitEquivalence: Number(pres.unitEquivalence ?? pres.unit_equivalence ?? 1),
+    }));
+    if (presentations.some((pres: any) => !pres.name || !Number.isSafeInteger(pres.priceCents) || pres.priceCents < 0 ||
+      !Number.isSafeInteger(pres.costCents) || pres.costCents < 0 || !Number.isSafeInteger(pres.unitEquivalence) || pres.unitEquivalence < 1)) {
+      throw new SyncValidationError("Datos de presentación inválidos.");
+    }
+    try {
+      await syncProductPresentations(client, serverId, presentations, nowIso());
+    } catch (error) {
+      throw new SyncValidationError(error instanceof Error ? error.message : "Presentaciones inválidas.");
+    }
   }
 
   // Combos

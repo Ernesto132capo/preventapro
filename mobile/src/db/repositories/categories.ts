@@ -1,6 +1,6 @@
 import { v4 as uuid } from "uuid";
 import { getDb, nowIso, withTx } from "../client";
-import { enqueue } from "../outbox";
+import { enqueue, hasUnresolvedOutbox } from "../outbox";
 import { Category } from "../../domain/types";
 
 export async function listCategories(): Promise<Category[]> {
@@ -122,7 +122,7 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
 
   const targetId = existing ? existing.id : serverCat.id;
 
-  if (existing && existing.sync_status !== "synced") {
+  if (existing && (existing.sync_status !== "synced" || await hasUnresolvedOutbox(db, "category", existing.id))) {
     await db.runAsync(`UPDATE categories SET server_id = ? WHERE id = ?`, [serverCat.id, existing.id]);
     return;
   }

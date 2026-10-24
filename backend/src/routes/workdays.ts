@@ -9,6 +9,7 @@ import { invalidatePullCache } from "./sync";
 import { z } from "zod";
 import { getBoliviaToday } from "../services/dates";
 import { isDatabaseUnavailable } from "../services/http-errors";
+import { withReportDirectoryLock } from "../services/report-storage";
 
 export const workdaysRouter = Router();
 workdaysRouter.use(requireAuth);
@@ -273,7 +274,7 @@ workdaysRouter.delete("/:id", async (req: AuthedRequest, res) => {
   const reportDir = path.resolve(reportRoot, path.basename(String(row.id)));
   if (reportDir.startsWith(`${reportRoot}${path.sep}`)) {
     try {
-      await fs.promises.rm(reportDir, { recursive: true, force: true });
+      await withReportDirectoryLock(reportDir, () => fs.promises.rm(reportDir, { recursive: true, force: true }));
     } catch (error) {
       console.error(`No se pudieron borrar los reportes de la jornada ${row.id}:`, error);
     }

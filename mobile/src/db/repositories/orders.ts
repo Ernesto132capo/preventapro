@@ -1,9 +1,9 @@
 import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
-import { enqueueInTx } from "../outbox";
+import { enqueueInTx, hasUnresolvedOutbox } from "../outbox";
 import { CartLine, LocalOrder } from "../../domain/types";
-import { calcOrderTotals, PricingError } from "../../domain/pricing";
+import { calcOrderTotals, PricingError, allocateProportionalCents } from "../../domain/pricing";
 import { formatClientDisplayName } from "../../domain/client-display";
 import { getClient } from "./clients";
 import { withUserWorkDayLock } from "./workdays";
@@ -14,6 +14,48 @@ export interface CreateOrderInput {
   paymentCondition: string;
   lines: CartLine[];
   taxRatePermille?: number;
+}
+
+/** Validacion offline: un combo nunca puede guardarse con selecciones vacias o ajenas. */
+async function validateLocalCombos(db: SQLiteDatabase, lines: CartLine[], existingOrderId?: string) {
+  for (const line of lines) {
+    const product = await db.getFirstAsync<{ id: string; server_id: string | null; product_type: string }>(
+      `SELECT id, server_id, product_type FROM products WHERE id = ? OR server_id = ?`, [line.productId, line.productId]);
+    if (!line.isCombo && product?.product_type !== "combo") continue;
+    const selections = line.selections || [];
+    if (!selections.length) throw new PricingError("Debes elegir las opciones del combo antes de guardar la preventa.");
+    if (selections.some(sel => !Number.isSafeInteger(sel.quantity) || sel.quantity <= 0)) throw new PricingError("Las cantidades de las opciones del combo deben ser enteros positivos.");
+    // Una seleccion historica intacta sigue siendo valida si el catalogo cambio o fue desactivado.
+    if (existingOrderId) {
+      const previous = await db.getAllAsync<any>(
+        `SELECT s.* FROM order_item_selections s JOIN order_items i ON i.id = s.order_item_id
+         WHERE i.order_id = ? AND (i.presentation_id = ? OR i.presentation_id IN (
+           SELECT id FROM product_presentations WHERE server_id = ?)) ORDER BY s.sort_order`,
+        [existingOrderId, line.presentationId, line.presentationId]);
+      const signature = (values: any[]) => JSON.stringify(values.map(sel => [sel.selectedPresentationId ?? sel.selected_presentation_id, Number(sel.quantity)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+      if (signature(previous) === signature(selections)) continue;
+    }
+    const definition = await db.getFirstAsync<any>(
+      `SELECT * FROM combo_definitions WHERE (product_id = ? OR product_id = ?) AND active = 1
+       ORDER BY CASE WHEN sync_status <> 'synced' THEN 0 ELSE 1 END LIMIT 1`, [product?.id || line.productId, product?.server_id || line.productId]);
+    if (!definition) throw new PricingError("No se encontro la configuracion del combo. Actualiza el catalogo antes de guardarlo.");
+    const quantity = selections.reduce((total, selection) => total + selection.quantity, 0);
+    if (quantity < definition.selection_min || quantity > definition.selection_max) throw new PricingError("La seleccion no cumple la cantidad de opciones del combo.");
+    const totals = new Map<string, number>();
+    for (const selection of selections) {
+      const option = await db.getFirstAsync<any>(
+        `SELECT co.id, co.max_quantity, pp.product_id FROM combo_options co
+         JOIN product_presentations pp ON (pp.id = co.presentation_id OR pp.server_id = co.presentation_id)
+         WHERE co.combo_id = ? AND co.active = 1 AND (pp.id = ? OR pp.server_id = ?)
+           AND (pp.product_id = ? OR pp.product_id IN (SELECT id FROM products WHERE server_id = ?)
+             OR pp.product_id IN (SELECT server_id FROM products WHERE id = ?))`,
+        [definition.id, selection.selectedPresentationId, selection.selectedPresentationId, selection.selectedProductId, selection.selectedProductId, selection.selectedProductId]);
+      if (!option) throw new PricingError("Una opcion elegida no pertenece al combo. Vuelve a seleccionarla.");
+      const total = (totals.get(option.id) || 0) + selection.quantity;
+      totals.set(option.id, total);
+      if (option.max_quantity != null && total > option.max_quantity) throw new PricingError("Una opcion supera el limite permitido en el combo.");
+    }
+  }
 }
 
 /**
@@ -55,6 +97,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
       throw new PricingError("La jornada está cerrada. Reábrela antes de registrar nuevas preventas.");
     }
 
+    await validateLocalCombos(db, input.lines);
     await db.runAsync(
       `INSERT INTO orders
         (id, work_day_id, client_id, client_name, payment_condition, subtotal_cents, tax_cents, total_cents,
@@ -137,8 +180,8 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
 export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(LocalOrder & { business_name?: string | null; name?: string | null; contact_name?: string | null; owner_name?: string | null })[]> {
   const db = await getDb();
   const wd = await db.getFirstAsync<{ id: string; server_id: string | null; user_id: string }>(
-    `SELECT id, server_id, user_id FROM work_days WHERE id = ?`,
-    [workDayLocalId]
+    `SELECT id, server_id, user_id FROM work_days WHERE id = ? OR server_id = ?`,
+    [workDayLocalId, workDayLocalId]
   );
   if (wd?.server_id) {
     return db.getAllAsync<any>(
@@ -148,7 +191,7 @@ export async function listOrdersForWorkDay(workDayLocalId: string): Promise<(Loc
        WHERE (o.work_day_id = ? OR o.work_day_id = ? OR o.work_day_id IN (SELECT id FROM work_days WHERE server_id = ?))
          AND o.status = 'active'
        ORDER BY o.created_at DESC`,
-      [workDayLocalId, wd.server_id, wd.server_id]
+      [wd.id, wd.server_id, wd.server_id]
     );
   }
   return db.getAllAsync<any>(
@@ -233,13 +276,11 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
       add(row.product_name_snapshot, row.presentation_name_snapshot, quantity, subtotal, Number(row.unit_price_cents_snapshot || 0));
       continue;
     }
-    const totalFactors = selected.reduce((sum, sel) => sum + (Number(sel.quantity) || 1), 0);
-    let allocated = 0;
+    const shares = allocateProportionalCents(subtotal, selected.map(sel => Number(sel.quantity) || 1));
     selected.forEach((sel, index) => {
       const factor = Number(sel.quantity) || 1;
       const units = quantity * factor;
-      const share = index === selected.length - 1 ? subtotal - allocated : Math.round(subtotal * factor / totalFactors);
-      allocated += share;
+      const share = shares[index];
       add(sel.product_name_snapshot, sel.presentation_name_snapshot, units, share, units > 0 ? Math.round(share / units) : 0);
     });
   }
@@ -326,7 +367,7 @@ export async function upsertOrderFromServerInTx(db: SQLiteDatabase, serverOrder:
 
   const isCancelled = serverOrder.status === "cancelled";
 
-  if (existing && existing.sync_status !== "synced") {
+  if (existing && (existing.sync_status !== "synced" || await hasUnresolvedOutbox(db, "order", existing.id))) {
     // Si la copia local tiene cambios pendientes:
     if (!isCancelled) {
       // Para actualizaciones remotas normales, proteger cambios locales pendientes
@@ -548,6 +589,7 @@ async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymen
       throw new PricingError("La jornada está cerrada. Reábrela antes de editar esta preventa.");
     }
 
+    await validateLocalCombos(db, lines, orderId);
     await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [orderId]);
     await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [orderId]);
 

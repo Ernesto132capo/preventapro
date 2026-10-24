@@ -17,7 +17,7 @@ import {
 } from "../db/repositories/products";
 import { listCategories } from "../db/repositories/categories";
 import { createOrderLocal, getOrderWithItems, updateOrderLocal } from "../db/repositories/orders";
-import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId, upsertServerWorkDay } from "../db/repositories/workdays";
+import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { buildCartLine, calcOrderTotals, recalcLineQuantity, updateLineUnitPrice, calcPriceDifference, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
 import { CartLine, CartLineSelection, Category, Client, Presentation, Product, WorkDay } from "../domain/types";
@@ -25,7 +25,7 @@ import { formatClientDisplayName } from "../domain/client-display";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
 import { resolveSelectedPresentation } from "../utils/catalogSelection";
-import { apiFetch, ApiError } from "../services/api";
+import { apiFetch } from "../services/api";
 import { useDebounce } from "../utils/useDebounce";
 
 type Step = "client" | "products";
@@ -413,34 +413,15 @@ export function NewSaleScreen() {
     saveInFlightRef.current = true;
     setSaving(true);
     try {
-      let currentWd = await getTodayWorkDay(user!.id);
+      const currentWd = await getTodayWorkDay(user!.id);
       const localWdId = currentWd.id;
-
-      try {
-        const freshRes = await apiFetch<any>("/workdays/current?fresh=1");
-        if (freshRes?.workDay) {
-          await upsertServerWorkDay(localWdId, freshRes.workDay);
-          currentWd = {
-            ...currentWd,
-            ...freshRes.workDay,
-            id: localWdId,
-            server_id: freshRes.workDay.id,
-            status: freshRes.workDay.status,
-          };
-          setWorkDay(currentWd);
-        }
-      } catch (netErr) {
-        if (netErr instanceof ApiError && netErr.status >= 400 && netErr.status < 500) {
-          throw netErr;
-        }
-        console.warn("No se pudo verificar estado online de jornada, usando local:", netErr);
-      }
+      setWorkDay(currentWd);
 
       if (currentWd.status === "closed") {
         setError("La jornada de hoy ya fue concluida. Debes reabrir la jornada para registrar preventas.");
         Alert.alert(
           "Jornada Concluida",
-          "La jornada de hoy ya fue cerrada por otro usuario. No es posible registrar pedidos en una jornada concluida. Para añadir nuevas preventas debes reabrir la jornada.",
+          "La jornada está cerrada. Para añadir nuevas preventas debes reabrirla.",
           [
             { text: "Entendido", style: "cancel" },
             { text: "Reabrir Jornada", onPress: handleReopen },
@@ -459,7 +440,8 @@ export function NewSaleScreen() {
           lines: cart,
         });
       }
-      await pushSync();
+      // SQLite y su outbox ya están confirmados; la red no retrasa ni revierte el guardado.
+      void pushSync().catch(() => {});
       setCart([]);
       setSelectedClient(null);
       setCartModalVisible(false);

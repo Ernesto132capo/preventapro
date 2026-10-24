@@ -8,6 +8,8 @@ import { calculateLineSubtotalCents, calculateTaxCents } from "../services/prici
 import { invalidatePullCache } from "./sync";
 import { invalidateWorkdayCache } from "./workdays";
 import { isDatabaseUnavailable } from "../services/http-errors";
+import { isLegitimateOfflineOrder } from "../services/workday-policy";
+import { loadOrderCatalog, insertOrderItems } from "../services/order-storage";
 
 export const ordersRouter = Router();
 ordersRouter.use(requireAuth);
@@ -105,16 +107,9 @@ async function full(id: string, client: PoolClient | typeof pool = pool) {
 
 async function make(client: PoolClient, items: z.infer<typeof item>[]) {
   const out: any[] = [];
+  const catalog = await loadOrderCatalog(client, items);
   for (const x of items) {
-    const { rows: pRows } = await client.query(
-      "SELECT id, name, sku, product_type, active FROM products WHERE id = $1",
-      [x.productId]
-    );
-    const { rows: qRows } = await client.query(
-      "SELECT id, product_id, name, unit_equivalence, price_cents, active FROM product_presentations WHERE id = $1",
-      [x.presentationId]
-    );
-    const p = pRows[0], q = qRows[0];
+    const p = catalog.products.get(x.productId), q = catalog.presentations.get(x.presentationId);
     if (!p || p.active === false || !q || q.active === false) throw new OrderValidationError("Producto o presentación no encontrados o inactivos.");
     if (q.product_id !== x.productId) throw new OrderValidationError("La presentación no pertenece a este producto.");
 
@@ -123,17 +118,9 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
       if (!x.selections || x.selections.length === 0) {
         throw new OrderValidationError(`El producto combo "${p.name}" requiere selecciones de opciones.`);
       }
-      const { rows: comboDefs } = await client.query(
-        "SELECT * FROM combo_definitions WHERE product_id = $1 AND active = true LIMIT 1",
-        [x.productId]
-      );
-      if (comboDefs.length === 0) throw new OrderValidationError(`El producto combo "${p.name}" no tiene una definición de combo activa.`);
-      const comboDef = comboDefs[0];
-
-      const { rows: comboOpts } = await client.query(
-        "SELECT * FROM combo_options WHERE combo_id = $1 AND active = true",
-        [comboDef.id]
-      );
+      const comboDef = catalog.definitions.get(x.productId);
+      if (!comboDef) throw new OrderValidationError(`El producto combo "${p.name}" no tiene una definición de combo activa.`);
+      const comboOpts = catalog.options.filter((option) => option.combo_id === comboDef.id);
       const optMap = new Map<string, any>(comboOpts.map((o: any) => [o.presentation_id, o]));
 
       const totalSelectedUnits = x.selections.reduce((sum, s) => sum + s.quantity, 0);
@@ -168,15 +155,9 @@ async function make(client: PoolClient, items: z.infer<typeof item>[]) {
           throw new OrderValidationError(`La cantidad seleccionada para una de las opciones excede el máximo permitido de ${opt.max_quantity}.`);
         }
 
-        const { rows: selPresRows } = await client.query(
-          `SELECT pp.name as pres_name, p.name as prod_name, p.id as prod_id
-           FROM product_presentations pp
-           JOIN products p ON pp.product_id = p.id
-           WHERE pp.id = $1 AND pp.active = true AND p.active = true`,
-          [s.selectedPresentationId]
-        );
-        if (selPresRows.length === 0) throw new OrderValidationError("Opción seleccionada no disponible o inactiva.");
-        const selRow = selPresRows[0];
+        const selRow = catalog.selections.get(s.selectedPresentationId);
+        if (!selRow) throw new OrderValidationError("Opción seleccionada no disponible o inactiva.");
+        if (selRow.prod_id !== s.selectedProductId) throw new OrderValidationError("La opción seleccionada no pertenece a este producto.");
 
         selectionsSnapshot.push({
           id: uuid(),
@@ -261,19 +242,7 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
       return res.status(404).json({ error: "Jornada no encontrada." });
     }
     if (wd.status === "closed") {
-      const orderCreatedAt = d.createdAt;
-      // Si la preventa se capturó offline antes del cierre de la jornada (o durante el día correspondiente),
-      // se admite legítimamente recalculando los totales de la jornada concluida.
-      const isLegitimateOfflineOrder = Boolean(
-        orderCreatedAt &&
-        (
-          !wd.closed_at ||
-          new Date(orderCreatedAt).getTime() <= new Date(wd.closed_at).getTime() + 60 * 60 * 1000 ||
-          String(orderCreatedAt).slice(0, 10) === wd.work_date
-        )
-      );
-
-      if (!isLegitimateOfflineOrder) {
+      if (!isLegitimateOfflineOrder(wd, d.createdAt)) {
         await client.query("ROLLBACK");
         inTransaction = false;
         return res.status(400).json({ error: "La jornada está concluida. Para registrar nuevas preventas debes reabrir la jornada." });
@@ -313,27 +282,7 @@ ordersRouter.post("/", async (req: AuthedRequest, res) => {
       [id, d.idempotencyKey, d.workDayId, req.userId, d.clientId, d.paymentCondition, d.taxRatePermille, sub, tax, sub + tax, itemCount, ts, serverNow]
     );
 
-    for (const it of items) {
-      await client.query(
-        `INSERT INTO order_items (
-           id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
-           presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot, quantity, subtotal_cents, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [it.id, id, it.product_id, it.presentation_id, it.product_name_snapshot, it.sku_snapshot, it.presentation_name_snapshot, it.unit_equivalence_snapshot, it.unit_price_cents_snapshot, it.quantity, it.subtotal_cents, ts]
-      );
-      if (it.selections && it.selections.length > 0) {
-        for (let sIdx = 0; sIdx < it.selections.length; sIdx++) {
-          const sel = it.selections[sIdx];
-          await client.query(
-            `INSERT INTO order_item_selections (
-               id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
-               presentation_name_snapshot, quantity, sort_order, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [uuid(), it.id, sel.selected_product_id, sel.selected_presentation_id, sel.product_name_snapshot, sel.presentation_name_snapshot, sel.quantity, sel.sort_order ?? sIdx, ts]
-          );
-        }
-      }
-    }
+    await insertOrderItems(client, id, items, ts);
 
     await totals(client, d.workDayId);
     const createdOrder = await full(id, client);
@@ -411,27 +360,7 @@ ordersRouter.put("/:id", async (req: AuthedRequest, res) => {
     // CASCADE eliminará automáticamente order_item_selections
     await client.query("DELETE FROM order_items WHERE order_id = $1", [req.params.id]);
 
-    for (const it of items) {
-      await client.query(
-        `INSERT INTO order_items (
-           id, order_id, product_id, presentation_id, product_name_snapshot, sku_snapshot,
-           presentation_name_snapshot, unit_equivalence_snapshot, unit_price_cents_snapshot, quantity, subtotal_cents, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [it.id, req.params.id, it.product_id, it.presentation_id, it.product_name_snapshot, it.sku_snapshot, it.presentation_name_snapshot, it.unit_equivalence_snapshot, it.unit_price_cents_snapshot, it.quantity, it.subtotal_cents, ts]
-      );
-      if (it.selections && it.selections.length > 0) {
-        for (let sIdx = 0; sIdx < it.selections.length; sIdx++) {
-          const sel = it.selections[sIdx];
-          await client.query(
-            `INSERT INTO order_item_selections (
-               id, order_item_id, selected_product_id, selected_presentation_id, product_name_snapshot,
-               presentation_name_snapshot, quantity, sort_order, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [uuid(), it.id, sel.selected_product_id, sel.selected_presentation_id, sel.product_name_snapshot, sel.presentation_name_snapshot, sel.quantity, sel.sort_order ?? sIdx, ts]
-          );
-        }
-      }
-    }
+    await insertOrderItems(client, req.params.id, items, ts);
 
     await client.query(
       "UPDATE orders SET payment_condition = $2, tax_rate_permille = $3, subtotal_cents = $4, tax_cents = $5, total_cents = $6, item_count = $7, updated_at = $8 WHERE id = $1",

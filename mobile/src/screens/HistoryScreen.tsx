@@ -1,71 +1,111 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, FlatList, StyleSheet, Linking, Alert } from "react-native";
-import { useFocusEffect } from "@react-navigation/native";
+import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import { colors, spacing } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { useAuth } from "../context/AuthContext";
-import { deleteClosedWorkDayLocal, listClosedWorkDays } from "../db/repositories/workdays";
+import { assertClosedWorkDayDeletable, deleteClosedWorkDayLocal, listClosedWorkDays, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { listOrdersForWorkDay } from "../db/repositories/orders";
 import { centsToBs } from "../domain/pricing";
 import { formatClientDisplayName } from "../domain/client-display";
 import { WorkDay } from "../domain/types";
 import { API_BASE_URL } from "../services/config";
 import { apiFetch } from "../services/api";
+import { useSync } from "../context/SyncContext";
 
 /** Registros Históricos (Fase 29) — jornadas cerradas, de solo lectura, con enlaces a reportes. */
 export function HistoryScreen() {
   const { user } = useAuth();
+  const { syncTick } = useSync();
+  const isFocused = useIsFocused();
   const [workDays, setWorkDays] = useState<WorkDay[]>([]);
   const [expandedWorkDayId, setExpandedWorkDayId] = useState<string | null>(null);
   const [ordersMap, setOrdersMap] = useState<Record<string, any[]>>({});
   const [loadingOrders, setLoadingOrders] = useState<string | null>(null);
+  const historyRequest = useRef(0);
+  const ordersRequest = useRef(0);
+  const expandedIdRef = useRef(expandedWorkDayId);
+  const observedSyncTick = useRef(syncTick);
+  expandedIdRef.current = expandedWorkDayId;
+
+  const loadOrders = useCallback(async (item: WorkDay) => {
+    const requestId = ++ordersRequest.current;
+    setLoadingOrders(item.id);
+    try {
+      const localOrders = await listOrdersForWorkDay(item.id);
+      if (requestId !== ordersRequest.current) return;
+      setOrdersMap((previous) => ({ ...previous, [item.id]: localOrders }));
+      const serverId = item.server_id || await resolveServerWorkDayId(item.id);
+      if (!serverId) return;
+      const res = await apiFetch<any>(`/workdays/${serverId}/orders`);
+      if (res?.orders && requestId === ordersRequest.current) {
+        setOrdersMap((previous) => ({ ...previous, [item.id]: res.orders }));
+      }
+    } catch {
+      // La copia SQLite ya está visible y admite tanto IDs locales como remotos.
+    } finally {
+      if (requestId === ordersRequest.current) setLoadingOrders(null);
+    }
+  }, []);
 
   const load = useCallback(async () => {
     if (!user) return;
+    const requestId = ++historyRequest.current;
+    ++ordersRequest.current;
+    setOrdersMap({});
+    let days = await listClosedWorkDays(user.id);
+    const localDays = days;
+    if (requestId !== historyRequest.current) return;
+    setWorkDays(days);
     try {
       const res = await apiFetch<{ workDays: any[] }>("/workdays/history");
       if (res?.workDays) {
-        setWorkDays(res.workDays);
-        return;
+        days = res.workDays;
+        if (requestId !== historyRequest.current) return;
+        setWorkDays(days);
       }
     } catch {
       // Fallback offline
     }
-    setWorkDays(await listClosedWorkDays(user.id));
-  }, [user]);
+    if (requestId !== historyRequest.current) return;
+    const localExpanded = localDays.find((day) => day.id === expandedIdRef.current || day.server_id === expandedIdRef.current);
+    const aliases = new Set([expandedIdRef.current, localExpanded?.id, localExpanded?.server_id].filter(Boolean));
+    const expanded = days.find((day) => aliases.has(day.id) || (!!day.server_id && aliases.has(day.server_id)));
+    if (expanded) {
+      setExpandedWorkDayId(expanded.id);
+      await loadOrders(expanded);
+    } else {
+      setExpandedWorkDayId(null);
+      setLoadingOrders(null);
+    }
+  }, [user, loadOrders]);
 
   const toggleExpand = async (item: WorkDay) => {
     if (expandedWorkDayId === item.id) {
       setExpandedWorkDayId(null);
+      ++ordersRequest.current;
+      setLoadingOrders(null);
       return;
     }
     setExpandedWorkDayId(item.id);
-    if (!ordersMap[item.id]) {
-      const serverId = item.server_id || item.id;
-      setLoadingOrders(item.id);
-      try {
-        const res = await apiFetch<any>(`/workdays/${serverId}/orders`);
-        if (res?.orders) {
-          setOrdersMap((prev) => ({ ...prev, [item.id]: res.orders }));
-        }
-      } catch {
-        // Fallback local
-        const localOrders = await listOrdersForWorkDay(item.id);
-        setOrdersMap((prev) => ({ ...prev, [item.id]: localOrders }));
-      } finally {
-        setLoadingOrders(null);
-      }
-    }
+    await loadOrders(item);
   };
 
   useFocusEffect(
     useCallback(() => {
-      load();
+      void load().catch(() => {});
+      return () => { ++historyRequest.current; ++ordersRequest.current; };
     }, [load])
   );
+
+  useEffect(() => {
+    const changed = observedSyncTick.current !== syncTick;
+    observedSyncTick.current = syncTick;
+    if (isFocused && changed && syncTick > 0) void load().catch(() => {});
+  }, [isFocused, syncTick, load]);
 
   async function openReport(workDayServerId: string, fileName: string) {
     try {
@@ -77,9 +117,11 @@ export function HistoryScreen() {
   }
 
   async function deleteRecord(item: WorkDay) {
-    if (!item.server_id) return;
     try {
-      await apiFetch(`/workdays/${item.server_id}`, { method: "DELETE" });
+      await assertClosedWorkDayDeletable(item.id);
+      const serverId = item.server_id || await resolveServerWorkDayId(item.id);
+      if (!serverId) throw new Error("Sincroniza esta jornada antes de eliminarla del historial.");
+      await apiFetch(`/workdays/${serverId}`, { method: "DELETE" });
       await deleteClosedWorkDayLocal(item.id);
       await load();
     } catch (err: any) {
@@ -145,7 +187,7 @@ export function HistoryScreen() {
 
                   {isExpanded && (
                     <View style={styles.ordersContainer}>
-                      {loadingOrders === item.id ? (
+                      {loadingOrders === item.id && !ordersMap[item.id] ? (
                         <Text style={styles.loadingOrdersText}>Cargando preventas...</Text>
                       ) : (ordersMap[item.id] || []).length === 0 ? (
                         <Text style={styles.loadingOrdersText}>No hay preventas registradas en esta jornada.</Text>

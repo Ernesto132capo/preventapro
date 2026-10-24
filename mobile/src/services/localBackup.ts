@@ -26,6 +26,7 @@ export interface BackupInfo {
   createdAt: string;
   orderCount: number;
   pendingCount: number;
+  exportedAt?: string;
 }
 
 function backupDirectory(): string {
@@ -63,6 +64,39 @@ function infoFor(backup: LocalBackup, uri: string): BackupInfo {
   };
 }
 
+function validateBackupUri(uri: string): void {
+  const directory = backupDirectory();
+  if (!uri.startsWith(directory) || !/^preventapro-[^/\\]+\.json$/.test(uri.slice(directory.length))) {
+    throw new Error("La ruta del respaldo no es válida.");
+  }
+}
+
+// Índice pequeño y recuperable: abrir la lista no carga todos los snapshots en memoria.
+async function writeBackupInfo(info: BackupInfo): Promise<void> {
+  await FileSystem.writeAsStringAsync(info.uri + ".meta", JSON.stringify({
+    ...info, format: "preventapro-backup-info", version: 1,
+  }));
+}
+
+async function readBackupInfo(uri: string): Promise<BackupInfo> {
+  try {
+    const data = JSON.parse(await FileSystem.readAsStringAsync(uri + ".meta"));
+    if (data?.format !== "preventapro-backup-info" || data.version !== 1 ||
+        typeof data.createdAt !== "string" || !Number.isFinite(Date.parse(data.createdAt)) ||
+        !Number.isSafeInteger(data.orderCount) || data.orderCount < 0 ||
+        !Number.isSafeInteger(data.pendingCount) || data.pendingCount < 0 ||
+        (data.exportedAt !== undefined && (typeof data.exportedAt !== "string" || !Number.isFinite(Date.parse(data.exportedAt))))) {
+      throw new Error("Índice de respaldo inválido.");
+    }
+    return { uri, createdAt: data.createdAt, orderCount: data.orderCount, pendingCount: data.pendingCount,
+      ...(data.exportedAt ? { exportedAt: data.exportedAt } : {}) };
+  } catch {
+    const info = infoFor(parseLocalBackup(await FileSystem.readAsStringAsync(uri)), uri);
+    await writeBackupInfo(info).catch(() => undefined);
+    return info;
+  }
+}
+
 /** Snapshot coherente y escritura verificada antes de permitir cualquier reinicio. */
 export async function createLocalBackup(afterSave?: (db: SQLiteDatabase) => Promise<void>): Promise<BackupInfo> {
   const tables = {} as LocalBackup["tables"];
@@ -78,10 +112,12 @@ export async function createLocalBackup(afterSave?: (db: SQLiteDatabase) => Prom
       await FileSystem.writeAsStringAsync(temporaryUri, JSON.stringify(backup));
       const verified = parseLocalBackup(await FileSystem.readAsStringAsync(temporaryUri));
       await FileSystem.moveAsync({ from: temporaryUri, to: uri });
+      const info = infoFor(verified, uri);
+      await writeBackupInfo(info).catch(() => undefined);
       // Mantener el mismo lock de escritura hasta terminar un reinicio/restauración.
       // Una venta guardada durante el I/O se ejecutará después, sin perderse.
       if (afterSave) await afterSave(db);
-      return infoFor(verified, uri);
+      return info;
     } catch (error) {
       await FileSystem.deleteAsync(temporaryUri, { idempotent: true }).catch(() => undefined);
       throw error;
@@ -98,7 +134,7 @@ export async function listLocalBackups(): Promise<BackupInfo[]> {
   for (const name of names) {
     try {
       const uri = directory + name;
-      result.push(infoFor(parseLocalBackup(await FileSystem.readAsStringAsync(uri)), uri));
+      result.push(await readBackupInfo(uri));
     } catch {
       // Un archivo dañado no oculta los otros respaldos recuperables.
     }
@@ -109,6 +145,7 @@ export async function listLocalBackups(): Promise<BackupInfo[]> {
 /** Conserva el original local y copia a la carpeta elegida por el usuario en Android. */
 export async function exportLocalBackup(uri: string): Promise<boolean> {
   if (Platform.OS !== "android") throw new Error("La exportación a una carpeta está disponible en Android.");
+  validateBackupUri(uri);
   const contents = await FileSystem.readAsStringAsync(uri);
   const backup = parseLocalBackup(contents);
   const permission = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
@@ -116,7 +153,24 @@ export async function exportLocalBackup(uri: string): Promise<boolean> {
   const name = `PreventaPro-respaldo-${backup.createdAt.replace(/[:.]/g, "-")}`;
   const destination = await FileSystem.StorageAccessFramework.createFileAsync(permission.directoryUri, name, "application/json");
   await FileSystem.writeAsStringAsync(destination, contents);
+  if (await FileSystem.readAsStringAsync(destination) !== contents) {
+    throw new Error("No se pudo verificar la copia exportada. Conserva el respaldo local y vuelve a intentarlo.");
+  }
+  await writeBackupInfo({ ...infoFor(backup, uri), exportedAt: nowIso() }).catch(() => undefined);
   return true;
+}
+
+/** Limpieza manual: los pendientes requieren una copia externa verificada antes de borrar. */
+export async function deleteLocalBackup(uri: string): Promise<void> {
+  validateBackupUri(uri);
+  // Comprobar el snapshot real antes de eliminarlo, aunque su índice esté disponible.
+  const backup = parseLocalBackup(await FileSystem.readAsStringAsync(uri));
+  const info = await readBackupInfo(uri);
+  if (infoFor(backup, uri).pendingCount > 0 && !info.exportedAt) {
+    throw new Error("Este respaldo contiene cambios pendientes. Usa primero Guardar en carpeta para conservar una copia recuperable.");
+  }
+  await FileSystem.deleteAsync(uri, { idempotent: true });
+  await FileSystem.deleteAsync(uri + ".meta", { idempotent: true }).catch(() => undefined);
 }
 
 /** Recupera copias exportadas incluso después de reinstalar la app. No restaura aún la base. */
@@ -134,7 +188,15 @@ export async function importLocalBackups(): Promise<number> {
       const contents = await FileSystem.readAsStringAsync(file);
       const backup = parseLocalBackup(contents);
       const uri = `${directory}preventapro-${backup.createdAt.replace(/[:.]/g, "-")}-${uuid()}.json`;
-      await FileSystem.writeAsStringAsync(uri, JSON.stringify(backup));
+      const temporaryUri = uri + ".tmp";
+      try {
+        await FileSystem.writeAsStringAsync(temporaryUri, JSON.stringify(backup));
+        parseLocalBackup(await FileSystem.readAsStringAsync(temporaryUri));
+        await FileSystem.moveAsync({ from: temporaryUri, to: uri });
+      } finally {
+        await FileSystem.deleteAsync(temporaryUri, { idempotent: true }).catch(() => undefined);
+      }
+      await writeBackupInfo({ ...infoFor(backup, uri), exportedAt: nowIso() }).catch(() => undefined);
       imported++;
     } catch {
       // Una copia incompleta no impide recuperar las demás; SQLite sigue intacto.
@@ -145,10 +207,7 @@ export async function importLocalBackups(): Promise<number> {
 
 /** Solo lee archivos de la carpeta de respaldos de la app; no acepta SQL ni rutas arbitrarias. */
 export async function restoreLocalBackup(uri: string, existingDb?: SQLiteDatabase): Promise<BackupInfo> {
-  const directory = backupDirectory();
-  if (!uri.startsWith(directory) || !/^preventapro-[^/\\]+\.json$/.test(uri.slice(directory.length))) {
-    throw new Error("La ruta del respaldo no es válida.");
-  }
+  validateBackupUri(uri);
   const backup = parseLocalBackup(await FileSystem.readAsStringAsync(uri));
   const db = existingDb || await getDb();
   // Validar todas las columnas antes de borrar datos; si falla un INSERT se revierte todo.

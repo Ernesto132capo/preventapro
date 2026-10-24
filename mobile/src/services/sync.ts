@@ -3,6 +3,9 @@ import { apiFetch, ApiError } from "./api";
 import {
   enqueue,
   enqueueInTx,
+  captureOutboxSnapshot,
+  completeOutboxSnapshot,
+  hasUnresolvedOutbox,
   listPending,
   markDone,
   markSyncing,
@@ -12,7 +15,7 @@ import {
   normalizeOutboxErrors,
   OutboxRow,
 } from "../db/outbox";
-import { upsertFromServer as upsertClientFromServer, markClientSynced, resolveServerClientId } from "../db/repositories/clients";
+import { upsertFromServer as upsertClientFromServer, resolveServerClientId } from "../db/repositories/clients";
 import { upsertCategoryFromServer, resolveServerCategoryId } from "../db/repositories/categories";
 import {
   upsertProductFromServer,
@@ -20,8 +23,9 @@ import {
   resolveServerProductId,
   remapProductReferences,
   remapCategoryReferences,
+  reconcileComboDefinitionAliases,
 } from "../db/repositories/products";
-import { markOrderSynced, markOrderFailed, upsertOrderFromServerInTx } from "../db/repositories/orders";
+import { markOrderFailed, upsertOrderFromServerInTx } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay } from "../db/repositories/workdays";
 
 export interface SyncResult {
@@ -129,14 +133,13 @@ function chunkArray(items: any[], size = 200): any[][] {
             `SELECT id, sync_status FROM products WHERE server_id = ? OR id = ?`,
             [cd.product_id, cd.product_id]
           );
-          if (localProd && localProd.sync_status !== "synced") {
+          if (localProd && (localProd.sync_status !== "synced" || await hasUnresolvedOutbox(txDb, "product", localProd.id))) {
             continue;
           }
           const targetProdId = localProd ? localProd.id : cd.product_id;
-          const existingDef = await txDb.getFirstAsync<{ id: string }>(
-            `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR id = ?`,
-            [cd.id, targetProdId, cd.id]
-          );
+          const canonicalDefId = await reconcileComboDefinitionAliases(txDb, targetProdId, cd.product_id);
+          const existingDef = canonicalDefId ? { id: canonicalDefId } : await txDb.getFirstAsync<{ id: string }>(
+            `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR product_id = ? OR id = ?`, [cd.id, targetProdId, cd.product_id, cd.id]);
           const targetDefId = existingDef ? existingDef.id : cd.id;
           await txDb.runAsync(
             `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
@@ -312,97 +315,77 @@ async function resolveTodayWorkDay(userId: string) {
   for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
 
+/** Captura eventos y datos juntos: un ACK no confirma una edicion posterior al envio. */
+async function captureEntitySnapshot(row: OutboxRow, table: string) {
+  return withTx(async db => ({
+    entity: await db.getFirstAsync<any>(`SELECT * FROM ${table} WHERE id = ?`, [row.local_entity_id]),
+    eventIds: await captureOutboxSnapshot(db, row),
+  }));
+}
+
 async function pushCategory(row: OutboxRow) {
-  const db = await getDb();
-  const category = await db.getFirstAsync<any>(`SELECT * FROM categories WHERE id = ?`, [row.local_entity_id]);
+  const { entity: category, eventIds } = await captureEntitySnapshot(row, "categories");
   if (!category) return markDone(row.id);
-
+  let serverId = category.server_id;
   if (category.active === 0) {
-    if (category.server_id) {
-      await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "DELETE" });
-    }
-    await db.runAsync(`UPDATE categories SET sync_status = 'synced' WHERE id = ?`, [category.id]);
-    return markDone(row.id);
-  }
-
-  const body = { name: category.name };
-  if (category.server_id) {
-    const res = await apiFetch<any>(`/catalog/categories/${category.server_id}`, { method: "PUT", body });
-    await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
-    await remapCategoryReferences(category.id, res.category.id);
+    await apiFetch<any>(`/catalog/categories/${serverId || category.id}`, { method: "DELETE" }).catch(err => {
+      if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    });
   } else {
-    const res = await apiFetch<any>(`/catalog/categories`, { method: "POST", body });
-    await db.runAsync(`UPDATE categories SET server_id = ?, sync_status = 'synced' WHERE id = ?`, [res.category.id, category.id]);
-    await remapCategoryReferences(category.id, res.category.id);
+    const body = { name: category.name, categoryLocalId: category.id };
+    const res = await apiFetch<any>(serverId ? `/catalog/categories/${serverId}` : `/catalog/categories`, { method: serverId ? "PUT" : "POST", body });
+    serverId = res.category.id;
+    if (!category.server_id && res.deduped) await apiFetch<any>(`/catalog/categories/${serverId}`, { method: "PUT", body });
   }
-  await markDone(row.id);
+  await withTx(async db => {
+    await completeOutboxSnapshot(db, row, eventIds, serverId);
+    if (serverId) await remapCategoryReferences(category.id, serverId);
+  });
 }
 
 async function pushClient(row: OutboxRow) {
-  const db = await getDb();
-  const client = await db.getFirstAsync<any>(`SELECT * FROM clients WHERE id = ?`, [row.local_entity_id]);
-  if (!client) return markDone(row.id); // se borró localmente, nada que hacer
-
-  // Cliente borrado localmente o con operación delete: propagar al servidor si tiene server_id; si no, marcar listo
-  if (row.operation === "delete" || client.active === 0) {
-    await db.runAsync(
-      `UPDATE outbox SET status = 'done', last_error = NULL
-       WHERE entity_type = 'client' AND local_entity_id = ? AND id <> ?`,
-      [client.id, row.id]
-    );
-
-    if (client.server_id) {
-      try {
-        await apiFetch<any>(`/clients/${client.server_id}`, { method: "DELETE" });
-      } catch (err: any) {
-        const status = err?.status ?? err?.statusCode;
-        const msg = String(err?.message || "");
-        if (status === 404 || msg.includes("404") || msg.toLowerCase().includes("no encontrado")) {
-          // Idempotente: el cliente ya no existe o fue eliminado previamente en el servidor
-        } else {
-          throw err;
-        }
-      }
+  const { entity: client, eventIds } = await captureEntitySnapshot(row, "clients");
+  if (!client) return markDone(row.id);
+  let serverId = client.server_id;
+  if (client.active === 0) {
+    if (!serverId) {
+      const res = await apiFetch<any>(`/clients`, { method: "POST", body: { clientLocalId: client.id, businessName: client.business_name || client.name || "Cliente" } });
+      serverId = res.client.id;
     }
-    await db.runAsync(`UPDATE clients SET sync_status = 'synced' WHERE id = ?`, [client.id]);
-    return markDone(row.id);
-  }
-
-  const effectiveBusinessName = (client.business_name || client.name || "").trim() || null;
-  const effectiveContactName = (client.contact_name || client.owner_name || "").trim() || null;
-
-  const body = {
-    clientLocalId: client.id,
-    businessName: effectiveBusinessName,
-    business_name: effectiveBusinessName,
-    name: effectiveBusinessName,
-    contactName: effectiveContactName,
-    contact_name: effectiveContactName,
-    ownerName: effectiveContactName,
-    owner_name: effectiveContactName,
-    phone: client.phone ?? null,
-    address: client.address ?? null,
-    lat: client.lat ?? null,
-    lng: client.lng ?? null,
-    neighborhoodId: client.neighborhood_id ?? null,
-    neighborhoodName: client.neighborhood_name ?? null,
-  };
-
-  if (client.server_id) {
-    // Ya existía en el servidor: esto es una edición.
-    const res = await apiFetch<any>(`/clients/${client.server_id}`, { method: "PUT", body });
-    await markClientSynced(client.id, res.client.id);
+    await apiFetch<any>(`/clients/${serverId}`, { method: "DELETE" }).catch(err => {
+      if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    });
   } else {
-    // Primera vez que sube: alta.
-    const res = await apiFetch<any>(`/clients`, { method: "POST", body });
-    await markClientSynced(client.id, res.client.id);
+    const effectiveBusinessName = (client.business_name || client.name || "").trim() || null;
+    const effectiveContactName = (client.contact_name || client.owner_name || "").trim() || null;
+    const body = {
+      clientLocalId: client.id,
+      businessName: effectiveBusinessName, business_name: effectiveBusinessName, name: effectiveBusinessName,
+      contactName: effectiveContactName, contact_name: effectiveContactName, ownerName: effectiveContactName, owner_name: effectiveContactName,
+      phone: client.phone ?? null, address: client.address ?? null, lat: client.lat ?? null, lng: client.lng ?? null,
+      neighborhoodId: client.neighborhood_id ?? null, neighborhoodName: client.neighborhood_name ?? null,
+    };
+    const res = await apiFetch<any>(serverId ? `/clients/${serverId}` : `/clients`, { method: serverId ? "PUT" : "POST", body });
+    serverId = res.client.id;
+    if (!client.server_id && (res.deduped || row.operation === "update")) await apiFetch<any>(`/clients/${serverId}`, { method: "PUT", body });
   }
-  await markDone(row.id);
+  await withTx(db => completeOutboxSnapshot(db, row, eventIds, serverId));
 }
 
 async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
   const db = await getDb();
-  const product = await db.getFirstAsync<any>(`SELECT * FROM products WHERE id = ?`, [row.local_entity_id]);
+  const { product, eventIds, presentations, comboDef, comboOpts } = await withTx(async txDb => {
+    const product = await txDb.getFirstAsync<any>(`SELECT * FROM products WHERE id = ?`, [row.local_entity_id]);
+    const eventIds = await captureOutboxSnapshot(txDb, row);
+    if (!product) return { product, eventIds, presentations: [], comboDef: null, comboOpts: [] };
+    const presentations = await txDb.getAllAsync<any>(
+      `SELECT * FROM product_presentations WHERE (product_id = ? OR product_id = ?) AND active = 1 ORDER BY sort_order ASC`, [product.id, product.server_id]);
+    const comboDef = await txDb.getFirstAsync<any>(
+      `SELECT * FROM combo_definitions WHERE (product_id = ? OR product_id = ?) AND active = 1
+       ORDER BY CASE WHEN sync_status <> 'synced' THEN 0 ELSE 1 END, CASE WHEN product_id = ? THEN 0 ELSE 1 END LIMIT 1`, [product.id, product.server_id, product.id]);
+    const comboOpts = comboDef ? await txDb.getAllAsync<any>(`SELECT * FROM combo_options WHERE combo_id = ? AND active = 1 ORDER BY sort_order ASC`, [comboDef.id]) : [];
+    return { product, eventIds, presentations, comboDef, comboOpts };
+  });
   if (!product) {
     await markDone(row.id);
     return "done";
@@ -410,11 +393,10 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
 
   // Producto borrado localmente: si ya existía en el servidor, propagar el borrado; si no, nada que subir.
   if (product.active === 0) {
-    if (product.server_id) {
-      await apiFetch<any>(`/catalog/products/${product.server_id}`, { method: "DELETE" });
-    }
-    await db.runAsync(`UPDATE products SET sync_status = 'synced' WHERE id = ?`, [product.id]);
-    await markDone(row.id);
+    await apiFetch<any>(`/catalog/products/${product.server_id || product.id}`, { method: "DELETE" }).catch(err => {
+      if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    });
+    await withTx(txDb => completeOutboxSnapshot(txDb, row, eventIds));
     return "done";
   }
 
@@ -425,25 +407,9 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
   }
 
   // Solo se envían las presentaciones activas; las borradas localmente se omiten (el servidor las desactiva por ausencia).
-  const presentations = await db.getAllAsync<any>(
-    `SELECT id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active
-     FROM product_presentations
-     WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1
-     ORDER BY sort_order ASC`,
-    [product.id, product.server_id]
-  );
-
   let comboDefinitionBody: any = undefined;
   if (product.product_type === "combo") {
-    const comboDef = await db.getFirstAsync<any>(
-      `SELECT * FROM combo_definitions WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1`,
-      [product.id, product.server_id]
-    );
     if (comboDef) {
-      const comboOpts = await db.getAllAsync<any>(
-        `SELECT * FROM combo_options WHERE combo_id = ? AND active = 1 ORDER BY sort_order ASC`,
-        [comboDef.id]
-      );
       const resolvedOptions = [];
       for (const opt of comboOpts) {
         const presServerId = await resolveServerPresentationId(opt.presentation_id);
@@ -468,13 +434,16 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
   }
 
   const body = {
+    productLocalId: product.id,
     sku: product.sku,
     name: product.name,
     categoryId: categoryServerId,
     productType: product.product_type || "standard",
     baseCostCents: product.base_cost_cents,
     baseUnitName: product.base_unit_name,
-    presentations: presentations.map((p) => ({
+    presentations: presentations.map((p: any) => ({
+      id: p.server_id || undefined,
+      localId: p.id,
       name: p.name,
       unitEquivalence: p.unit_equivalence,
       priceCents: p.price_cents,
@@ -492,30 +461,39 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
     // Primera vez que sube: alta.
     const res = await apiFetch<any>(`/catalog/products`, { method: "POST", body });
     serverProduct = res.product;
+    if (res.deduped || row.operation === "update") {
+      const updateBody = { ...body, presentations: body.presentations.map((p: any) => ({
+        ...p, id: p.id || serverProduct.presentations?.find((sp: any) => sp.name === p.name)?.id,
+      })) };
+      const updated = await apiFetch<any>(`/catalog/products/${serverProduct.id}`, { method: "PUT", body: updateBody });
+      serverProduct = updated.product;
+    }
   }
 
-  await db.runAsync(`UPDATE products SET server_id = ?, category_id = ?, sync_status = 'synced' WHERE id = ?`, [
+  await withTx(async db => {
+  await db.runAsync(`UPDATE products SET server_id = ? WHERE id = ?`, [
     serverProduct.id,
-    serverProduct.category_id ?? product.category_id,
     product.id,
   ]);
   await remapProductReferences(product.id, serverProduct.id, false);
   if (serverProduct.combo_definition) {
     await db.runAsync(
-      `UPDATE combo_definitions SET server_id = ?, sync_status = 'synced' WHERE product_id = ? OR (product_id = ? AND product_id IS NOT NULL)`,
-      [serverProduct.combo_definition.id, product.id, product.server_id]
+      `UPDATE combo_definitions SET server_id = ? WHERE id = ?`,
+      [serverProduct.combo_definition.id, comboDef?.id]
     );
   }
   // Emparejar por nombre (estable entre ediciones) en vez de por posición, para no desalinear
   // los ids si se agregó o quitó alguna presentación en esta misma edición.
   for (const localPres of presentations) {
-    const serverPres = serverProduct.presentations.find((sp: any) => sp.name === localPres.name);
+    const serverPres = (serverProduct.presentations || []).find((sp: any) => sp.id === localPres.server_id || sp.id === localPres.id || sp.name === localPres.name);
     if (serverPres) {
       await db.runAsync(`UPDATE product_presentations SET server_id = ? WHERE id = ?`, [serverPres.id, localPres.id]);
       await remapProductReferences(localPres.id, serverPres.id, true);
     }
   }
-  await markDone(row.id);
+  await completeOutboxSnapshot(db, row, eventIds, serverProduct.id);
+  if (comboDef) await db.runAsync(`UPDATE combo_definitions SET sync_status = (SELECT sync_status FROM products WHERE id = ?) WHERE id = ?`, [product.id, comboDef.id]);
+  });
   return "done";
 }
 
@@ -577,9 +555,31 @@ function dependencyRank(row: OutboxRow): number {
   return row.entity_type === "order" ? 3 : row.entity_type === "product" ? 2 : row.entity_type === "client" ? 1 : 0;
 }
 
+function sameOrderPayload(order: any, body: any): boolean {
+  if (!Array.isArray(order.items)) return false;
+  const normalize = (item: any) => ({
+    productId: item.productId ?? item.product_id, presentationId: item.presentationId ?? item.presentation_id,
+    quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents ?? item.unit_price_cents_snapshot),
+    selections: (item.selections || []).map((selection: any) => ({
+      productId: selection.selectedProductId ?? selection.selected_product_id,
+      presentationId: selection.selectedPresentationId ?? selection.selected_presentation_id,
+      quantity: Number(selection.quantity),
+    })),
+  });
+  return (order.payment_condition || "Contado 48h") === body.paymentCondition &&
+    JSON.stringify(order.items.map(normalize)) === JSON.stringify(body.items.map(normalize));
+}
+
 async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
   const db = await getDb();
-  const order = await db.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ?`, [row.local_entity_id]);
+  const { order, eventIds, items, selectionsByItem } = await withTx(async txDb => {
+    const order = await txDb.getFirstAsync<any>(`SELECT * FROM orders WHERE id = ?`, [row.local_entity_id]);
+    const eventIds = await captureOutboxSnapshot(txDb, row);
+    const items = order ? await txDb.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]) : [];
+    const selectionsByItem = new Map<string, any[]>();
+    for (const item of items) selectionsByItem.set(item.id, await txDb.getAllAsync<any>(`SELECT * FROM order_item_selections WHERE order_item_id = ? ORDER BY sort_order ASC`, [item.id]));
+    return { order, eventIds, items, selectionsByItem };
+  });
   if (!order) {
     await markDone(row.id);
     return "done";
@@ -605,11 +605,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     } else {
       await apiFetch<any>(`/orders/${serverOrderId}/cancel`, { method: "POST" });
     }
-    await db.runAsync(
-      `UPDATE orders SET sync_status = 'synced', sync_error = NULL WHERE id = ?`,
-      [order.id]
-    );
-    await markDone(row.id);
+    await withTx(txDb => completeOutboxSnapshot(txDb, row, eventIds, serverOrderId));
     return "done";
   }
 
@@ -649,7 +645,6 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
     return "deferred";
   }
 
-  const items = await db.getAllAsync<any>(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
   const resolvedItems = [];
   for (const item of items) {
     const productServerId = await resolveServerProductId(item.product_id);
@@ -667,10 +662,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       return "deferred"; // el producto creado offline todavía no sincronizó
     }
 
-    const selections = await db.getAllAsync<any>(
-      `SELECT * FROM order_item_selections WHERE order_item_id = ? ORDER BY sort_order ASC`,
-      [item.id]
-    );
+    const selections = selectionsByItem.get(item.id) || [];
     let resolvedSelections: any[] | undefined = undefined;
     if (selections.length > 0) {
       resolvedSelections = [];
@@ -713,7 +705,7 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       items: resolvedItems,
     };
     let res: any;
-    if (row.operation === "update" && order.server_id) {
+    if (order.server_id) {
       res = await apiFetch<any>(`/orders/${order.server_id}`, { method: "PUT", body });
     } else if (workDayServerId) {
       res = await apiFetch<any>(`/orders`, {
@@ -739,16 +731,19 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
       if (result.workDay) await upsertServerWorkDay(order.work_day_id, result.workDay);
       if (!result.workDay || result.deduped) {
         res = await apiFetch<any>(`/orders/${result.serverId}`);
+        res.deduped = result.deduped;
         if (res.order?.work_day_id) await db.runAsync(`UPDATE work_days SET server_id = ? WHERE id = ?`, [res.order.work_day_id, order.work_day_id]);
       } else {
         res = { order: { id: result.serverId } };
       }
     }
-    await markOrderSynced(order.id, res.order.id);
-    if (res.order.status === "cancelled") {
-      await withTx((txDb) => upsertOrderFromServerInTx(txDb, res.order));
+    if (!order.server_id && (res.deduped || row.operation === "update") && res.order.status !== "cancelled") {
+      if (!sameOrderPayload(res.order, body)) res = await apiFetch<any>(`/orders/${res.order.id}`, { method: "PUT", body });
     }
-    await markDone(row.id);
+    await withTx(async txDb => {
+      await completeOutboxSnapshot(txDb, row, eventIds, res.order.id);
+      if (res.order.status === "cancelled") await upsertOrderFromServerInTx(txDb, res.order);
+    });
     return "done";
   } catch (err) {
     const message = errorMessage(err);

@@ -1,4 +1,5 @@
 import { v4 as uuid } from "uuid";
+import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
 import { WorkDay } from "../../domain/types";
 import { todayBolivia } from "../../utils/dates";
@@ -85,7 +86,7 @@ export async function getTodayWorkDay(userId: string): Promise<WorkDay> {
            VALUES (?, ?, ?, 'open', 0, 0, 'pending', ?)`,
           [id, userId, today, nowIso()]
         );
-        row = await db.getFirstAsync<any>(`SELECT * FROM work_days WHERE id = ?`, [id]);
+        row = await db.getFirstAsync<any>(`SELECT * FROM work_days WHERE id = ? OR server_id = ?`, [id, id]);
       }
     });
     return { ...row, local_id: row.id };
@@ -96,7 +97,7 @@ export const getOrCreateOpenWorkDay = getTodayWorkDay;
 
 export async function getWorkDay(id: string): Promise<WorkDay | null> {
   const db = await getDb();
-  const row = await db.getFirstAsync<any>(`SELECT * FROM work_days WHERE id = ?`, [id]);
+  const row = await db.getFirstAsync<any>(`SELECT * FROM work_days WHERE id = ? OR server_id = ?`, [id, id]);
   return row ? { ...row, local_id: row.id } : null;
 }
 
@@ -246,20 +247,37 @@ export async function listClosedWorkDays(_userId?: string): Promise<WorkDay[]> {
   return rows.map((r) => ({ ...r, local_id: r.id }));
 }
 
+async function deletableWorkDayAliases(db: SQLiteDatabase, localId: string): Promise<string[]> {
+  const workDay = await db.getFirstAsync<{ id: string; server_id: string | null; status: string }>(
+    `SELECT id, server_id, status FROM work_days WHERE id = ? OR server_id = ?`, [localId, localId]);
+  if (!workDay) return [];
+  const aliases = await db.getAllAsync<{ id: string; status: string }>(
+    `SELECT id, status FROM work_days WHERE id = ? OR (? IS NOT NULL AND server_id = ?)`, [workDay.id, workDay.server_id, workDay.server_id]);
+  if (aliases.some(day => day.status !== "closed")) throw new Error("Solo se puede borrar una jornada cerrada.");
+  const ids = Array.from(new Set([...aliases.map(day => day.id), ...(workDay.server_id ? [workDay.server_id] : [])]));
+  const placeholders = ids.map(() => "?").join(",");
+  const pending = await db.getFirstAsync<{ id: string }>(
+    `SELECT o.id FROM orders o WHERE o.work_day_id IN (${placeholders}) AND
+     (o.sync_status <> 'synced' OR EXISTS (SELECT 1 FROM outbox b WHERE b.entity_type = 'order' AND b.local_entity_id = o.id AND b.status <> 'done')) LIMIT 1`, ids);
+  if (pending) throw new Error("Esta jornada tiene preventas pendientes. Sincronizalas antes de borrar el historial.");
+  return ids;
+}
+
+/** Comprobar antes del DELETE remoto: una copia pendiente no puede perder su jornada. */
+export async function assertClosedWorkDayDeletable(localId: string): Promise<void> {
+  await withTx(async db => { await deletableWorkDayAliases(db, localId); });
+}
+
 /** Elimina la copia local después de que el backend confirmó borrar el histórico. */
 export async function deleteClosedWorkDayLocal(localId: string): Promise<void> {
-  const db = await getDb();
-  await withTx(async () => {
-    await db.runAsync(
-      `DELETE FROM order_item_selections
-       WHERE order_item_id IN (
-         SELECT id FROM order_items
-         WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = ?)
-       )`,
-      [localId]
-    );
-    await db.runAsync(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id = ?)`, [localId]);
-    await db.runAsync(`DELETE FROM orders WHERE work_day_id = ?`, [localId]);
-    await db.runAsync(`DELETE FROM work_days WHERE id = ? AND status = 'closed'`, [localId]);
+  await withTx(async db => {
+    const ids = await deletableWorkDayAliases(db, localId);
+    if (!ids.length) return;
+    const placeholders = ids.map(() => "?").join(",");
+    await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id IN (${placeholders})))`, ids);
+    await db.runAsync(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE work_day_id IN (${placeholders}))`, ids);
+    await db.runAsync(`DELETE FROM outbox WHERE entity_type = 'order' AND status = 'done' AND local_entity_id IN (SELECT id FROM orders WHERE work_day_id IN (${placeholders}))`, ids);
+    await db.runAsync(`DELETE FROM orders WHERE work_day_id IN (${placeholders})`, ids);
+    await db.runAsync(`DELETE FROM work_days WHERE id IN (${placeholders}) AND status = 'closed'`, ids);
   });
 }

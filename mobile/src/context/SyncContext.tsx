@@ -125,7 +125,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   /** forceSync expuesto al exterior (para botones manuales, reabrir jornada, etc.) */
   const forceSync = useCallback(async () => {
     // El llamador espera la sincronización real antes de cerrar una jornada o recargar datos.
-    if (activeTaskRef.current) await activeTaskRef.current.catch(() => undefined);
+    while (activeTaskRef.current) await activeTaskRef.current.catch(() => undefined);
     await runForceSyncRef.current(true);
   }, []);
 
@@ -146,8 +146,15 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
         value = await withSyncMaintenance(operation);
       }
       finally {
-        if (activeTaskRef.current === task) activeTaskRef.current = null;
-        setConnection(isConnectedRef.current ? "online" : "offline");
+        if (activeTaskRef.current === task) {
+          activeTaskRef.current = null;
+          setConnection(isConnectedRef.current ? "online" : "offline");
+          // Un guardado durante un respaldo también necesita vaciar la cola al terminar.
+          if (pendingPushRef.current && userRef.current && isConnectedRef.current) {
+            pendingPushRef.current = false;
+            void startSyncRef.current("push").catch(() => undefined);
+          }
+        }
       }
     })();
     activeTaskRef.current = task;

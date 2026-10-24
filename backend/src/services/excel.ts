@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import { allocateProportionalCents } from "./pricing";
 import fs from "fs";
 import path from "path";
 import { pool } from "../db/pg";
@@ -82,6 +83,7 @@ export function getUniqueSheetName(workbook: ExcelJS.Workbook, rawName: string):
 async function writeWorkbookAtomic(wb: ExcelJS.Workbook, filePath: string): Promise<string> {
   const tmpFilePath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   try {
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
     await wb.xlsx.writeFile(tmpFilePath);
     await fs.promises.rename(tmpFilePath, filePath);
     return filePath;
@@ -217,23 +219,14 @@ export async function generateProductListExcel(workDayId: string, outDir: string
       // Desglosar el combo en sus productos individuales componentes
       const comboQty = Number(row.quantity || 0);
       const comboSubtotal = Number(row.subtotal_cents ?? (row.unit_price_cents_snapshot * comboQty));
-      const totalSelQty = row.selections.reduce((sum, s) => sum + (Number(s.quantity) || 1), 0);
-
-      let allocatedSubtotal = 0;
+      const selectionWeights = row.selections.map((selection) => Number(selection.quantity) || 1);
+      const selectionSubtotals = allocateProportionalCents(comboSubtotal, selectionWeights);
       for (let i = 0; i < row.selections.length; i++) {
         const sel = row.selections[i];
         const selFactor = Number(sel.quantity) || 1;
         const itemUnits = comboQty * selFactor;
 
-        let itemSubtotal: number;
-        if (i === row.selections.length - 1) {
-          itemSubtotal = comboSubtotal - allocatedSubtotal;
-        } else {
-          itemSubtotal = totalSelQty > 0
-            ? Math.round((comboSubtotal * selFactor) / totalSelQty)
-            : Math.round(comboSubtotal / row.selections.length);
-          allocatedSubtotal += itemSubtotal;
-        }
+        const itemSubtotal = selectionSubtotals[i];
 
         const isSpecialPres = sel.presentation_name_snapshot &&
           sel.presentation_name_snapshot !== "Unidad" &&
@@ -411,7 +404,7 @@ export async function generateClientReceiptsExcel(workDayId: string, outDir: str
       if (isCombo) {
         for (const sel of line.selections) {
           const selRow = sheet.addRow([
-            `   • ${sel.product_name_snapshot}`,
+            `   • ${sel.product_name_snapshot} (por combo)`,
             sel.presentation_name_snapshot,
             sel.quantity,
             "",

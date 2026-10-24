@@ -139,6 +139,25 @@ describe("Coordinación de acciones públicas de SyncContext", () => {
     expect(services.pushOnlySync).toHaveBeenCalledTimes(1);
   });
 
+  it("atiende un push solicitado durante el respaldo al liberar el mantenimiento", async () => {
+    const { value, services, backups } = mountProvider();
+    const backupGate = deferred<typeof backupInfo>();
+    const pushGate = deferred<typeof okResult>();
+    backups.createLocalBackup.mockImplementationOnce(() => backupGate.promise);
+    services.pushOnlySync.mockImplementationOnce(() => pushGate.promise);
+    const backup = value.backupLocalData();
+    const push = value.pushSync();
+    const full = value.forceSync();
+    expect(services.pushOnlySync).not.toHaveBeenCalled();
+    backupGate.resolve(backupInfo);
+    await Promise.all([backup, push]);
+    expect(services.pushOnlySync).toHaveBeenCalledTimes(1);
+    expect(services.runSync).not.toHaveBeenCalled();
+    pushGate.resolve(okResult);
+    await full;
+    expect(services.runSync).toHaveBeenCalledTimes(1);
+  });
+
   it("resetLocalData no borra SQLite ni fuerza sync si falla el respaldo", async () => {
     const { value, services, db, backups } = mountProvider();
     backups.createLocalBackup.mockRejectedValueOnce(new Error("No se pudo verificar el respaldo"));

@@ -85,6 +85,15 @@ const mockDb = {
   runAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
+    if (cleanSql.startsWith("DELETE FROM orders WHERE work_day_id IN (")) {
+      mockDbState.orders = mockDbState.orders.filter(order => !params.includes(order.work_day_id));
+      return { changes: 1 };
+    }
+    if (cleanSql.startsWith("DELETE FROM work_days WHERE id IN (")) {
+      mockDbState.workDays = mockDbState.workDays.filter(day => !params.includes(day.id) || day.status !== "closed");
+      return { changes: 1 };
+    }
+
     // OUTBOX: INSERT
     if (cleanSql.startsWith("INSERT INTO outbox")) {
       const [id, entity_type, local_entity_id, operation, priority, created_at] = params;
@@ -398,6 +407,10 @@ const mockDb = {
   getAllAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
 
+    if (cleanSql.startsWith("SELECT id, status FROM work_days WHERE")) {
+      return mockDbState.workDays.filter(day => day.id === params[0] || (params[1] && day.server_id === params[2]));
+    }
+
     if (cleanSql.includes("FROM orders WHERE server_id = ? OR id = ? OR id = ?")) {
       const [serverId, id, originalId] = params;
       return mockDbState.orders
@@ -455,6 +468,15 @@ const mockDb = {
 
   getFirstAsync: jest.fn(async (sql: string, params: any[] = []) => {
     const cleanSql = sql.replace(/\s+/g, " ").trim();
+
+    if (cleanSql.startsWith("SELECT id, server_id, status FROM work_days WHERE")) {
+      return mockDbState.workDays.find(day => day.id === params[0] || day.server_id === params[1]) || null;
+    }
+    if (cleanSql.startsWith("SELECT o.id FROM orders o WHERE o.work_day_id IN (")) {
+      return mockDbState.orders.find(order => params.includes(order.work_day_id) &&
+        ((order.sync_status && order.sync_status !== "synced") || mockDbState.outbox.some(event =>
+          event.entity_type === "order" && event.local_entity_id === order.id && event.status !== "done"))) || null;
+    }
 
     if (cleanSql.startsWith("SELECT attempts FROM outbox WHERE id = ?")) {
       const row = mockDbState.outbox.find((r) => r.id === params[0]);
@@ -745,48 +767,48 @@ describe("Outbox deduplication and sorting logic", () => {
   });
 
   it("[A-16] encola una ejecución inmediata de pushSync si se invoca durante una sincronización activa", async () => {
-    // Simulación del patrón implementado en SyncContext (syncingRef + pendingPushRef)
-    const executionLog: string[] = [];
-    let syncing = false;
-    let pendingPush = false;
+    jest.useFakeTimers();
+    try {
+      // Caso legacy; el Provider real se prueba en sync_context_orchestration.test.ts.
+      const executionLog: string[] = [];
+      let syncing = false;
+      let pendingPush = false;
 
-    async function simulatedPushSync() {
-      if (syncing) {
-        pendingPush = true;
-        return;
-      }
-      syncing = true;
-      executionLog.push("start-push");
-      try {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        executionLog.push("complete-push");
-      } finally {
-        syncing = false;
-        if (pendingPush) {
-          pendingPush = false;
-          setTimeout(() => { void simulatedPushSync(); }, 10);
+      async function simulatedPushSync() {
+        if (syncing) {
+          pendingPush = true;
+          return;
+        }
+        syncing = true;
+        executionLog.push("start-push");
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          executionLog.push("complete-push");
+        } finally {
+          syncing = false;
+          if (pendingPush) {
+            pendingPush = false;
+            setTimeout(() => { void simulatedPushSync(); }, 10);
+          }
         }
       }
+
+      const firstSyncPromise = simulatedPushSync();
+      expect(syncing).toBe(true);
+
+      await simulatedPushSync();
+      expect(pendingPush).toBe(true);
+      expect(executionLog.filter((x) => x === "start-push")).toHaveLength(1);
+
+      await jest.runAllTimersAsync();
+      await firstSyncPromise;
+
+      expect(executionLog).toEqual(["start-push", "complete-push", "start-push", "complete-push"]);
+      expect(syncing).toBe(false);
+      expect(pendingPush).toBe(false);
+    } finally {
+      jest.useRealTimers();
     }
-
-    // 1. Iniciar la primera sincronización
-    const firstSyncPromise = simulatedPushSync();
-    expect(syncing).toBe(true);
-
-    // 2. Invocar pushSync mientras está en vuelo la primera
-    await simulatedPushSync();
-    expect(pendingPush).toBe(true);
-    // No debe iniciar una segunda en paralelo
-    expect(executionLog.filter((x) => x === "start-push")).toHaveLength(1);
-
-    // 3. Esperar que termine la primera y que el timer ejecute la encolada
-    await firstSyncPromise;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    // Verificamos que se ejecutó la llamada encolada posteriormente
-    expect(executionLog).toEqual(["start-push", "complete-push", "start-push", "complete-push"]);
-    expect(syncing).toBe(false);
-    expect(pendingPush).toBe(false);
   });
 
   it("[C-05] upsertOrderFromServer realiza upsert incremental sin purgar órdenes locales previas", async () => {

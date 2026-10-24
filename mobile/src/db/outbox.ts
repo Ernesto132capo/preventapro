@@ -61,6 +61,38 @@ export async function markDone(id: string) {
   );
 }
 
+/** Capturar dentro de la misma transacción que los datos que se enviarán. */
+export async function captureOutboxSnapshot(db: SQLiteDatabase, row: OutboxRow): Promise<string[]> {
+  const events = await db.getAllAsync<{ id: string }>(
+    `SELECT id FROM outbox WHERE entity_type = ? AND local_entity_id = ? AND status <> 'done'`,
+    [row.entity_type, row.local_entity_id]
+  );
+  return events.map(event => event.id);
+}
+
+/** Un ACK solo confirma su foto local; una edición durante HTTP conserva su evento. */
+export async function completeOutboxSnapshot(db: SQLiteDatabase, row: OutboxRow, eventIds: string[], serverId?: string | null) {
+  for (const id of eventIds) {
+    await db.runAsync(
+      `UPDATE outbox SET status = 'done', last_error = NULL, next_retry_at = NULL, completed_at = ? WHERE id = ?`,
+      [nowIso(), id]
+    );
+  }
+  const pending = await hasUnresolvedOutbox(db, row.entity_type, row.local_entity_id);
+  const table = { category: 'categories', client: 'clients', product: 'products', order: 'orders' }[row.entity_type];
+  await db.runAsync(
+    `UPDATE ${table} SET sync_status = ?${serverId ? ', server_id = ?' : ''}${row.entity_type === 'order' ? ', sync_error = NULL' : ''} WHERE id = ?`,
+    [pending ? 'pending' : 'synced', ...(serverId ? [serverId] : []), row.local_entity_id]
+  );
+}
+
+export async function hasUnresolvedOutbox(db: SQLiteDatabase, entityType: OutboxEntity, localId: string): Promise<boolean> {
+  return !!(await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM outbox WHERE entity_type = ? AND local_entity_id = ? AND status <> 'done' LIMIT 1`,
+    [entityType, localId]
+  ));
+}
+
 export async function markFailed(id: string, error: string) {
   const db = await getDb();
   await db.runAsync(

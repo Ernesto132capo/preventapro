@@ -6,6 +6,7 @@ import { requireAuth, requireReportDownloadAuth, AuthedRequest } from "../middle
 import { createReportDownloadToken } from "../services/auth";
 import { generateClientReceiptsExcel, generateClientSummaryExcel, generateProductListExcel } from "../services/excel";
 import { generateClientReceiptsPdf } from "../services/receipts-pdf";
+import { isMissingReportPath, removeExpiredReportDirectories, withReportDirectoryLock } from "../services/report-storage";
 
 export const reportsRouter = Router();
 
@@ -24,7 +25,7 @@ export async function getOrGenerateReport(
   reportDir: string,
   generator: (id: string, dir: string) => Promise<string>
 ): Promise<string> {
-  const flightKey = `${workDayId}:${fileName}`;
+  const flightKey = `${path.resolve(reportDir)}:${workDayId}:${fileName}`;
   const inFlight = reportsInFlight.get(flightKey);
   if (inFlight) {
     return inFlight;
@@ -40,41 +41,12 @@ export async function getOrGenerateReport(
   return task;
 }
 
-function isMissingPathError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | null)?.code;
-  return code === "ENOENT" || code === "ENOTDIR";
-}
-
 /** Elimina reportes vencidos con I/O asíncrono para no bloquear el Event Loop. */
-async function cleanupExpiredReportDirectories(): Promise<void> {
+export async function cleanupExpiredReportDirectories(): Promise<void> {
   if (reportGcInFlight) return reportGcInFlight;
   if (Date.now() - lastReportGcAt < REPORT_GC_INTERVAL_MS) return;
 
-  const cleanup = (async () => {
-    try {
-      const entries = await fs.promises.readdir(reportsRoot, { withFileTypes: true });
-      const now = Date.now();
-      await Promise.all(entries.map(async (entry) => {
-        if (!entry.isDirectory()) return;
-        const directoryPath = path.join(reportsRoot, entry.name);
-        try {
-          const stats = await fs.promises.stat(directoryPath);
-          if (now - stats.mtimeMs > REPORT_TTL_MS) {
-            await fs.promises.rm(directoryPath, { recursive: true, force: true });
-          }
-        } catch (error) {
-          if (!isMissingPathError(error)) {
-            console.warn(`No se pudo limpiar la carpeta de reportes ${entry.name}:`, error);
-          }
-        }
-      }));
-    } catch (error) {
-      // Es normal que el directorio aún no exista en una instalación nueva.
-      if (!isMissingPathError(error)) {
-        console.warn("No se pudieron revisar los reportes vencidos:", error);
-      }
-    }
-  })();
+  const cleanup = removeExpiredReportDirectories(reportsRoot, REPORT_TTL_MS, Date.now());
 
   reportGcInFlight = cleanup.finally(() => {
     lastReportGcAt = Date.now();
@@ -137,30 +109,25 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
   const reportDir = path.join(reportsRoot, safeWorkDayId);
   const filePath = path.join(reportDir, safeFileName);
   try {
-    await cleanupExpiredReportDirectories();
-    await fs.promises.mkdir(reportDir, { recursive: true });
-    await getOrGenerateReport(safeFileName, safeWorkDayId, reportDir, generateReport);
-
-    try {
+    // GC puede esperar una descarga activa; no hacer que otra descarga espere a GC.
+    void cleanupExpiredReportDirectories();
+    await withReportDirectoryLock(reportDir, async () => {
+      await fs.promises.mkdir(reportDir, { recursive: true });
+      await getOrGenerateReport(safeFileName, safeWorkDayId, reportDir, generateReport);
       const stats = await fs.promises.stat(filePath);
       if (!stats.isFile()) {
-        return res.status(404).json({ error: "El reporte solicitado no está disponible." });
+        res.status(404).json({ error: "El reporte solicitado no está disponible." });
+        return;
       }
-    } catch (error) {
-      if (isMissingPathError(error)) {
-        return res.status(404).json({ error: "El reporte solicitado no está disponible." });
-      }
-      throw error;
-    }
-
-    return res.download(filePath, safeFileName, (error) => {
-      if (!error) return;
-      if (isMissingPathError(error) && !res.headersSent) {
-        return res.status(404).json({ error: "El reporte solicitado ya no está disponible." });
-      }
-      next(error);
+      // Mantener el lock hasta que Express termine de leer el archivo o falle.
+      await new Promise<void>((resolve, reject) => {
+        res.download(filePath, safeFileName, (error) => error ? reject(error) : resolve());
+      });
     });
   } catch (error) {
+    if (isMissingReportPath(error) && !res.headersSent) {
+      return res.status(404).json({ error: "El reporte solicitado ya no está disponible." });
+    }
     return next(error);
   }
 });

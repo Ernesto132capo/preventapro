@@ -2,7 +2,7 @@ import { LOCAL_SCHEMA } from "../db/schema";
 import { withTx } from "../db/client";
 import {
   BACKUP_TABLES, createLocalBackup, exportLocalBackup, importLocalBackups, listLocalBackups,
-  parseLocalBackup, restoreLocalBackup,
+  parseLocalBackup, restoreLocalBackup, deleteLocalBackup,
 } from "../services/localBackup";
 import {
   countUnresolvedOutboxItems, deferForRetry, enqueueInTx, listPending,
@@ -123,7 +123,7 @@ sqliteDescribe("Respaldo local y retención del outbox con SQLite real", () => {
     expect(contents).not.toContain("AUTH_TOKEN_PRIVATE_DO_NOT_BACK_UP");
     expect(info).toMatchObject({ orderCount: 1, pendingCount: 1 });
     expect(info.uri).toMatch(/^file:\/\/\/app\/preventapro-backups\/preventapro-.*\.json$/);
-    expect(Array.from(mockFiles.keys())).toEqual([info.uri]);
+    expect(Array.from(mockFiles.keys())).toEqual([info.uri, info.uri + ".meta"]);
     expect(snapshot()).toEqual(before);
   });
 
@@ -279,9 +279,71 @@ sqliteDescribe("Respaldo local y retención del outbox con SQLite real", () => {
     const before = snapshot();
     expect(await importLocalBackups()).toBe(1);
     expect(snapshot()).toEqual(before);
-    const imported = Array.from(mockFiles.keys()).filter((file) => file.startsWith(directory));
+    const imported = Array.from(mockFiles.keys()).filter((file) => file.startsWith(directory) && file.endsWith(".json"));
     expect(imported).toHaveLength(1);
     expect(parseLocalBackup(mockFiles.get(imported[0])!).tables.clients[0].phone).toBe("123");
+  });
+
+  it("lista los índices pequeños sin volver a leer los snapshots completos", async () => {
+    const saved = await createLocalBackup();
+    (FileSystem.readAsStringAsync as jest.Mock).mockClear();
+    expect(await listLocalBackups()).toEqual([saved]);
+    expect(FileSystem.readAsStringAsync).toHaveBeenCalledWith(saved.uri + ".meta");
+    expect(FileSystem.readAsStringAsync).not.toHaveBeenCalledWith(saved.uri);
+  });
+
+  it.each(["ausente", "dañado"])("reconstruye un índice %s de respaldos antiguos", async (kind) => {
+    const saved = await createLocalBackup();
+    if (kind === "ausente") mockFiles.delete(saved.uri + ".meta");
+    else mockFiles.set(saved.uri + ".meta", "índice dañado");
+    expect(await listLocalBackups()).toEqual([saved]);
+    expect(JSON.parse(mockFiles.get(saved.uri + ".meta")!)).toMatchObject({ orderCount: 1, pendingCount: 1 });
+  });
+
+  it("conserva el respaldo verificado aunque falle la escritura del índice", async () => {
+    const write = FileSystem.writeAsStringAsync as jest.Mock;
+    write.mockImplementationOnce(async (uri, contents) => { mockFiles.set(uri, contents); })
+      .mockRejectedValueOnce(new Error("Índice no disponible"));
+    const saved = await createLocalBackup();
+    expect(parseLocalBackup(mockFiles.get(saved.uri)!).tables.orders).toHaveLength(1);
+    expect(await listLocalBackups()).toEqual([saved]);
+  });
+
+  it("no permite eliminar la única copia de pendientes antes de exportarla", async () => {
+    const { uri } = await createLocalBackup();
+    const before = snapshot();
+    await expect(deleteLocalBackup(uri)).rejects.toThrow(/Guardar en carpeta/);
+    expect(mockFiles.has(uri)).toBe(true);
+    expect(snapshot()).toEqual(before);
+    await exportLocalBackup(uri);
+    await deleteLocalBackup(uri);
+    expect(mockFiles.has(uri)).toBe(false);
+    expect(mockFiles.has(uri + ".meta")).toBe(false);
+    expect(Array.from(mockFiles.keys()).some((name) => name.startsWith("content://"))).toBe(true);
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("permite depurar manualmente una copia sin pendientes sin modificar SQLite", async () => {
+    await mockDb.runAsync("UPDATE outbox SET status = 'done'");
+    const { uri } = await createLocalBackup();
+    const before = snapshot();
+    await deleteLocalBackup(uri);
+    expect(await listLocalBackups()).toEqual([]);
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("una exportación incompleta no habilita eliminar el respaldo de pendientes", async () => {
+    const { uri } = await createLocalBackup();
+    (FileSystem.writeAsStringAsync as jest.Mock).mockImplementationOnce(async (destination, contents) => {
+      mockFiles.set(destination, contents.slice(0, 20));
+    });
+    await expect(exportLocalBackup(uri)).rejects.toThrow(/verificar/);
+    await expect(deleteLocalBackup(uri)).rejects.toThrow(/Guardar en carpeta/);
+    expect(mockFiles.has(uri)).toBe(true);
+  });
+
+  it.each([exportLocalBackup, deleteLocalBackup])("rechaza exportar o eliminar archivos ajenos a los respaldos", async (action) => {
+    await expect(action("file:///app/SQLite/preventapro.json")).rejects.toThrow(/ruta/);
   });
 
   it("cancelar la carpeta de importación conserva SQLite y no añade archivos", async () => {

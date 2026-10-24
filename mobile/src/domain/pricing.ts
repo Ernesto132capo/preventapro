@@ -18,6 +18,44 @@ export class PricingError extends Error {
 
 const TAX_RATE_DENOMINATOR = 1_000;
 
+/**
+ * Reparte centavos por peso sin importes negativos ni pérdida de centavos.
+ * Los residuos se asignan de mayor a menor; los empates conservan el orden original.
+ * BigInt evita redondeos incluso cuando el producto total * peso excede el entero seguro.
+ */
+export function allocateProportionalCents(totalCents: number, weights: number[]): number[] {
+  if (!Number.isSafeInteger(totalCents) || totalCents < 0) {
+    throw new PricingError("El total debe expresarse en centavos enteros no negativos.");
+  }
+  if (weights.some((weight) => !Number.isSafeInteger(weight) || weight < 0)) {
+    throw new PricingError("Los pesos deben ser enteros no negativos.");
+  }
+  const weightSum = weights.reduce((sum, weight) => sum + BigInt(weight), 0n);
+  if (weightSum === 0n) {
+    if (totalCents === 0) return weights.map(() => 0);
+    throw new PricingError("Se necesita al menos un peso mayor a cero.");
+  }
+
+  const total = BigInt(totalCents);
+  const shares = weights.map((weight, index) => {
+    const weightedTotal = total * BigInt(weight);
+    return {
+      index,
+      cents: Number(weightedTotal / weightSum),
+      remainder: weightedTotal % weightSum,
+    };
+  });
+  const allocations = shares.map((share) => share.cents);
+  let remaining = totalCents - allocations.reduce((sum, cents) => sum + cents, 0);
+  shares.sort((left, right) => left.remainder === right.remainder
+    ? left.index - right.index
+    : left.remainder > right.remainder ? -1 : 1);
+  for (let index = 0; remaining > 0; index++, remaining--) {
+    allocations[shares[index].index]++;
+  }
+  return allocations;
+}
+
 export function calculateLineSubtotalCents(unitPriceCents: number, quantity: number): number {
   if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0) {
     throw new PricingError("El precio debe expresarse en centavos enteros.");

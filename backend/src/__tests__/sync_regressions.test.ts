@@ -10,7 +10,7 @@ vi.mock("../middleware/auth", () => ({
   requireAuth: (req: any, _res: any, next: any) => { req.userId = "user"; next(); },
   requireRole: () => (_req: any, _res: any, next: any) => next(),
 }));
-vi.mock("../routes/workdays", () => ({ closeStaleOpenWorkDays: async () => false, invalidateWorkdayCache: vi.fn() }));
+vi.mock("../routes/workdays", () => ({ closeStaleOpenWorkDays: async () => false, invalidateWorkdayCache: vi.fn(), lockWorkDays: async (client: any) => client.query("SELECT pg_advisory_xact_lock(1003, hashtext('workdays:shared'))") }));
 vi.mock("../services/dates", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), getBoliviaToday: () => "2026-10-20" }));
 import { invalidatePullCache, syncRouter } from "../routes/sync";
 
@@ -107,7 +107,7 @@ describe("Lotes aplican ediciones y borrados dentro de su savepoint", () => {
       if (sql.startsWith("SELECT * FROM orders")) return { rows: [state.order] };
       if (sql.startsWith("SELECT * FROM work_days")) return { rows: [{ id: "wd", status: "open" }] };
       if (sql.startsWith("SELECT id, active FROM clients")) return { rows: [{ id: "client", active: true }] };
-      if (sql.includes("FROM products WHERE id")) return { rows: [{ id: "product", name: "Papa", sku: "P", product_type: "standard", active: true }] };
+      if (sql.includes("FROM products WHERE id")) return { rows: [{ id: values[0], name: "Papa", sku: "P", product_type: "standard", active: true }] };
       if (sql.includes("FROM product_presentations WHERE id")) return { rows: [{ id: "presentation", product_id: "product", name: "Unidad", unit_equivalence: 1, price_cents: 200, active: true }] };
       if (sql.startsWith("DELETE FROM order_items")) state.items = [];
       if (sql.startsWith("UPDATE orders SET payment_condition")) state.order.total_cents = values[5];

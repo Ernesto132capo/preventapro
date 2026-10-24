@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
-import { enqueue } from "../outbox";
+import { enqueue, hasUnresolvedOutbox } from "../outbox";
 import { Product, Presentation, ComboDefinition, ComboOption } from "../../domain/types";
 import { listRecentProductIdsForClient } from "./orders";
 
@@ -26,28 +26,50 @@ export async function listFavoriteProductIds(): Promise<Set<string>> {
   return new Set(rows.map((r) => r.product_id));
 }
 
+async function favoriteAliases(productId: string) {
+  const db = await getDb();
+  const product = await db.getFirstAsync<{ id: string; server_id: string | null }>(`SELECT id, server_id FROM products WHERE id = ? OR server_id = ?`, [productId, productId]);
+  return { localId: product?.id || productId, remoteId: product?.server_id || productId };
+}
+
 export async function isFavoriteLocal(productId: string): Promise<boolean> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ product_id: string }>(
-    `SELECT product_id FROM product_favorites WHERE product_id = ?`,
-    [productId]
-  );
-  return !!row;
+  const { localId, remoteId } = await favoriteAliases(productId);
+  return !!(await db.getFirstAsync(`SELECT product_id FROM product_favorites WHERE product_id = ? OR product_id = ?`, [localId, remoteId]));
 }
 
 export async function toggleFavoriteLocal(productId: string): Promise<boolean> {
-  const db = await getDb();
-  const existing = await db.getFirstAsync<{ product_id: string }>(
-    `SELECT product_id FROM product_favorites WHERE product_id = ?`,
-    [productId]
-  );
-  if (existing) {
-    await db.runAsync(`DELETE FROM product_favorites WHERE product_id = ?`, [productId]);
-    return false;
-  } else {
-    await db.runAsync(`INSERT INTO product_favorites (product_id, created_at) VALUES (?, ?)`, [productId, nowIso()]);
+  return withTx(async db => {
+    const { localId, remoteId } = await favoriteAliases(productId);
+    const existing = await db.getFirstAsync(`SELECT product_id FROM product_favorites WHERE product_id = ? OR product_id = ?`, [localId, remoteId]);
+    if (existing) {
+      await db.runAsync(`DELETE FROM product_favorites WHERE product_id = ? OR product_id = ?`, [localId, remoteId]);
+      return false;
+    }
+    await db.runAsync(`INSERT OR IGNORE INTO product_favorites (product_id, created_at) VALUES (?, ?)`, [localId, nowIso()]);
     return true;
+  });
+}
+
+/** Normaliza aliases viejos sin duplicar el favorito ni propagar un UNIQUE al pull. */
+async function normalizeFavoriteAlias(db: SQLiteDatabase, localId: string, remoteId: string) {
+  await db.runAsync(`INSERT OR IGNORE INTO product_favorites (product_id, created_at) SELECT ?, created_at FROM product_favorites WHERE product_id = ?`, [localId, remoteId]);
+  await db.runAsync(`DELETE FROM product_favorites WHERE product_id = ? AND product_id <> ?`, [remoteId, localId]);
+}
+
+/** Una sola definicion activa por producto; conserva primero la configuracion pendiente. */
+export async function reconcileComboDefinitionAliases(db: SQLiteDatabase, localId: string, remoteId: string | null): Promise<string | null> {
+  const definitions = await db.getAllAsync<{ id: string }>(
+    `SELECT id FROM combo_definitions WHERE (product_id = ? OR product_id = ?) AND active = 1
+     ORDER BY CASE WHEN sync_status <> 'synced' THEN 0 ELSE 1 END, CASE WHEN product_id = ? THEN 0 ELSE 1 END, rowid DESC`, [localId, remoteId, localId]);
+  const canonical = definitions[0];
+  if (!canonical) return null;
+  await db.runAsync(`UPDATE combo_definitions SET product_id = ? WHERE id = ?`, [localId, canonical.id]);
+  for (const duplicate of definitions.slice(1)) {
+    // Conservar el contenido de versiones viejas para recuperacion, pero no hidratar dos combos.
+    await db.runAsync(`UPDATE combo_definitions SET active = 0 WHERE id = ?`, [duplicate.id]);
   }
+  return canonical.id;
 }
 
 /** Hidrata una lista de productos con sus presentaciones y definiciones de combos */
@@ -193,7 +215,7 @@ export async function listProducts(optionsOrSearch?: string | ListProductsOption
   }
 
   if (onlyFavorites) {
-    conditions.push("p.id IN (SELECT product_id FROM product_favorites)");
+    conditions.push("(p.id IN (SELECT product_id FROM product_favorites) OR p.server_id IN (SELECT product_id FROM product_favorites))");
   }
 
   if (productIds && productIds.length > 0) {
@@ -464,9 +486,10 @@ export async function updateProductLocal(productId: string, input: UpdateProduct
       }
     }
 
+    await reconcileComboDefinitionAliases(db, localProdId, serverProdId);
     if (productType === "combo" && comboDef) {
       const existingDef = await db.getFirstAsync<{ id: string }>(
-        `SELECT id FROM combo_definitions WHERE product_id = ? OR (product_id = ? AND product_id IS NOT NULL)`,
+        `SELECT id FROM combo_definitions WHERE (product_id = ? OR (product_id = ? AND product_id IS NOT NULL)) AND active = 1`,
         [localProdId, serverProdId]
       );
       let comboDefId: string;
@@ -548,13 +571,14 @@ export async function remapProductReferences(
     // 1. product_presentations.product_id
     await db.runAsync(`UPDATE product_presentations SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
     // 2. combo_definitions.product_id
-    await db.runAsync(`UPDATE combo_definitions SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+    // Las definiciones conservan el ID local estable del producto.
+    await reconcileComboDefinitionAliases(db, oldId, canonicalId);
     // 3. order_items.product_id
     await db.runAsync(`UPDATE order_items SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
     // 4. order_item_selections.selected_product_id
     await db.runAsync(`UPDATE order_item_selections SET selected_product_id = ? WHERE selected_product_id = ?`, [canonicalId, oldId]);
     // 5. product_favorites.product_id
-    await db.runAsync(`UPDATE product_favorites SET product_id = ? WHERE product_id = ?`, [canonicalId, oldId]);
+    await normalizeFavoriteAlias(db, oldId, canonicalId);
   }
 }
 
@@ -575,7 +599,8 @@ export async function upsertProductFromServer(serverProduct: any) {
   );
 
   // Si el producto local tiene cambios pendientes de subir, no sobreescribir
-  if (localMatch && localMatch.sync_status !== "synced") {
+  if (localMatch && (localMatch.sync_status !== "synced" || await hasUnresolvedOutbox(db, "product", localMatch.id))) {
+    await db.runAsync(`UPDATE products SET server_id = ? WHERE id = ?`, [serverProduct.id, localMatch.id]);
     return;
   }
 
@@ -661,10 +686,9 @@ export async function upsertProductFromServer(serverProduct: any) {
   // Si el producto incluye definición de combo, sincronizarla localmente
   if (serverProduct.combo_definition) {
     const cd = serverProduct.combo_definition;
-    const existingDef = await db.getFirstAsync<{ id: string }>(
-      `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ?`,
-      [cd.id, targetId]
-    );
+    const canonicalDefId = await reconcileComboDefinitionAliases(db, targetId, serverProduct.id);
+    const existingDef = canonicalDefId ? { id: canonicalDefId } : await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR product_id = ?`, [cd.id, targetId, serverProduct.id]);
     const targetDefId = existingDef ? existingDef.id : cd.id;
     await db.runAsync(
       `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)

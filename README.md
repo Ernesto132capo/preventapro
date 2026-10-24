@@ -188,6 +188,8 @@ En **Mi cuenta → Guardar respaldo** se crea una copia de los datos de trabajo,
 
 En **Mi cuenta → Restaurar respaldo** puedes elegir una copia local o importar las copias de una carpeta. La app valida el archivo, respalda los datos actuales y restaura todo en una transacción. Los cambios pendientes restaurados se procesan en la próxima sincronización.
 
+La lista utiliza un índice pequeño para evitar abrir todos los respaldos completos. Los respaldos antiguos reconstruyen ese índice automáticamente. Puedes usar **Eliminar copia local** para depurar archivos; si una copia contiene cambios pendientes, primero debes usar **Guardar en carpeta**. La exportación verifica el archivo externo antes de habilitar su eliminación local. No se eliminan respaldos automáticamente.
+
 **Reiniciar datos locales** y **Descartar pendientes con error** guardan un respaldo antes de actuar. Si el respaldo falla, no se ejecuta la operación. Antes de reiniciar una copia con cambios pendientes, guarda también el archivo en una carpeta externa si necesitas conservarlo fuera de la app.
 
 El mantenimiento automático solo elimina eventos `done` del outbox cuya confirmación tenga más de 30 días. Conserva pedidos, clientes, jornadas y eventos pendientes o con error. Los errores temporales se reintentan sin límite de intentos, con esperas de 30 segundos a 15 minutos; las validaciones permanentes requieren corrección o descarte explícito.
@@ -222,6 +224,8 @@ Variables requeridas en Render:
 - `NODE_ENV=production`.
 
 Render asigna `PORT` automáticamente. Antes de un despliegue con cambios de esquema, ejecuta `npm run migrate` una vez contra Neon; para migraciones usa preferentemente la conexión directa de Neon.
+
+Esta revisión incorpora `010_clients_assigned_user`, que añade de forma idempotente la columna `clients.assigned_user_id` usada al registrar clientes. El runner la aplica tanto a bases existentes como a instalaciones nuevas. Debe ejecutarse antes de desplegar el backend actualizado.
 
 ---
 

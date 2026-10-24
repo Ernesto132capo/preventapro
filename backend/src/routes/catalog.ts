@@ -79,6 +79,8 @@ const comboDefinitionInput = z.object({
 }).passthrough();
 
 const presentationInput = z.object({
+  id: z.string().uuid().optional(),
+  localId: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(100),
   unitEquivalence: z.number().int().positive().max(1_000_000),
   priceCents: z.number().int().nonnegative().max(2_000_000_000),
@@ -86,6 +88,7 @@ const presentationInput = z.object({
 }).passthrough();
 
 const productSchema = z.object({
+  productLocalId: z.string().uuid().optional(),
   sku: z.string().trim().min(1).max(100),
   name: z.string().trim().min(1).max(250),
   categoryId: z.string().min(1).optional().nullable(),
@@ -244,39 +247,66 @@ export async function serialProduct(row: any, dbClient: PoolClient | typeof pool
   return product;
 }
 
-async function syncProductPresentationsAndCombos(
+export async function syncProductPresentations(
   client: PoolClient,
   productId: string,
-  presentations: Array<{ name: string; unitEquivalence: number; priceCents: number; costCents: number }>,
-  productType: "standard" | "combo",
-  comboDefinition: { selectionMin: number; selectionMax: number; options: Array<{ presentationId: string; maxQuantity?: number | null; sortOrder?: number }> } | null | undefined,
+  presentations: Array<{ id?: string; localId?: string; name: string; unitEquivalence: number; priceCents: number; costCents: number }>,
   ts: string
 ) {
-  const current = await client.query("SELECT id, name FROM product_presentations WHERE product_id = $1", [productId]);
+  const current = await client.query("SELECT id, name FROM product_presentations WHERE product_id = $1 FOR UPDATE", [productId]);
   const names = new Set(presentations.map((p) => p.name));
+  if (names.size !== presentations.length) throw new Error("Las presentaciones deben tener nombres distintos.");
+  const byId = new Map(current.rows.map((p: any) => [p.id, p]));
   const byName = new Map(current.rows.map((p: any) => [p.name, p]));
+  const matches = presentations.map((p) => {
+    if (p.id && !byId.has(p.id)) throw new Error("La presentación no pertenece a este producto.");
+    return p.id ? byId.get(p.id) : (p.localId ? byId.get(p.localId) : undefined) || byName.get(p.name);
+  });
+  const retainedIds = new Set(matches.filter(Boolean).map((p: any) => p.id));
+  if (retainedIds.size !== matches.filter(Boolean).length) throw new Error("Una presentación no puede aparecer dos veces.");
+
+  // Reservar nombres antes de renombrar permite intercambiarlos sin romper
+  // UNIQUE(product_id, name). Los UUID permanecen y los combos conservan sus referencias.
+  for (const row of current.rows) {
+    const nextIndex = matches.findIndex((match: any) => match?.id === row.id);
+    if ((nextIndex >= 0 && presentations[nextIndex].name !== row.name) || (nextIndex < 0 && names.has(row.name))) {
+      await client.query("UPDATE product_presentations SET name = $2 WHERE id = $1", [row.id, `__renamed_${uuid()}`]);
+    }
+  }
 
   for (const row of current.rows) {
-    if (!names.has(row.name)) {
+    if (!retainedIds.has(row.id)) {
       await client.query("UPDATE product_presentations SET active = false, updated_at = $2 WHERE id = $1", [row.id, ts]);
     }
   }
   for (let sortOrder = 0; sortOrder < presentations.length; sortOrder++) {
     const p = presentations[sortOrder];
-    const match = byName.get(p.name);
+    const match = matches[sortOrder];
     if (match) {
       await client.query(
-        `UPDATE product_presentations SET sort_order = $2, unit_equivalence = $3, price_cents = $4, cost_cents = $5, active = true, updated_at = $6 WHERE id = $1`,
-        [match.id, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
+        `UPDATE product_presentations SET sort_order = $2, unit_equivalence = $3, price_cents = $4, cost_cents = $5, active = true, updated_at = $6, name = $7 WHERE id = $1`,
+        [match.id, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts, p.name]
       );
     } else {
       await client.query(
         `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)`,
-        [uuid(), productId, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
+        [p.localId || uuid(), productId, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
       );
     }
   }
+
+}
+
+export async function syncProductPresentationsAndCombos(
+  client: PoolClient,
+  productId: string,
+  presentations: Array<{ id?: string; localId?: string; name: string; unitEquivalence: number; priceCents: number; costCents: number }>,
+  productType: "standard" | "combo",
+  comboDefinition: { selectionMin: number; selectionMax: number; options: Array<{ presentationId: string; maxQuantity?: number | null; sortOrder?: number }> } | null | undefined,
+  ts: string
+) {
+  await syncProductPresentations(client, productId, presentations, ts);
 
   // Gestionar definición de combo
   if (productType === "combo" && comboDefinition) {
@@ -326,13 +356,15 @@ catalogRouter.get("/categories", async (_req, res, next) => {
 
 catalogRouter.post("/categories", async (req: AuthedRequest, res, next) => {
   try {
-    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
+    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100), categoryLocalId: z.string().uuid().optional() }).strict().safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-    const { name } = parsed.data;
+    const { name, categoryLocalId } = parsed.data;
     if (UUID_REGEX.test(name)) {
       return res.status(400).json({ error: "El nombre de categoría no puede ser un UUID." });
     }
-    const existing = await pool.query("SELECT id, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [name]);
+    const existing = categoryLocalId
+      ? await pool.query("SELECT id, name, active FROM categories WHERE id = $1 OR lower(name) = lower($2) ORDER BY (id = $1) DESC LIMIT 1", [categoryLocalId, name])
+      : await pool.query("SELECT id, name, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [name]);
     const ts = nowIso();
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
@@ -341,9 +373,9 @@ catalogRouter.post("/categories", async (req: AuthedRequest, res, next) => {
         await pool.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [row.id, ts]);
       }
       invalidatePullCache("products");
-      return res.json({ category: { id: row.id, name, active: 1, created_at: ts, updated_at: ts } });
+      return res.json({ category: { id: row.id, name: row.name ?? name, active: 1, created_at: ts, updated_at: ts }, deduped: true });
     }
-    const id = uuid();
+    const id = categoryLocalId || uuid();
     await pool.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [id, name, ts]);
     invalidatePullCache("products");
     res.status(201).json({ category: { id, name, active: 1, created_at: ts, updated_at: ts } });
@@ -419,10 +451,9 @@ catalogRouter.post("/products", asyncRoute(async (req: AuthedRequest, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
   const d = parsed.data;
 
-  const existing = await pool.query(
-    "SELECT * FROM products WHERE sku = $1 OR lower(name) = lower($2) LIMIT 1",
-    [d.sku, d.name]
-  );
+  const existing = d.productLocalId
+    ? await pool.query("SELECT * FROM products WHERE id = $1 OR sku = $2 OR lower(name) = lower($3) ORDER BY (id = $1) DESC LIMIT 1", [d.productLocalId, d.sku, d.name])
+    : await pool.query("SELECT * FROM products WHERE sku = $1 OR lower(name) = lower($2) LIMIT 1", [d.sku, d.name]);
 
   const ts = nowIso();
 
@@ -485,7 +516,7 @@ catalogRouter.post("/products", asyncRoute(async (req: AuthedRequest, res) => {
   }
 
   // Creación de nuevo producto
-  const id = uuid();
+  const id = d.productLocalId || uuid();
   let client: PoolClient | undefined;
   try {
     client = await pool.connect();
@@ -519,7 +550,7 @@ catalogRouter.post("/products", asyncRoute(async (req: AuthedRequest, res) => {
       await client.query(
         `INSERT INTO product_presentations (id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)`,
-        [uuid(), id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
+        [p.localId || uuid(), id, p.name, sortOrder, p.unitEquivalence, p.priceCents, p.costCents, ts]
       );
     }
 

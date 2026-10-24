@@ -1,8 +1,9 @@
 import { LOCAL_SCHEMA } from "../db/schema";
-import { createOrderLocal, updateOrderLocal, cancelOrderLocal, upsertOrderFromServer, getConsolidatedProductsForWorkDay } from "../db/repositories/orders";
-import { upsertFromServer } from "../db/repositories/clients";
+import { createOrderLocal, updateOrderLocal, cancelOrderLocal, upsertOrderFromServer, getConsolidatedProductsForWorkDay, listOrdersForWorkDay } from "../db/repositories/orders";
+import { createClientLocal, updateClientLocal, upsertFromServer } from "../db/repositories/clients";
 import { upsertCategoryFromServer } from "../db/repositories/categories";
-import { resolveServerPresentationId, upsertProductFromServer } from "../db/repositories/products";
+import { resolveServerPresentationId, upsertProductFromServer, createProductLocal, updateProductLocal, getProduct, toggleFavoriteLocal, listProducts, isFavoriteLocal } from "../db/repositories/products";
+import { getWorkDay, deleteClosedWorkDayLocal, assertClosedWorkDayDeletable } from "../db/repositories/workdays";
 import { pullCatalog, pushOnlySync, runSync, resetSyncCooldown, withSyncMaintenance } from "../services/sync";
 import { apiFetch, ApiError } from "../services/api";
 import { listPending, retryFailed } from "../db/outbox";
@@ -65,6 +66,17 @@ async function queue(id: string, operation = "create", attempts = 0) {
   await mockDb.runAsync(`INSERT INTO outbox(id,entity_type,local_entity_id,operation,status,attempts,created_at) VALUES (?, 'order', ?, ?, 'pending', ?, ?)`, [`q-${id}`, id, operation, attempts, ts]);
 }
 const scalar = (sql: string) => mockSqlite.prepare(sql).get();
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
+const productResponse = (body: any, id = "new-remote-product") => ({
+  id, sku: body.sku, name: body.name, product_type: body.productType,
+  presentations: body.presentations.map((p: any) => ({ id: p.id || p.localId || "new-remote-pres", name: p.name, unit_equivalence: p.unitEquivalence, price_cents: p.priceCents, cost_cents: p.costCents })),
+  ...(body.comboDefinition ? { combo_definition: { id: "new-remote-definition", selection_min: body.comboDefinition.selectionMin, selection_max: body.comboDefinition.selectionMax,
+    options: body.comboDefinition.options.map((o: any, i: number) => ({ id: `remote-option-${i}`, presentation_id: o.presentationId, max_quantity: o.maxQuantity, sort_order: i })) } } : {}),
+});
 
 sqliteDescribe("Offline sync data integrity with real SQLite", () => {
   beforeEach(async () => {
@@ -84,6 +96,209 @@ sqliteDescribe("Offline sync data integrity with real SQLite", () => {
     });
   });
   afterEach(() => mockSqlite.close());
+
+  it("persists an edit made after a lost client create ACK and coalesces its pending events", async () => {
+    const client = await createClientLocal({ businessName: "First" });
+    let remote = { id: "new-remote-client", client_local_id: client.id, business_name: "First" };
+    let first = true;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/clients" && first) { first = false; throw new ApiError("Respuesta perdida", 0); }
+      if (path === "/clients") return { client: remote, deduped: true };
+      if (path === "/clients/new-remote-client") { remote = { ...remote, business_name: options.body.businessName }; return { client: remote }; }
+      return { workDay: null };
+    });
+    expect((await pushOnlySync("user")).pushed.deferred).toBe(1);
+    await updateClientLocal(client.id, { businessName: "Second" });
+    await mockDb.runAsync("UPDATE outbox SET next_retry_at=NULL");
+    expect((await pushOnlySync("user")).pushed.done).toBe(1);
+    expect(remote.business_name).toBe("Second");
+    expect(scalar(`SELECT COUNT(*) n FROM outbox WHERE status <> 'done'`).n).toBe(0);
+    await upsertFromServer(remote);
+    expect(scalar(`SELECT business_name,sync_status FROM clients WHERE id='${client.id}'`)).toMatchObject({ business_name: "Second", sync_status: "synced" });
+  });
+
+  it("an old client ACK cannot confirm or overwrite a newer local edit", async () => {
+    const client = await createClientLocal({ businessName: "First" });
+    const entered = deferred<void>(), ack = deferred<any>();
+    (apiFetch as jest.Mock).mockImplementation(async (path: string) => {
+      if (path === "/clients") { entered.resolve(); return ack.promise; }
+      return { workDay: null };
+    });
+    const firstPush = pushOnlySync("user");
+    await entered.promise;
+    await updateClientLocal(client.id, { businessName: "Second" });
+    ack.resolve({ client: { id: "new-remote-client" } });
+    await firstPush;
+    expect(scalar(`SELECT sync_status FROM clients WHERE id='${client.id}'`).sync_status).toBe("pending");
+    await upsertFromServer({ id: "new-remote-client", client_local_id: client.id, business_name: "First" });
+    expect(scalar(`SELECT business_name FROM clients WHERE id='${client.id}'`).business_name).toBe("Second");
+    expect(scalar("SELECT COUNT(*) n FROM outbox WHERE status <> 'done'").n).toBe(1);
+  });
+
+  it("an old order ACK leaves a newer quantity pending and protects it from pull", async () => {
+    const order = await createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [line] });
+    const entered = deferred<void>(), ack = deferred<any>();
+    (apiFetch as jest.Mock).mockImplementation(async (path: string) => {
+      if (path === "/orders") { entered.resolve(); return ack.promise; }
+      return { workDay: null };
+    });
+    const firstPush = pushOnlySync("user");
+    await entered.promise;
+    await updateOrderLocal(order.id, [{ ...line, quantity: 2, subtotalCents: 2002 }]);
+    ack.resolve({ order: { id: "new-remote-order" } });
+    await firstPush;
+    expect(scalar("SELECT total_cents,sync_status FROM orders")).toMatchObject({ total_cents: 2002, sync_status: "pending" });
+    await upsertOrderFromServer(orderFixture({ id: "new-remote-order", idempotency_key: order.id }));
+    expect(scalar("SELECT total_cents,sync_status FROM orders")).toMatchObject({ total_cents: 2002, sync_status: "pending" });
+    expect(scalar("SELECT quantity FROM order_items").quantity).toBe(2);
+    let finalBody: any;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/orders/new-remote-order") { finalBody = options.body; return { order: { id: "new-remote-order" } }; }
+      return { workDay: null };
+    });
+    await pushOnlySync("user");
+    expect(finalBody.items[0].quantity).toBe(2);
+    expect(scalar("SELECT sync_status FROM orders").sync_status).toBe("synced");
+  });
+
+  it("retries a deduplicated order creation with its edited quantities before completing it", async () => {
+    const order = await createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [line] });
+    let first = true, remoteQuantity = 1;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/orders" && first) { first = false; throw new ApiError("Respuesta perdida", 0); }
+      if (path === "/orders") return { order: { id: "new-remote-order", status: "active", payment_condition: "Contado", items: [{ productId: "remote-product", presentationId: "remote-pres", quantity: 1, unitPriceCents: 1001 }] }, deduped: true };
+      if (path === "/orders/new-remote-order") { remoteQuantity = options.body.items[0].quantity; return { order: { id: "new-remote-order" } }; }
+      return { workDay: null };
+    });
+    await pushOnlySync("user");
+    await updateOrderLocal(order.id, [{ ...line, quantity: 3, subtotalCents: 3003 }]);
+    await mockDb.runAsync("UPDATE outbox SET next_retry_at=NULL");
+    await pushOnlySync("user");
+    expect(remoteQuantity).toBe(3);
+    expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(1);
+    expect(scalar("SELECT total_cents,sync_status FROM orders")).toMatchObject({ total_cents: 3003, sync_status: "synced" });
+  });
+
+  it("retries a deduplicated product creation with its latest name and prices", async () => {
+    const p = await createProductLocal({ name: "First", presentations: [{ name: "Bolsa", unitEquivalence: 1, priceCents: 100, costCents: 0 }] });
+    let remote: any, first = true;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/catalog/products" && first) { first = false; remote = productResponse(options.body); throw new ApiError("Respuesta perdida", 0); }
+      if (path === "/catalog/products") return { product: remote, deduped: true };
+      if (path === "/catalog/products/new-remote-product") { remote = productResponse(options.body); return { product: remote }; }
+      return { workDay: null };
+    });
+    await pushOnlySync("user");
+    await updateProductLocal(p.id, { name: "Second", presentations: [{ id: p.presentations[0].id, name: "Bolsa", unitEquivalence: 1, priceCents: 200, costCents: 0 }] });
+    await mockDb.runAsync("UPDATE outbox SET next_retry_at=NULL");
+    await pushOnlySync("user");
+    expect(remote.name).toBe("Second");
+    expect(remote.presentations[0].price_cents).toBe(200);
+    await upsertProductFromServer(remote);
+    expect((await getProduct(p.id))!.name).toBe("Second");
+    expect((await getProduct(p.id))!.presentations[0].price_cents).toBe(200);
+    expect(scalar("SELECT COUNT(*) n FROM outbox WHERE status <> 'done'").n).toBe(0);
+  });
+
+  it("an old product ACK leaves later presentation edits pending during a pull", async () => {
+    const p = await createProductLocal({ name: "First", presentations: [{ name: "Bolsa", unitEquivalence: 1, priceCents: 100, costCents: 0 }] });
+    const entered = deferred<void>(), ack = deferred<any>();
+    let original: any;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/catalog/products") { original = productResponse(options.body); entered.resolve(); return ack.promise; }
+      return { workDay: null };
+    });
+    const pushing = pushOnlySync("user");
+    await entered.promise;
+    await updateProductLocal(p.id, { name: "Second", presentations: [{ id: p.presentations[0].id, name: "Bolsa grande", unitEquivalence: 1, priceCents: 200, costCents: 0 }] });
+    ack.resolve({ product: original });
+    await pushing;
+    await upsertProductFromServer(original);
+    const local = (await getProduct(p.id))!;
+    expect(local).toMatchObject({ name: "Second", sync_status: "pending" });
+    expect(local.presentations[0]).toMatchObject({ name: "Bolsa grande", price_cents: 200 });
+  });
+
+  it("favorites survive aliases, filter correctly and remove both legacy copies", async () => {
+    await toggleFavoriteLocal("p");
+    await mockDb.runAsync("INSERT INTO product_favorites(product_id,created_at) VALUES ('remote-product',?)", [ts]);
+    await upsertProductFromServer({ id: "remote-product", sku: "P1", name: "Papa", presentations: [{ id: "remote-pres", name: "Unidad", price_cents: 1001 }] });
+    expect(scalar("SELECT COUNT(*) n FROM product_favorites").n).toBe(1);
+    expect((await listProducts({ onlyFavorites: true })).map(p => p.id)).toEqual(["p"]);
+    expect(await isFavoriteLocal("remote-product")).toBe(true);
+    expect(await toggleFavoriteLocal("remote-product")).toBe(false);
+    expect(scalar("SELECT COUNT(*) n FROM product_favorites").n).toBe(0);
+    expect(await listProducts({ onlyFavorites: true })).toHaveLength(0);
+  });
+
+  it("a synced combo keeps one active definition and editing uses the new limits", async () => {
+    const p = await createProductLocal({ name: "Combo", productType: "combo", presentations: [{ name: "Combo", unitEquivalence: 1, priceCents: 200, costCents: 0 }], comboDefinition: { selectionMin: 1, selectionMax: 1, options: [{ presentationId: "pres", maxQuantity: 2 }] } });
+    let remote: any;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/catalog/products" || path === "/catalog/products/new-remote-product") { remote = productResponse(options.body); return { product: remote }; }
+      return { workDay: null };
+    });
+    await pushOnlySync("user");
+    await upsertProductFromServer(remote);
+    expect(scalar("SELECT COUNT(*) n FROM combo_definitions WHERE active=1").n).toBe(1);
+    const local = (await getProduct(p.id))!;
+    await updateProductLocal(p.id, { name: "Combo", productType: "combo", presentations: [{ id: local.presentations[0].id, name: "Combo", unitEquivalence: 1, priceCents: 200, costCents: 0 }], comboDefinition: { selectionMin: 1, selectionMax: 2, options: [{ presentationId: "pres", maxQuantity: 2 }] } });
+    expect((await getProduct(p.id))!.combo_definition!.selection_max).toBe(2);
+    await pushOnlySync("user");
+    await upsertProductFromServer(remote);
+    expect(scalar("SELECT COUNT(*) n FROM combo_definitions WHERE active=1").n).toBe(1);
+    expect((await getProduct(p.id))!.combo_definition!.selection_max).toBe(2);
+  });
+
+  it("renaming a presentation sends its stable remote ID and preserves dependent combo links", async () => {
+    await mockDb.runAsync("INSERT INTO combo_definitions(id,product_id,selection_min,selection_max) VALUES ('definition','p',1,1)");
+    await mockDb.runAsync("INSERT INTO combo_options(id,combo_id,presentation_id) VALUES ('option','definition','remote-pres')");
+    await updateProductLocal("p", { name: "Papa", presentations: [{ id: "pres", name: "Bolsa nueva", unitEquivalence: 1, priceCents: 1001, costCents: 0 }] });
+    let body: any;
+    (apiFetch as jest.Mock).mockImplementation(async (path: string, options: any) => {
+      if (path === "/catalog/products/remote-product") { body = options.body; return { product: productResponse(body, "remote-product") }; }
+      return { workDay: null };
+    });
+    await pushOnlySync("user");
+    expect(body.presentations[0]).toMatchObject({ id: "remote-pres", localId: "pres", name: "Bolsa nueva" });
+    expect(scalar("SELECT presentation_id FROM combo_options").presentation_id).toBe("remote-pres");
+    expect(await resolveServerPresentationId("pres")).toBe("remote-pres");
+  });
+
+  it.each(["empty", "foreign", "above-limit"])("rejects an invalid %s combo atomically before writing its header", async (kind) => {
+    const combo = await createProductLocal({ name: "Combo", productType: "combo", presentations: [{ name: "Combo", unitEquivalence: 1, priceCents: 200, costCents: 0 }], comboDefinition: { selectionMin: 1, selectionMax: 2, options: [{ presentationId: "pres", maxQuantity: 1 }] } });
+    const comboLine: CartLine = {
+      ...line, productId: combo.id, presentationId: combo.presentations[0].id,
+      unitPriceCents: 200, subtotalCents: 200, isCombo: true,
+      selections: kind === "empty" ? [] : [{ selectedProductId: "p", selectedPresentationId: kind === "foreign" ? "missing-pres" : "pres",
+        productNameSnapshot: "Papa", presentationNameSnapshot: "Unidad", quantity: kind === "above-limit" ? 2 : 1, sortOrder: 0 }],
+    };
+    await expect(createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [comboLine] })).rejects.toThrow();
+    expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM order_items").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM outbox WHERE entity_type='order'").n).toBe(0);
+  });
+
+  it("historical orders and local deletion accept a remote workday ID without orphan selections", async () => {
+    await seedOrder("local-order", "remote-order", "synced");
+    await mockDb.runAsync("UPDATE work_days SET status='closed'");
+    await mockDb.runAsync("INSERT INTO order_item_selections(id,order_item_id,selected_product_id,selected_presentation_id,product_name_snapshot,presentation_name_snapshot,quantity) VALUES ('s','item-local-order','p','pres','Papa','Unidad',1)");
+    expect((await getWorkDay("remote-day"))!.id).toBe("day");
+    expect((await listOrdersForWorkDay("remote-day")).map(o => o.id)).toEqual(["local-order"]);
+    await assertClosedWorkDayDeletable("remote-day");
+    await deleteClosedWorkDayLocal("remote-day");
+    for (const table of ["work_days", "orders", "order_items", "order_item_selections"]) expect(scalar(`SELECT COUNT(*) n FROM ${table}`).n).toBe(0);
+  });
+
+  it.each(["pending", "outbox-only"])("preflight blocks remote workday deletion with %s local work", async (mode) => {
+    await seedOrder("local-order", "remote-order", mode === "pending" ? "pending" : "synced");
+    await mockDb.runAsync("UPDATE work_days SET status='closed'");
+    if (mode === "outbox-only") await queue("local-order", "update");
+    await expect(assertClosedWorkDayDeletable("remote-day")).rejects.toThrow(/pendientes/);
+    await expect(deleteClosedWorkDayLocal("remote-day")).rejects.toThrow(/pendientes/);
+    expect(scalar("SELECT COUNT(*) n FROM work_days").n).toBe(1);
+    expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(1);
+  });
 
   it("reconciles a lost create ACK by its original UUID without a second local order or doubled totals", async () => {
     await seedOrder();

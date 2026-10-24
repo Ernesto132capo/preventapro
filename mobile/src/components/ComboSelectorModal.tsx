@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, TextInput, Modal, StyleSheet, FlatList, Pressable, Alert } from "react-native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "./Button";
@@ -24,11 +24,23 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
   const debouncedSearch = useDebounce(search, 200);
   const [selectedCounts, setSelectedCounts] = useState<Record<string, number>>({});
   const [comboQty, setComboQty] = useState(1);
+  const selectionSession = `${visible ? "open" : "closed"}:${product?.id ?? ""}:${presentation?.id ?? ""}`;
+  const selectionSessionRef = useRef(selectionSession);
+  // Una selección pertenece a una apertura concreta y a un único combo.
+  const [selectionOwner, setSelectionOwner] = useState(selectionSession);
+  useEffect(() => {
+    selectionSessionRef.current = selectionSession;
+    setSelectedCounts({});
+    setComboQty(1);
+    setSearch("");
+    setSelectionOwner(selectionSession);
+  }, [selectionSession]);
 
   const options = product?.combo_definition?.options ?? emptyComboOptions;
+  const currentCounts = selectionOwner === selectionSession ? selectedCounts : {};
   const totalSelectedUnits = useMemo(
-    () => Object.values(selectedCounts).reduce((a, b) => a + b, 0),
-    [selectedCounts]
+    () => options.reduce((sum, option) => sum + (currentCounts[option.presentation_id] || 0), 0),
+    [options, currentCounts]
   );
   const filteredOptions = useMemo(() => {
     const term = debouncedSearch.trim().toLowerCase();
@@ -49,7 +61,7 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
   const isValid = totalSelectedUnits >= minRequired && totalSelectedUnits <= maxAllowed;
 
   function handleIncrement(option: ComboOption) {
-    const current = selectedCounts[option.presentation_id] || 0;
+    const current = currentCounts[option.presentation_id] || 0;
     if (totalSelectedUnits >= maxAllowed) {
       Alert.alert("Límite alcanzado", `El combo permite un máximo de ${maxAllowed} unidades.`);
       return;
@@ -65,7 +77,7 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
   }
 
   function handleDecrement(option: ComboOption) {
-    const current = selectedCounts[option.presentation_id] || 0;
+    const current = currentCounts[option.presentation_id] || 0;
     if (current <= 0) return;
     setSelectedCounts((prev) => {
       const next = { ...prev };
@@ -79,7 +91,7 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
   }
 
   function handleAddCombo() {
-    if (!product || !presentation) return;
+    if (!visible || !product || !presentation || selectionSessionRef.current !== selectionSession) return;
     if (!isValid) {
       if (totalSelectedUnits < minRequired) {
         Alert.alert("Selección incompleta", `Debes elegir al menos ${minRequired} unidades (llevas ${totalSelectedUnits}).`);
@@ -92,7 +104,7 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
     const selections: CartLineSelection[] = [];
     let sortOrder = 0;
     for (const opt of options) {
-      const qty = selectedCounts[opt.presentation_id] || 0;
+      const qty = currentCounts[opt.presentation_id] || 0;
       if (qty > 0) {
         selections.push({
           selectedProductId: opt.product_id || opt.id,
@@ -105,6 +117,13 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
       }
     }
 
+    if (selections.length === 0 || selections.some((selection) => {
+      const option = options.find((candidate) => candidate.presentation_id === selection.selectedPresentationId);
+      return !option || (option.max_quantity != null && selection.quantity > option.max_quantity);
+    })) {
+      Alert.alert("Selección inválida", "Vuelve a elegir las opciones de este combo.");
+      return;
+    }
     onAdd(product, presentation, comboQty, selections);
     setSelectedCounts({});
     setComboQty(1);
@@ -153,7 +172,7 @@ export const ComboSelectorModal = React.memo(function ComboSelectorModal({ visib
             keyboardShouldPersistTaps="handled"
             style={{ maxHeight: 320 }}
             renderItem={({ item }) => {
-              const count = selectedCounts[item.presentation_id] || 0;
+              const count = currentCounts[item.presentation_id] || 0;
               const maxLabel = item.max_quantity ? ` (Máx: ${item.max_quantity})` : "";
               const cannotIncrement = totalSelectedUnits >= maxAllowed || (item.max_quantity != null && count >= item.max_quantity);
               return (

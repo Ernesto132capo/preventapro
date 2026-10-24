@@ -14,7 +14,7 @@ import { centsToBs } from "../domain/pricing";
 import { LocalOrder, WorkDay } from "../domain/types";
 import { apiFetch, fetchActiveSessions, revokeOtherSessions, revokeSessionById, UserSessionInfo } from "../services/api";
 import { countUnresolvedOutboxItems } from "../db/outbox";
-import { BackupInfo, listLocalBackups, exportLocalBackup, importLocalBackups } from "../services/localBackup";
+import { BackupInfo, listLocalBackups, exportLocalBackup, importLocalBackups, deleteLocalBackup } from "../services/localBackup";
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
@@ -25,7 +25,7 @@ export function DashboardScreen() {
   const [recentOrders, setRecentOrders] = useState<LocalOrder[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [showUserModal, setShowUserModal] = useState(false);
-  const [stats, setStats] = useState<{ totalHistoricalOrders: number } | null>(null);
+  const [stats, setStats] = useState<{ totalHistoricalOrders: number; lastReceiptNumber: number } | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
   const [showCounterModal, setShowCounterModal] = useState(false);
   const [counterInput, setCounterInput] = useState("");
@@ -74,6 +74,16 @@ export function DashboardScreen() {
         setShowBackups(false);
         await load();
         Alert.alert("Respaldo restaurado", "Los datos están disponibles en este teléfono. Los cambios pendientes se enviarán en la próxima sincronización.");
+      }); } },
+    ]);
+  }
+
+  function confirmDeleteBackup(saved: BackupInfo) {
+    Alert.alert("Eliminar copia local", "Se eliminará únicamente este archivo de respaldo del teléfono. Tus preventas actuales y los datos del servidor se conservan.", [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Eliminar copia", style: "destructive", onPress: () => { void backupAction(async () => {
+        await deleteLocalBackup(saved.uri);
+        setBackups(await listLocalBackups());
       }); } },
     ]);
   }
@@ -156,7 +166,7 @@ export function DashboardScreen() {
     setLoadingStats(true);
     try {
       const res = await apiFetch<any>(`/settings/stats`);
-      setStats({ totalHistoricalOrders: res.totalHistoricalOrders });
+      setStats({ totalHistoricalOrders: res.totalHistoricalOrders, lastReceiptNumber: res.lastReceiptNumber ?? res.totalHistoricalOrders });
     } catch {
       // Si falla (sin conexión, etc.) simplemente no se muestra el dato — no es crítico.
     } finally {
@@ -394,7 +404,7 @@ export function DashboardScreen() {
             <Button
               label="✏️ Ajustar contador (temporal)"
               variant="outline"
-              onPress={() => { setCounterInput(stats ? String(stats.totalHistoricalOrders) : ""); setShowCounterModal(true); }}
+              onPress={() => { setCounterInput(stats ? String(stats.lastReceiptNumber) : ""); setShowCounterModal(true); }}
               style={{ marginTop: spacing.md }}
             />
 
@@ -431,8 +441,12 @@ export function DashboardScreen() {
                   <Text style={styles.statsHint}>{saved.orderCount} preventa(s) · {saved.pendingCount} cambio(s) pendientes</Text>
                   <Button label="Restaurar esta copia" variant="outline" disabled={backupBusy} onPress={() => confirmRestore(saved)} style={{ marginTop: spacing.xs }} />
                   <Button label="Guardar en carpeta" variant="outline" disabled={backupBusy} onPress={() => { void backupAction(async () => {
-                    if (await exportLocalBackup(saved.uri)) Alert.alert("Copia guardada", "El respaldo se guardó en la carpeta elegida.");
+                    if (await exportLocalBackup(saved.uri)) {
+                      setBackups(await listLocalBackups());
+                      Alert.alert("Copia guardada", "El respaldo se guardó en la carpeta elegida.");
+                    }
                   }); }} style={{ marginTop: spacing.xs }} />
+                  <Button label="Eliminar copia local" variant="outline" disabled={backupBusy} onPress={() => confirmDeleteBackup(saved)} style={{ marginTop: spacing.xs }} />
                 </View>
               ))}
             </ScrollView>
