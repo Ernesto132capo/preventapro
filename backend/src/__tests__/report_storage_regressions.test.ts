@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { removeExpiredReportDirectories, withReportDirectoryLock } from "../services/report-storage";
+import { removeExpiredReportDirectories, withReportDirectoryLock, withReportDirectoryRead } from "../services/report-storage";
 
 const hour = 60 * 60 * 1000;
 const ttl = 24 * hour;
@@ -27,6 +27,33 @@ beforeEach(async () => { root = await fs.promises.mkdtemp(path.join(os.tmpdir(),
 afterEach(async () => { await fs.promises.rm(root, { recursive: true, force: true }); });
 
 describe("Reportes: exclusión entre generación, descargas y GC", () => {
+  it("permite dos lectores y GC espera hasta que ambos terminan", async () => {
+    const directory = await expiredDirectory("shared-downloads");
+    const firstStarted = gate(), secondStarted = gate(), finishFirst = gate(), finishSecond = gate();
+    const first = withReportDirectoryRead(directory, async () => { firstStarted.resolve(); await finishFirst.promise; });
+    const second = withReportDirectoryRead(directory, async () => { secondStarted.resolve(); await finishSecond.promise; });
+    await Promise.all([firstStarted.promise, secondStarted.promise]);
+    const cleanup = removeExpiredReportDirectories(root, ttl);
+    finishFirst.resolve(); await first;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(fs.existsSync(directory)).toBe(true);
+    finishSecond.resolve(); await Promise.all([second, cleanup]);
+    expect(fs.existsSync(directory)).toBe(false);
+  });
+
+  it("no deja que lectores nuevos se adelanten a una eliminación ya reservada", async () => {
+    const directory = path.join(root, "fair-access");
+    const finishRead = gate(), started = gate(), events: string[] = [];
+    const first = withReportDirectoryRead(directory, async () => { started.resolve(); await finishRead.promise; events.push("first"); });
+    await started.promise;
+    const writer = withReportDirectoryLock(directory, async () => { events.push("exclusive"); });
+    const next = withReportDirectoryRead(directory, async () => { events.push("next"); });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(events).toEqual([]);
+    finishRead.resolve(); await Promise.all([first, writer, next]);
+    expect(events).toEqual(["first", "exclusive", "next"]);
+  });
+
   it("espera una generación en vuelo y revisa la antigüedad de nuevo antes de borrar", async () => {
     const directory = await expiredDirectory("generating");
     const started = gate();

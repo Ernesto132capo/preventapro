@@ -6,6 +6,7 @@ import { pool, nowIso } from "../db/pg";
 import { requireAuth, requireRole, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
 import { asyncRoute, isDatabaseUnavailable } from "../services/http-errors";
+import { CONFLICT_CODE, deletedConflictMessage } from "../services/conflict";
 
 export const catalogRouter = Router();
 catalogRouter.use(requireAuth);
@@ -25,20 +26,15 @@ export async function resolveCategoryId(
     // 1. Verificar si existe por ID directo en categories
     const byId = await client.query("SELECT id, active FROM categories WHERE id = $1 LIMIT 1", [cleanCatId]);
     if (byId.rows.length > 0) {
-      if (byId.rows[0].active === false) {
-        await client.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [byId.rows[0].id, ts]);
-      }
-      return byId.rows[0].id;
+      // Nunca reactivar una categoría eliminada de forma indirecta.
+      return byId.rows[0].active === false ? null : byId.rows[0].id;
     }
 
     // 2. Si no existe por ID, verificar si cleanCatId NO es un UUID (es un nombre textual de categoría)
     if (!UUID_REGEX.test(cleanCatId)) {
       const byName = await client.query("SELECT id, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [cleanCatId]);
       if (byName.rows.length > 0) {
-        if (byName.rows[0].active === false) {
-          await client.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [byName.rows[0].id, ts]);
-        }
-        return byName.rows[0].id;
+        return byName.rows[0].active === false ? null : byName.rows[0].id;
       }
       // Crear nueva categoría con este nombre legítimo
       const newCatId = uuid();
@@ -52,10 +48,7 @@ export async function resolveCategoryId(
   if (cleanCatName && !UUID_REGEX.test(cleanCatName)) {
     const byName = await client.query("SELECT id, active FROM categories WHERE lower(name) = lower($1) LIMIT 1", [cleanCatName]);
     if (byName.rows.length > 0) {
-      if (byName.rows[0].active === false) {
-        await client.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [byName.rows[0].id, ts]);
-      }
-      return byName.rows[0].id;
+      return byName.rows[0].active === false ? null : byName.rows[0].id;
     }
     const newCatId = cleanCatId && UUID_REGEX.test(cleanCatId) ? cleanCatId : uuid();
     await client.query("INSERT INTO categories (id, name, active, created_at, updated_at) VALUES ($1, $2, true, $3, $3)", [newCatId, cleanCatName, ts]);
@@ -72,11 +65,21 @@ const comboOptionInput = z.object({
   sortOrder: z.number().int().nonnegative().optional().default(0),
 }).passthrough();
 
-const comboDefinitionInput = z.object({
+export const comboDefinitionInput = z.object({
   selectionMin: z.number().int().positive(),
   selectionMax: z.number().int().positive(),
   options: z.array(comboOptionInput).min(1, "Configura al menos una opción para el combo."),
-}).passthrough();
+}).passthrough().refine((data) => {
+  if (data.selectionMax < data.selectionMin) return false;
+  // La selección mínima debe ser alcanzable: si ninguna opción es ilimitada,
+  // la suma de las cantidades máximas por opción debe cubrir selectionMin.
+  const hasUnlimited = data.options.some((option) => option.maxQuantity == null);
+  if (hasUnlimited) return true;
+  const capacity = data.options.reduce((sum, option) => sum + (option.maxQuantity ?? 0), 0);
+  return capacity >= data.selectionMin;
+}, {
+  message: "El combo no permite alcanzar la selección mínima con las opciones configuradas.",
+});
 
 const presentationInput = z.object({
   id: z.string().uuid().optional(),
@@ -100,13 +103,10 @@ const productSchema = z.object({
   presentations: z.array(presentationInput).min(1, "Configura al menos una presentación.").max(100),
   comboDefinition: comboDefinitionInput.optional().nullable(),
 }).passthrough().refine((data) => {
-  if (data.productType === "combo") {
-    if (!data.comboDefinition) return false;
-    if (data.comboDefinition.selectionMax < data.comboDefinition.selectionMin) return false;
-  }
+  if (data.productType === "combo" && !data.comboDefinition) return false;
   return true;
 }, {
-  message: "Para un producto combo, la definición de combo es obligatoria y selectionMax debe ser mayor o igual a selectionMin.",
+  message: "Para un producto combo, la definición de combo es obligatoria.",
 });
 
 const productUpdateSchema = z.object({
@@ -115,20 +115,12 @@ const productUpdateSchema = z.object({
   categoryId: z.string().min(1).optional().nullable(),
   categoryName: z.string().trim().min(1).max(100).optional().nullable(),
   photoUrl: z.string().url().max(2_000).optional().nullable(),
-  baseCostCents: z.number().int().nonnegative().max(2_000_000_000).default(0),
-  baseUnitName: z.string().trim().min(1).max(100).default("Unidad"),
-  productType: z.enum(["standard", "combo"]).default("standard"),
+  baseCostCents: z.number().int().nonnegative().max(2_000_000_000).optional(),
+  baseUnitName: z.string().trim().min(1).max(100).optional(),
+  productType: z.enum(["standard", "combo"]).optional(),
   presentations: z.array(presentationInput).min(1, "Configura al menos una presentación.").max(100),
   comboDefinition: comboDefinitionInput.optional().nullable(),
-}).passthrough().refine((data) => {
-  if (data.productType === "combo") {
-    if (!data.comboDefinition) return false;
-    if (data.comboDefinition.selectionMax < data.comboDefinition.selectionMin) return false;
-  }
-  return true;
-}, {
-  message: "Para un producto combo, la definición de combo es obligatoria y selectionMax debe ser mayor o igual a selectionMin.",
-});
+}).passthrough();
 
 function serialPresentation(row: any) {
   return {
@@ -369,8 +361,7 @@ catalogRouter.post("/categories", async (req: AuthedRequest, res, next) => {
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
       if (row.active === false) {
-        // Reactivar categoría previa con el mismo nombre
-        await pool.query("UPDATE categories SET active = true, updated_at = $2 WHERE id = $1", [row.id, ts]);
+        return res.status(409).json({ error: deletedConflictMessage("category"), code: CONFLICT_CODE, entityType: "category", serverId: row.id });
       }
       invalidatePullCache("products");
       return res.json({ category: { id: row.id, name: row.name ?? name, active: 1, created_at: ts, updated_at: ts }, deduped: true });
@@ -386,18 +377,26 @@ catalogRouter.post("/categories", async (req: AuthedRequest, res, next) => {
 
 catalogRouter.put("/categories/:id", async (req: AuthedRequest, res, next) => {
   try {
-    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100) }).strict().safeParse(req.body);
+    const parsed = z.object({ name: z.string().trim().min(1, "El nombre de categoría es obligatorio.").max(100), restore: z.boolean().optional() }).strict().safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
-    const { name } = parsed.data;
+    const { name, restore } = parsed.data;
     if (UUID_REGEX.test(name)) {
       return res.status(400).json({ error: "El nombre de categoría no puede ser un UUID." });
     }
     const ts = nowIso();
+    // Actualización atómica: solo reactiva si se solicita explícitamente (restore).
     const { rows } = await pool.query(
-      "UPDATE categories SET name = $2, updated_at = $3 WHERE id = $1 RETURNING *",
-      [req.params.id, name, ts]
+      "UPDATE categories SET name = $2, active = true, updated_at = $3 WHERE id = $1 AND (active = true OR $4 = true) RETURNING *",
+      [req.params.id, name, ts, restore === true]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "Categoría no encontrada." });
+    if (rows.length === 0) {
+      const existing = await pool.query("SELECT id, active, updated_at FROM categories WHERE id = $1", [req.params.id]);
+      if (existing.rows.length === 0) return res.status(404).json({ error: "Categoría no encontrada." });
+      if (existing.rows[0].active === false) {
+        return res.status(409).json({ error: deletedConflictMessage("category"), code: CONFLICT_CODE, entityType: "category", serverId: existing.rows[0].id, updatedAt: existing.rows[0].updated_at });
+      }
+      return res.status(404).json({ error: "Categoría no encontrada." });
+    }
     invalidatePullCache("products");
     res.json({ category: { ...rows[0], active: rows[0].active === false ? 0 : 1 } });
   } catch (err) {
@@ -464,7 +463,12 @@ catalogRouter.post("/products", asyncRoute(async (req: AuthedRequest, res) => {
       return res.json({ product: await serialProduct(existingRow), deduped: true });
     }
 
-    // [M-06] Si existía pero estaba inactivo, reactivarlo y actualizar sus datos
+    // Una alta normal nunca reactiva un producto eliminado; la restauración debe ser explícita.
+    if ((d as any).restore !== true) {
+      return res.status(409).json({ error: deletedConflictMessage("product"), code: CONFLICT_CODE, entityType: "product", serverId: existingRow.id, updatedAt: existingRow.updated_at });
+    }
+
+    // Restauración explícita: reactivar y actualizar sus datos
     let client: PoolClient | undefined;
     try {
       client = await pool.connect();
@@ -588,24 +592,61 @@ catalogRouter.put("/products/:id", asyncRoute(async (req: AuthedRequest, res) =>
 
   const existing = await pool.query("SELECT * FROM products WHERE id = $1", [req.params.id]);
   const old = existing.rows[0];
-  if (!old || old.active === false) return res.status(404).json({ error: "Producto no encontrado." });
+  if (!old) return res.status(404).json({ error: "Producto no encontrado." });
 
   const d = parsed.data, ts = nowIso();
+  const restore = (d as any).restore === true;
+  if (old.active === false && !restore) {
+    return res.status(409).json({ error: deletedConflictMessage("product"), code: CONFLICT_CODE, entityType: "product", serverId: old.id, updatedAt: old.updated_at });
+  }
+  // Conserva los campos omitidos: un PUT parcial no degrada el costo, el tipo ni pierde sku/foto.
+  const productType: "standard" | "combo" = d.productType ?? (old.product_type === "combo" ? "combo" : "standard");
+  const sku = d.sku ?? old.sku;
+  const photoUrl = d.photoUrl !== undefined ? d.photoUrl : (old.photo_url ?? null);
+  const baseCostCents = d.baseCostCents ?? old.base_cost_cents ?? 0;
+  const baseUnitName = d.baseUnitName ?? old.base_unit_name ?? "Unidad";
+
   let client: PoolClient | undefined;
   try {
     client = await pool.connect();
     await client.query("BEGIN");
 
-    if (d.productType === "combo" && d.comboDefinition) {
-      const presIds = d.comboDefinition.options.map((o) => o.presentationId);
-      const { rows: validPres } = await client.query(
-        `SELECT pp.id FROM product_presentations pp
-         JOIN products p ON pp.product_id = p.id
-         WHERE pp.id = ANY($1) AND pp.active = true AND p.active = true`,
-        [presIds]
-      );
-      if (validPres.length !== presIds.length) {
-        throw new Error("Una o más opciones del combo no pertenecen a presentaciones o productos activos.");
+    // Resolver la definición de combo efectiva sin desactivar la existente al editar.
+    let comboDefinition = d.comboDefinition ?? null;
+    if (productType === "combo") {
+      if (comboDefinition) {
+        const presIds = comboDefinition.options.map((o) => o.presentationId);
+        const { rows: validPres } = await client.query(
+          `SELECT pp.id FROM product_presentations pp
+           JOIN products p ON pp.product_id = p.id
+           WHERE pp.id = ANY($1) AND pp.active = true AND p.active = true`,
+          [presIds]
+        );
+        if (validPres.length !== presIds.length) {
+          throw new Error("Una o más opciones del combo no pertenecen a presentaciones o productos activos.");
+        }
+      } else {
+        // Conserva la definición y opciones existentes cuando el PUT no las envía.
+        const existingCombo = await client.query(
+          `SELECT id, selection_min, selection_max FROM combo_definitions WHERE product_id = $1 AND active = true`,
+          [req.params.id]
+        );
+        if (existingCombo.rows.length === 0) {
+          throw new Error("Para un producto combo, la definición de combo es obligatoria.");
+        }
+        const optionsRes = await client.query(
+          `SELECT presentation_id, max_quantity, sort_order FROM combo_options WHERE combo_id = $1 AND active = true ORDER BY sort_order`,
+          [existingCombo.rows[0].id]
+        );
+        comboDefinition = {
+          selectionMin: existingCombo.rows[0].selection_min,
+          selectionMax: existingCombo.rows[0].selection_max,
+          options: optionsRes.rows.map((o: any) => ({
+            presentationId: o.presentation_id,
+            maxQuantity: o.max_quantity,
+            sortOrder: o.sort_order,
+          })),
+        };
       }
     }
 
@@ -616,11 +657,11 @@ catalogRouter.put("/products/:id", asyncRoute(async (req: AuthedRequest, res) =>
     }
 
     await client.query(
-      `UPDATE products SET name = $2, category_id = $3, base_cost_cents = $4, base_unit_name = $5, product_type = $6, updated_at = $7 WHERE id = $1`,
-      [req.params.id, d.name, targetCategoryId, d.baseCostCents ?? old.base_cost_cents ?? 0, d.baseUnitName ?? old.base_unit_name ?? "Unidad", d.productType, ts]
+      `UPDATE products SET sku = $2, name = $3, category_id = $4, photo_url = $5, base_cost_cents = $6, base_unit_name = $7, product_type = $8, active = true, updated_at = $9 WHERE id = $1`,
+      [req.params.id, sku, d.name, targetCategoryId, photoUrl, baseCostCents, baseUnitName, productType, ts]
     );
 
-    await syncProductPresentationsAndCombos(client, req.params.id, d.presentations, d.productType, d.comboDefinition, ts);
+    await syncProductPresentationsAndCombos(client, req.params.id, d.presentations, productType, comboDefinition, ts);
 
     await client.query("COMMIT");
     const { rows: refreshed } = await pool.query("SELECT * FROM products WHERE id = $1", [req.params.id]);

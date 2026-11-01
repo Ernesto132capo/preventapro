@@ -370,8 +370,8 @@ describe("Suite Unificada: Sincronización, Jornadas y Reportes (sync_and_report
       mockClient.query.mockImplementation(async (sql: string, params: any[]) => {
         const clean = sql.replace(/\s+/g, " ").trim();
         if (clean === "BEGIN" || clean === "COMMIT" || clean === "ROLLBACK") return { rows: [] };
-        if (clean.includes("SELECT id FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2))")) {
-          return { rows: [{ id: "cat-existente" }] };
+        if (clean.includes("SELECT id, active, updated_at FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2))")) {
+          return { rows: [{ id: "cat-existente", active: true, updated_at: null }] };
         }
         if (clean.includes("UPDATE categories SET name = $1")) {
           executedCategoryUpdate = true;

@@ -1,12 +1,13 @@
 import { Router } from "express";
 import path from "path";
 import fs from "fs";
+import { createHash } from "crypto";
 import { pool } from "../db/pg";
 import { requireAuth, requireReportDownloadAuth, AuthedRequest } from "../middleware/auth";
 import { createReportDownloadToken } from "../services/auth";
 import { generateClientReceiptsExcel, generateClientSummaryExcel, generateProductListExcel } from "../services/excel";
 import { generateClientReceiptsPdf } from "../services/receipts-pdf";
-import { isMissingReportPath, removeExpiredReportDirectories, withReportDirectoryLock } from "../services/report-storage";
+import { isMissingReportPath, removeExpiredReportDirectories, withReportDirectoryRead } from "../services/report-storage";
 
 export const reportsRouter = Router();
 
@@ -83,17 +84,20 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
     return res.status(404).json({ error: "Reporte no encontrado." });
   }
 
+  let workDay: Record<string, any>;
   try {
-    const { rows: wdRows } = await pool.query("SELECT id FROM work_days WHERE id = $1", [safeWorkDayId]);
+    const { rows: wdRows } = await pool.query("SELECT id, updated_at, closed_at, status, order_count, total_cents FROM work_days WHERE id = $1", [safeWorkDayId]);
     if (wdRows.length === 0) {
       return res.status(404).json({ error: "Jornada no encontrada." });
     }
+    workDay = wdRows[0];
   } catch (err) {
     return next(err);
   }
 
-  // Regenera solo el formato solicitado para reflejar el diseño actual y evitar
-  // trabajo innecesario, por ejemplo crear un PDF al descargar un Excel.
+  // Cada versión confirmada de jornada usa archivos inmutables. Cambiar este
+  // identificador al modificar el diseño invalida también las copias del servidor.
+  const layoutVersion = "2026-11-01";
   const generators: Record<string, (id: string, dir: string) => Promise<string>> = {
     "lista_de_productos.xlsx": generateProductListExcel,
     "resumen_clientes.xlsx": generateClientSummaryExcel,
@@ -107,19 +111,30 @@ reportsRouter.get("/:workDayId/:fileName", requireReportDownloadAuth, async (req
   }
 
   const reportDir = path.join(reportsRoot, safeWorkDayId);
-  const filePath = path.join(reportDir, safeFileName);
+  const version = createHash("sha256").update(JSON.stringify([
+    layoutVersion, workDay.updated_at, workDay.closed_at, workDay.status, workDay.order_count, workDay.total_cents,
+  ])).digest("hex");
+  const outputDir = workDay.updated_at ? path.join(reportDir, version) : reportDir;
+  const filePath = path.join(outputDir, safeFileName);
   try {
     // GC puede esperar una descarga activa; no hacer que otra descarga espere a GC.
     void cleanupExpiredReportDirectories();
-    await withReportDirectoryLock(reportDir, async () => {
-      await fs.promises.mkdir(reportDir, { recursive: true });
-      await getOrGenerateReport(safeFileName, safeWorkDayId, reportDir, generateReport);
+    await withReportDirectoryRead(reportDir, async () => {
+      await fs.promises.mkdir(outputDir, { recursive: true });
+      const existing = await fs.promises.stat(filePath).catch(error => { if (isMissingReportPath(error)) return null; throw error; });
+      if (!existing?.isFile()) await getOrGenerateReport(safeFileName, safeWorkDayId, outputDir, async (id, directory) => {
+        // Una generación pudo terminar entre el stat anterior y la reserva.
+        const ready = await fs.promises.stat(filePath).catch(error => { if (isMissingReportPath(error)) return null; throw error; });
+        return ready?.isFile() ? filePath : generateReport(id, directory);
+      });
       const stats = await fs.promises.stat(filePath);
       if (!stats.isFile()) {
         res.status(404).json({ error: "El reporte solicitado no está disponible." });
         return;
       }
-      // Mantener el lock hasta que Express termine de leer el archivo o falle.
+      const touched = new Date();
+      await fs.promises.utimes(reportDir, touched, touched);
+      // La reserva compartida protege todas las descargas hasta su callback.
       await new Promise<void>((resolve, reject) => {
         res.download(filePath, safeFileName, (error) => error ? reject(error) : resolve());
       });

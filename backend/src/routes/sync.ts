@@ -9,6 +9,7 @@ import { isLegitimateOfflineOrder } from "../services/workday-policy";
 import { insertOrderItems, loadOrderCatalog } from "../services/order-storage";
 import { getBoliviaDate, getBoliviaToday } from "../services/dates";
 import { resolveCategoryId, UUID_REGEX, syncProductPresentations } from "./catalog";
+import { CONFLICT_CODE, deletedConflictMessage, DeletedEntityType } from "../services/conflict";
 
 export const syncRouter = Router();
 syncRouter.use(requireAuth);
@@ -636,8 +637,8 @@ interface SyncOperationItem {
   entityType?: "client" | "category" | "product" | "order" | "workday";
   entity_type?: "client" | "category" | "product" | "order" | "workday";
   type?: "client" | "category" | "product" | "order" | "workday";
-  operation?: "create" | "update" | "cancel" | "delete" | "close" | "reopen";
-  action?: "create" | "update" | "cancel" | "delete" | "close" | "reopen";
+  operation?: "create" | "update" | "cancel" | "delete" | "close" | "reopen" | "restore";
+  action?: "create" | "update" | "cancel" | "delete" | "close" | "reopen" | "restore";
   data?: any;
   [key: string]: any;
 }
@@ -652,6 +653,8 @@ interface SyncOperationResult {
   error?: string;
   httpStatus?: number;
   retryable?: boolean;
+  conflict?: string;
+  updatedAt?: string;
   workDayId?: string;
   workDay?: Record<string, unknown>;
 }
@@ -661,6 +664,25 @@ class SyncValidationError extends Error {}
 function syncFailureStatus(error: any): number {
   if (error instanceof SyncValidationError || error?.name === "PricingError" || String(error?.code || "").startsWith("23")) return 400;
   return 503;
+}
+
+function isRestoreOp(op: SyncOperationItem): boolean {
+  const data = op.data || {};
+  return op.operation === "restore" || op.action === "restore" || op.restore === true || data.restore === true;
+}
+
+function deletedConflictResult(localId: string, entityType: DeletedEntityType, serverId: string, updatedAt?: string | null): SyncOperationResult {
+  return {
+    id: localId,
+    entityType,
+    status: "failed",
+    conflict: CONFLICT_CODE,
+    error: deletedConflictMessage(entityType),
+    httpStatus: 409,
+    retryable: false,
+    serverId,
+    ...(updatedAt ? { updatedAt } : {}),
+  };
 }
 
 async function syncedOrderResult(client: PoolClient, localId: string, serverId: string, deduped = false): Promise<SyncOperationResult> {
@@ -885,6 +907,9 @@ async function processOrderSync(client: PoolClient, op: SyncOperationItem, userI
         }
         const selPres = catalog.selections.get(sPresId);
         if (!selPres) throw new SyncValidationError("Opción de presentación no encontrada.");
+        const selectedProductId = s.selectedProductId || s.selected_product_id;
+        // Payloads legacy omiten el producto y lo resuelven por presentación.
+        if (selectedProductId && selPres.prod_id !== selectedProductId) throw new SyncValidationError("La opción seleccionada no pertenece a este producto.");
         selectionsSnapshot.push({
           id: uuid(),
           selected_product_id: selPres.prod_id,
@@ -978,17 +1003,20 @@ async function processClientSync(client: PoolClient, op: SyncOperationItem, user
 
   const clientLocalId = data.clientLocalId || data.client_local_id || localId;
   const { rows: existing } = await client.query(
-    "SELECT id FROM clients WHERE id = $1 OR client_local_id = $2 LIMIT 1",
+    "SELECT id, active, updated_at FROM clients WHERE id = $1 OR client_local_id = $2 LIMIT 1",
     [data.serverId || data.server_id || localId, clientLocalId]
   );
 
   const neighborhoodId = data.neighborhoodId ?? data.neighborhood_id ?? null;
   if (existing.length > 0) {
     const serverId = existing[0].id;
+    if (existing[0].active === false && !isRestoreOp(op)) {
+      return deletedConflictResult(localId, "client", serverId, existing[0].updated_at);
+    }
     await client.query(
       `UPDATE clients SET
          business_name = $1, contact_name = $2,
-         phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $7, updated_at = now()
+         phone = $3, address = $4, lat = $5, lng = $6, neighborhood_id = $7, active = true, updated_at = now()
        WHERE id = $8`,
       [businessName || null, contactName || null, data.phone ?? null, data.address ?? null, data.lat ?? null, data.lng ?? null, neighborhoodId, serverId]
     );
@@ -1023,9 +1051,12 @@ async function processCategorySync(client: PoolClient, op: SyncOperationItem): P
   }
 
   const targetId = data.serverId || data.server_id || localId;
-  const { rows: existing } = await client.query("SELECT id FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1", [targetId, name]);
+  const { rows: existing } = await client.query("SELECT id, active, updated_at FROM categories WHERE id = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1", [targetId, name]);
   if (existing.length > 0) {
     const serverId = existing[0].id;
+    if (existing[0].active === false && !isRestoreOp(op)) {
+      return deletedConflictResult(localId, "category", serverId, existing[0].updated_at);
+    }
     await client.query("UPDATE categories SET name = $1, active = true, updated_at = now() WHERE id = $2", [name, serverId]);
     return { id: localId, serverId, entityType: "category", status: "synced" };
   }
@@ -1050,24 +1081,28 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
   const baseCost = Math.max(0, Number(data.baseCostCents ?? data.base_cost_cents ?? 0));
   const productType = data.productType || data.product_type || "standard";
 
-  // [M-05] Resolver categoría sin crear nombres que sean cadenas UUID
+  const targetId = data.serverId || data.server_id || localId;
+  const { rows: existing } = await client.query(
+    "SELECT id, active, updated_at FROM products WHERE id = $1 OR lower(sku) = lower($2) LIMIT 1",
+    [targetId, sku]
+  );
+
+  let serverId = targetId;
+  const isExisting = existing.length > 0;
+  if (isExisting && existing[0].active === false && !isRestoreOp(op)) {
+    return deletedConflictResult(localId, "product", existing[0].id, existing[0].updated_at);
+  }
+
+  // [M-05] Resolver categoría solo después de confirmar que no hay conflicto de eliminación.
   const targetCategoryId = await resolveCategoryId(
     client,
     data.categoryId || data.category_id || null,
     data.categoryName || data.category_name || null
   );
 
-  const targetId = data.serverId || data.server_id || localId;
-  const { rows: existing } = await client.query(
-    "SELECT id, active FROM products WHERE id = $1 OR sku = $2 OR lower(name) = lower($3) LIMIT 1",
-    [targetId, sku, name]
-  );
-
-  let serverId = targetId;
-  const isExisting = existing.length > 0;
   if (isExisting) {
     serverId = existing[0].id;
-    // [M-06] Reactivar si estaba inactivo y actualizar sus datos
+    // Actualiza sus datos; solo una restauración explícita lo reactiva.
     await client.query(
       `UPDATE products SET name = $1, sku = $2, base_cost_cents = $3, product_type = $4, category_id = $5, active = true, updated_at = now()
        WHERE id = $6`,
@@ -1142,6 +1177,10 @@ async function processProductSync(client: PoolClient, op: SyncOperationItem, use
         [optId, comboDefId, presId, maxQty != null ? Number(maxQty) : null, sortOrder, ts]
       );
     }
+  } else {
+    // Si el producto dejó de ser combo, desactivar las definiciones previas para
+    // no dejar combos huérfanos que el pull seguiría enviando.
+    await client.query("UPDATE combo_definitions SET active = false, updated_at = now() WHERE product_id = $1", [serverId]);
   }
 
   return { id: localId, serverId, entityType: "product", status: "synced", deduped: isExisting };
@@ -1175,6 +1214,13 @@ syncRouter.post(["/push", "/"], async (req: AuthedRequest, res, next) => {
     if (Array.isArray(body.orders)) {
       body.orders.forEach((o: any) => rawOperations.push({ ...o, entityType: "order", operation: o.operation || o.action || (o.status === "cancelled" ? "cancel" : "create") }));
     }
+  }
+
+  // Lote acotado: limita el trabajo por petición (transacciones largas/memoria/DoS)
+  // sin afectar al móvil, que envía de a una operación por preventa/cancelación.
+  const MAX_SYNC_OPERATIONS = 200;
+  if (rawOperations.length > MAX_SYNC_OPERATIONS) {
+    return res.status(413).json({ error: `El lote excede el máximo de ${MAX_SYNC_OPERATIONS} operaciones por sincronización.` });
   }
 
   // Resuelve categorías antes de productos y padres antes de preventas,

@@ -24,7 +24,7 @@ beforeEach(async () => {
 afterEach(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
 
 /** Ejecuta la ruta real con filesystem real y generadores controlables, sin abrir un puerto. */
-async function loadRoute(generator: Generator) {
+async function loadRoute(generator: Generator, version?: () => string) {
   let getHandler: any;
   const router = { post: vi.fn(), get: (_url: string, _auth: unknown, handler: unknown) => { getHandler = handler; } };
   const filename = path.resolve(__dirname, "../routes/reports.ts");
@@ -40,7 +40,8 @@ async function loadRoute(generator: Generator) {
       if (name === "express") return { Router: () => router };
       if (name === "path") return path;
       if (name === "fs") return fs;
-      if (name === "../db/pg") return { pool: { query: async () => ({ rows: [{ id: "exists" }] }) } };
+      if (name === "crypto") return require("crypto");
+      if (name === "../db/pg") return { pool: { query: async () => ({ rows: [{ id: "exists", ...(version ? { updated_at: version() } : {}) }] }) } };
       if (name === "../middleware/auth") return { requireAuth: vi.fn(), requireReportDownloadAuth: vi.fn() };
       if (name === "../services/auth") return { createReportDownloadToken: () => "test-token" };
       if (name === "../services/excel") return { generateProductListExcel: generator };
@@ -79,6 +80,32 @@ async function writeReport(_id: string, directory: string) {
 }
 
 describe("Ruta de reportes: protección durante toda la respuesta", () => {
+  it("comparte generación y permite descargar el mismo archivo sin esperar al otro teléfono", async () => {
+    const generator = vi.fn(writeReport);
+    const route = await loadRoute(generator);
+    const finishDownload = gate();
+    const first = route.request("shared", finishDownload.promise);
+    try {
+      await first.downloadStarted;
+      const second = route.request("shared");
+      expect((await second.response).status).toBe(200);
+      expect(generator).toHaveBeenCalledTimes(1);
+    } finally { finishDownload.resolve(); await first.response; }
+  });
+
+  it("reutiliza archivos de la misma versión y una edición de jornada genera otra copia", async () => {
+    let version = "2026-11-01T10:00:00.000Z";
+    const generator = vi.fn(writeReport);
+    const route = await loadRoute(generator, () => version);
+    expect((await route.request("versioned").response).status).toBe(200);
+    expect((await route.request("versioned").response).status).toBe(200);
+    expect(generator).toHaveBeenCalledTimes(1);
+    version = "2026-11-01T11:00:00.000Z";
+    expect((await route.request("versioned").response).status).toBe(200);
+    expect(generator).toHaveBeenCalledTimes(2);
+    expect(generator.mock.calls[0][1]).not.toBe(generator.mock.calls[1][1]);
+  });
+
   it("GC de otra petición no borra una carpeta mientras su generador está esperando datos", async () => {
     const origin = clock;
     const oldDir = path.join(tempDir, "reports", "old");

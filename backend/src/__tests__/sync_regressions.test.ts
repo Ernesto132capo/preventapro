@@ -299,3 +299,26 @@ describe("Recuperación de jornadas capturadas enteramente offline", () => {
     expect(result.body.results[0]).toMatchObject({ status: "failed", httpStatus: 503, retryable: true });
   });
 });
+
+it("rechaza en sync una opción de combo con selectedProductId de otro producto sin insertar una preventa", async () => {
+  db.query.mockImplementation(async (sql: string) => {
+    if (sql.startsWith("SELECT * FROM work_days WHERE id")) return { rows: [{ id: "day", status: "open" }] };
+    if (sql.startsWith("SELECT id, active FROM clients")) return { rows: [{ id: "client", active: true }] };
+    if (sql.includes("FROM products WHERE id")) return { rows: [{ id: "combo", name: "Combo", sku: "C", product_type: "combo", active: true }] };
+    if (sql.includes("FROM product_presentations WHERE id")) return { rows: [{ id: "combo-pres", product_id: "combo", name: "Combo", unit_equivalence: 1, price_cents: 300, active: true }] };
+    if (sql.includes("FROM combo_definitions")) return { rows: [{ id: "definition", product_id: "combo", selection_min: 1, selection_max: 1 }] };
+    if (sql.includes("FROM combo_options")) return { rows: [{ id: "option", combo_id: "definition", presentation_id: "option-pres", max_quantity: 1 }] };
+    if (sql.includes("FROM product_presentations pp JOIN products")) return { rows: [{ id: "option-pres", prod_id: "correct-product", prod_name: "Papa", pres_name: "Unidad" }] };
+    return { rows: [] };
+  });
+  const result = await request("POST", "/api/sync/push", { operations: [{
+    id: "local-order", entityType: "order", data: {
+      workDayId: "day", clientId: "client", items: [{ productId: "combo", presentationId: "combo-pres", quantity: 1,
+        selections: [{ selectedProductId: "wrong-product", selectedPresentationId: "option-pres", quantity: 1 }] }],
+    },
+  }] });
+  expect(result.body.results[0]).toMatchObject({ status: "failed", httpStatus: 400 });
+  expect(result.body.results[0].error).toContain("no pertenece");
+  expect(db.query.mock.calls.some(([sql]) => sql.includes("INSERT INTO orders"))).toBe(false);
+  expect(db.query.mock.calls.map(([sql]) => sql)).toContain("ROLLBACK TO SAVEPOINT sp_0");
+});

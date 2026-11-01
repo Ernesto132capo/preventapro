@@ -10,6 +10,7 @@ import { invalidateWorkdayCache } from "./workdays";
 import { isDatabaseUnavailable } from "../services/http-errors";
 import { isLegitimateOfflineOrder } from "../services/workday-policy";
 import { loadOrderCatalog, insertOrderItems } from "../services/order-storage";
+import { orderDraftValidationSchema, validateOrderDraft } from "../services/order-draft-validation";
 
 export const ordersRouter = Router();
 ordersRouter.use(requireAuth);
@@ -205,6 +206,30 @@ function invalidateReadCaches() {
   invalidatePullCache("orders");
   invalidateWorkdayCache();
 }
+
+// Comprobar la copia del carrito no abre/cierra jornadas ni guarda preventas.
+ordersRouter.post("/validate", async (req: AuthedRequest, res) => {
+  const parsed = orderDraftValidationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Datos de validación inválidos.", details: parsed.error.flatten() });
+  let client: PoolClient | undefined;
+  let inTransaction = false;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    inTransaction = true;
+    const result = await validateOrderDraft(client, parsed.data, nowIso());
+    await client.query("COMMIT");
+    inTransaction = false;
+    res.setHeader("Cache-Control", "no-store");
+    res.json(result);
+  } catch (error) {
+    if (client && inTransaction) {
+      try { await client.query("ROLLBACK"); } catch { /* conexión perdida */ }
+    }
+    console.error("Error al verificar borrador de preventa:", error);
+    res.status(!client || isDatabaseUnavailable(error) ? 503 : 500).json({ error: "No se pudo verificar el catálogo en este momento." });
+  } finally { client?.release(); }
+});
 
 ordersRouter.post("/", async (req: AuthedRequest, res) => {
   const r = schema.safeParse(req.body);

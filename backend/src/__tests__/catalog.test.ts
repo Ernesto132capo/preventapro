@@ -201,24 +201,20 @@ describe("Catálogo: Optimización de consultas en lote y resolución segura de 
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
-    it("reactiva la categoría si estaba inactiva (active = false)", async () => {
+    it("no reactiva la categoría si estaba inactiva (active = false)", async () => {
       const mockQuery = vi.fn().mockImplementation(async (sql: string, params: any[]) => {
         if (sql.includes("FROM categories WHERE id = $1")) {
           return { rows: [{ id: params[0], active: false }] };
-        }
-        if (sql.includes("UPDATE categories SET active = true")) {
-          return { rowCount: 1 };
         }
         return { rows: [] };
       });
       const mockClient = { query: mockQuery } as any;
 
       const catId = await resolveCategoryId(mockClient, "d290f1ee-6c54-4b01-90e6-d701748f0851");
-      expect(catId).toBe("d290f1ee-6c54-4b01-90e6-d701748f0851");
-      expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining("UPDATE categories SET active = true"),
-        expect.any(Array)
-      );
+      expect(catId).toBeNull();
+      // Una edición/alta nunca debe reactivar una categoría eliminada.
+      const updates = mockQuery.mock.calls.filter((call: any[]) => typeof call[0] === "string" && call[0].includes("UPDATE categories SET active = true"));
+      expect(updates).toHaveLength(0);
     });
 
     it("asigna null y NUNCA crea una categoría con nombre de UUID si el ID es un UUID huérfano", async () => {

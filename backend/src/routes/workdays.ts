@@ -197,8 +197,15 @@ workdaysRouter.get("/current", async (req: AuthedRequest, res) => {
 
 workdaysRouter.get("/history", async (req: AuthedRequest, res, next) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM work_days WHERE status = 'closed' ORDER BY work_date DESC");
-    res.json({ workDays: rows.map(serial) });
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    const { rows } = await pool.query(
+      "SELECT * FROM work_days WHERE status = 'closed' ORDER BY work_date DESC LIMIT $1 OFFSET $2",
+      [limit, offset]
+    );
+    const { rows: countRows } = await pool.query("SELECT COUNT(*)::int AS total FROM work_days WHERE status = 'closed'");
+    const total = countRows[0]?.total ?? 0;
+    res.json({ workDays: rows.map(serial), total, hasMore: offset + rows.length < total });
   } catch (err) {
     next(err);
   }

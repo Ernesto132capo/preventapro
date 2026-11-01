@@ -13,7 +13,10 @@ import { settingsRouter } from "./routes/settings";
 import { ensureClientsSchema } from "./db/pg";
 
 const app = express();
-app.set("trust proxy", 1);
+// Solo confiar en X-Forwarded-For tras un proxy de confianza (p. ej. Render).
+// Fuera de producción, usa la dirección real del socket para que el rate limit
+// de login no pueda eludirse rotando la cabecera X-Forwarded-For.
+app.set("trust proxy", process.env.NODE_ENV === "production" ? 1 : false);
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));

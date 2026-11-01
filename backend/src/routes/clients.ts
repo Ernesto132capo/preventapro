@@ -6,6 +6,7 @@ import { pool, nowIso } from "../db/pg";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { invalidatePullCache } from "./sync";
 import { isDatabaseUnavailable } from "../services/http-errors";
+import { CONFLICT_CODE, deletedConflictMessage } from "../services/conflict";
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -109,6 +110,12 @@ clientsRouter.post("/", async (req: AuthedRequest, res) => {
       await client.query("SELECT pg_advisory_xact_lock(1001, hashtext($1))", [d.clientLocalId]);
       const existing = await client.query("SELECT * FROM clients WHERE client_local_id = $1 LIMIT 1", [d.clientLocalId]);
       if (existing.rows.length > 0) {
+        const existingRow = existing.rows[0];
+        if (existingRow.active === false) {
+          await client.query("ROLLBACK");
+          inTransaction = false;
+          return res.status(409).json({ error: deletedConflictMessage("client"), code: CONFLICT_CODE, entityType: "client", serverId: existingRow.id, updatedAt: existingRow.updated_at });
+        }
         await client.query("COMMIT");
         inTransaction = false;
         return res.json({ client: serializeClient(existing.rows[0]), deduped: true });
@@ -168,7 +175,10 @@ clientsRouter.put("/:id", async (req, res, next) => {
 
     const existing = await pool.query("SELECT * FROM clients WHERE id = $1", [req.params.id]);
     const current = existing.rows[0];
-    if (!current || current.active === false) return res.status(404).json({ error: "Cliente no encontrado." });
+    if (!current) return res.status(404).json({ error: "Cliente no encontrado." });
+    if (current.active === false && req.body.restore !== true) {
+      return res.status(409).json({ error: deletedConflictMessage("client"), code: CONFLICT_CODE, entityType: "client", serverId: current.id, updatedAt: current.updated_at });
+    }
 
     const d = parsed.data;
     const bGiven = d.businessName !== undefined ? d.businessName : (d.business_name !== undefined ? d.business_name : d.name);
@@ -194,7 +204,7 @@ clientsRouter.put("/:id", async (req, res, next) => {
     const { rows } = await pool.query(
       `UPDATE clients SET
          business_name = $2, contact_name = $3,
-         phone = $4, neighborhood_id = $5, address = $6, lat = $7, lng = $8, updated_at = $9
+         phone = $4, neighborhood_id = $5, address = $6, lat = $7, lng = $8, active = true, updated_at = $9
        WHERE id = $1
        RETURNING *`,
       [req.params.id, merged.business_name, merged.contact_name, merged.phone, merged.neighborhood_id, merged.address, merged.lat, merged.lng, ts]
