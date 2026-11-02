@@ -68,7 +68,8 @@
 - `verify:ec2` consulta la API desde EC2 mediante SSH, sin depender de Neon ni guardar secretos de producción en el PC. Todas las comprobaciones HTTP resultaron correctas.
 - Compilación/backend: 233 pruebas correctas; simulador: 9; móvil: typecheck y 354 pruebas correctas, sin omisiones por versión de Node.
 - Render: servicio `preventapro-backend` suspendido y despliegue automático desactivado. Publicar en GitHub no debe volver a desplegar el servicio anterior.
-- Neon: proyecto antiguo identificado y confirmado como origen migrado; cómputo suspendido. El borrado definitivo de sus datos queda para la confirmación final.
+- Neon: proyecto antiguo identificado y confirmado como origen migrado; cómputo suspendido. El usuario eligió conservar Neon y Render suspendidos; no se eliminó el proyecto, la base anterior ni el servicio.
+- Retiro completado de las conexiones activas: tanto producción como desarrollo usan EC2. Los recursos antiguos quedan conservados por decisión del usuario y no son una dependencia de la aplicación.
 - La comprobación independiente del correo de AWS Budgets no forma parte del retiro de proveedores; confirmar si todavía está pendiente.
 
 No se ha desplegado CloudFormation. La plantilla describe recursos cuyos nombres ya existen y no debe aplicarse directamente a esta cuenta. Los archivos de entorno, claves y respaldos están fuera de Git. Las cuentas y las sesiones de los teléfonos no se han cambiado.
