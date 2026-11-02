@@ -1,10 +1,12 @@
 import { withTx } from "../db/client";
+import { getPerformanceMetrics, resetPerformanceMetrics } from "../services/performance";
 
 jest.mock("expo-sqlite", () => ({
   openDatabaseAsync: jest.fn(),
 }));
 
 describe("withTx Global Serialized Queue Suite", () => {
+  beforeEach(() => resetPerformanceMetrics());
   it("secuencia dos llamadas concurrentes a withTx sin intercalar", async () => {
     const events: string[] = [];
     const fakeDb = {
@@ -49,6 +51,8 @@ describe("withTx Global Serialized Queue Suite", () => {
       "TASK_2_END",
       "SQL:COMMIT",
     ]);
+    expect(getPerformanceMetrics().find(metric => metric.name === "db.transaction")).toMatchObject({ count: 2, failures: 0 });
+    expect(getPerformanceMetrics().find(metric => metric.name === "db.transaction_wait")).toMatchObject({ count: 2, failures: 0 });
   });
 
   it("hace ROLLBACK y propaga error si la tarea falla, permitiendo a la siguiente ejecutarse", async () => {
@@ -81,6 +85,7 @@ describe("withTx Global Serialized Queue Suite", () => {
       "TASK_2_SUCCESS",
       "SQL:COMMIT",
     ]);
+    expect(getPerformanceMetrics().find(metric => metric.name === "db.transaction")).toMatchObject({ count: 2, failures: 1 });
   });
 
   it("espera en cola cuando una tarea previa está activa", async () => {

@@ -5,6 +5,7 @@ import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { EmptyState } from "../components/EmptyState";
+import { LoadErrorBanner } from "../components/LoadErrorBanner";
 import { Button } from "../components/Button";
 import { listProducts, ProductWithPresentations, deleteProductLocal, toggleFavoriteLocal } from "../db/repositories/products";
 import { listCategories } from "../db/repositories/categories";
@@ -17,21 +18,28 @@ const productKeyExtractor = (product: ProductWithPresentations) => product.id;
 
 export function ProductsScreen() {
   const navigation = useNavigation<any>();
-  const { syncTick, pushSync } = useSync();
+  const { catalogRevision, pushSync } = useSync();
   const [products, setProducts] = useState<ProductWithPresentations[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
   const [showOnlyFavorites, setShowOnlyFavorites] = useState(false);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const [prods, cats] = await Promise.all([
-      listProducts({ search: debouncedSearch }),
-      listCategories(),
-    ]);
-    setProducts(prods);
-    setCategories(cats);
+    try {
+      const [prods, cats] = await Promise.all([
+        listProducts({ search: debouncedSearch }),
+        listCategories(),
+      ]);
+      setProducts(prods);
+      setCategories(cats);
+      setLoadError(null);
+    } catch {
+      // Conserva los datos visibles previos y permite reintentar.
+      setLoadError("No se pudo cargar el catálogo. Revisa la conexión e inténtalo de nuevo.");
+    }
   }, [debouncedSearch]);
 
   useFocusEffect(
@@ -41,8 +49,8 @@ export function ProductsScreen() {
   );
 
   useEffect(() => {
-    if (syncTick > 0) load();
-  }, [syncTick]);
+    if (catalogRevision > 0) load();
+  }, [catalogRevision]);
 
   const categoryMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -205,6 +213,8 @@ export function ProductsScreen() {
           })}
         </ScrollView>
       </View>
+
+      {loadError && <LoadErrorBanner message={loadError} onRetry={() => load()} />}
 
       <FlatList
         data={filteredProducts}

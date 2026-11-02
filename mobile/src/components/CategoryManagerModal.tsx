@@ -52,7 +52,7 @@ export function CategoryManagerModal({ visible, selectedCategoryId, onSelect, on
     setSubmitting(true);
     try {
       const cat = await createCategoryLocal(name);
-      await pushSync();
+      void pushSync().catch(() => {});
       setNewCatName("");
       await load();
       onSelect(cat);
@@ -78,7 +78,7 @@ export function CategoryManagerModal({ visible, selectedCategoryId, onSelect, on
     setSubmitting(true);
     try {
       const updated = await updateCategoryLocal(id, name);
-      await pushSync();
+      void pushSync().catch(() => {});
       setEditingId(null);
       setEditingName("");
       await load();
@@ -112,7 +112,7 @@ export function CategoryManagerModal({ visible, selectedCategoryId, onSelect, on
             setSubmitting(true);
             try {
               await deleteCategoryLocal(item.id);
-              await pushSync();
+              void pushSync().catch(() => {});
               await load();
               if (
                 selectedCategoryId === item.id ||

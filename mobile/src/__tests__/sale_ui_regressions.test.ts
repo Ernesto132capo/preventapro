@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import vm from "vm";
 import ts from "typescript";
+import { reviewSaleCatalog, saleDraftKey } from "../utils/saleReview";
 
 // Ejecuta componentes/handlers de producción. No sustituye pruebas táctiles en Android.
 function compile(source: string, fileName: string) {
@@ -159,19 +160,32 @@ function saveHarness(editing = false) {
   visit(source);
   if (!handler) throw new Error("No se encontró el handler de guardado real");
   const scope: any = {
-    saveInFlightRef: { current: false }, selectedClient: { id: "client" }, user: { id: "user" },
+    saveInFlightRef: { current: false }, selectedClient: { id: "client", business_name: "Tienda", contact_name: null }, user: { id: "user" },
     setSaving: jest.fn(), setError: jest.fn(), setWorkDay: jest.fn(), setCart: jest.fn(),
     setSelectedClient: jest.fn(), setCartModalVisible: jest.fn(), setFinalConfirmModalVisible: jest.fn(), setStep: jest.fn(),
     getTodayWorkDay: jest.fn(async () => ({ id: "day", status: "open" })),
     apiFetch: jest.fn(() => { throw new Error("La red no debe preceder al guardado"); }),
     editingOrderId: editing ? "order" : undefined,
     createOrderLocal: jest.fn(async () => "order"), updateOrderLocal: jest.fn(async () => {}),
-    pushSync: jest.fn(() => new Promise<void>(() => {})), cart: [{ quantity: 1 }], paymentCondition: "Contado 48h",
+    pushSync: jest.fn(() => new Promise<void>(() => {})),
+    cart: [{ productId: "product", presentationId: "presentation", productName: "Papa", sku: "P1",
+      presentationName: "Unidad", unitEquivalence: 1, unitPriceCents: 1000, quantity: 1, subtotalCents: 1000 }],
+    paymentCondition: "Contado 48h",
+    connection: "offline", isEditing: editing, priceDecision: null, currentPresMap: new Map(),
+    draftKeyRef: { current: "" }, focusedRef: { current: true }, approvedCatalogRef: { current: null },
+    saleDraftKey, reviewSaleCatalog, centsToBs: (value: number) => "Bs. " + (value / 100).toFixed(2),
+    validateSaleDraft: jest.fn(async () => ({ status: "unverified", reason: "offline", message: "Sin conexión" })),
+    forceSync: jest.fn(async () => {}), setClients: jest.fn(),
     handleReopen: jest.fn(), Alert: { alert: jest.fn() }, navigation: { navigate: jest.fn(), goBack: jest.fn() },
+    measurePerformance: (_name: string, task: () => Promise<unknown>) => task(),
     module: { exports: {} },
   };
+  const refreshKey = () => { scope.draftKeyRef.current = saleDraftKey(scope.selectedClient?.id || "", scope.cart, scope.editingOrderId); };
+  scope.setCart.mockImplementation((value: any) => { scope.cart = typeof value === "function" ? value(scope.cart) : value; refreshKey(); });
+  scope.setSelectedClient.mockImplementation((value: any) => { scope.selectedClient = value; refreshKey(); });
+  refreshKey();
   vm.runInNewContext(compile(handler + "\nmodule.exports = executeSaveOrder;", fileName), scope);
-  return { ...scope, save: scope.module.exports as () => Promise<void> };
+  return { ...scope, state: scope, save: scope.module.exports as (offlineConsentKey?: string) => Promise<void> };
 }
 
 describe("Guardado SQLite del formulario real de venta", () => {
@@ -189,8 +203,10 @@ describe("Guardado SQLite del formulario real de venta", () => {
   it("dos toques durante la escritura pendiente generan una sola preventa", async () => {
     const h = saveHarness();
     const gate = deferred<string>();
-    h.createOrderLocal.mockImplementationOnce(() => gate.promise);
+    const entered = deferred<void>();
+    h.createOrderLocal.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
     const first = h.save();
+    await entered.promise;
     await h.save();
     expect(h.createOrderLocal).toHaveBeenCalledTimes(1);
     gate.resolve("order");
@@ -219,6 +235,210 @@ describe("Guardado SQLite del formulario real de venta", () => {
     expect(h.createOrderLocal).not.toHaveBeenCalled();
     expect(h.pushSync).not.toHaveBeenCalled();
     expect(h.setError).toHaveBeenCalledWith(expect.stringContaining("concluida"));
+  });
+});
+
+function verifiedDraft(overrides: any = {}) {
+  return {
+    status: "verified", valid: true, checkedAt: "2026-10-24T12:00:00.000Z", unchecked: false,
+    client: { id: "remote-client", businessName: "Tienda", contactName: null, name: "Tienda", active: true, updatedAt: null },
+    issues: [], items: [{ lineIndex: 0, productId: "remote-product", presentationId: "remote-pres",
+      productName: "Papa", sku: "P1", presentationName: "Unidad", unitEquivalence: 1,
+      priceCents: 1000, productType: "standard", comboDefinition: null, selections: [], unchecked: false }],
+    ...overrides,
+  };
+}
+function alertButton(h: ReturnType<typeof saveHarness>, text: string) {
+  const alerts = h.Alert.alert.mock.calls;
+  const buttons = alerts[alerts.length - 1][2];
+  const button = buttons?.find((candidate: any) => candidate.text === text);
+  if (!button?.onPress) throw new Error("No se encontró el botón: " + text);
+  return button;
+}
+
+function saleFocusLifecycle(focusedRef: { current: boolean }) {
+  const fileName = path.join(__dirname, "../screens/NewSaleScreen.tsx");
+  const source = ts.createSourceFile(fileName, fs.readFileSync(fileName, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback = "";
+  function visit(node: ts.Node) {
+    if (ts.isCallExpression(node) && node.expression.getText(source) === "useFocusEffect") callback = node.arguments[0].getText(source);
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  const module = { exports: {} as () => () => void };
+  vm.runInNewContext(compile("module.exports = " + callback + ";", fileName), {
+    focusedRef, checkWorkDay: jest.fn(async () => {}), useCallback: (fn: any) => fn,
+    module, exports: module.exports,
+  });
+  return module.exports();
+}
+
+describe("Comprobación previa del formulario real", () => {
+  it("espera la comprobación online antes de guardar, pero no espera al push", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    const gate = deferred<any>(), entered = deferred<void>();
+    h.validateSaleDraft.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
+    const saving = h.save();
+    await entered.promise;
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    gate.resolve(verifiedDraft());
+    await saving;
+    expect(h.createOrderLocal).toHaveBeenCalledTimes(1);
+    expect(h.pushSync).toHaveBeenCalledTimes(1);
+    expect(h.navigation.navigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("bloquea un cliente borrado en otro teléfono y conserva el carrito para elegir otro", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    h.validateSaleDraft.mockResolvedValueOnce(verifiedDraft({ valid: false, issues: [
+      { entity: "client", code: "CLIENT_UNAVAILABLE", message: "El cliente fue eliminado en otro dispositivo." },
+    ] }));
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    expect(h.pushSync).not.toHaveBeenCalled();
+    expect(h.state.selectedClient).toBeNull();
+    expect(h.state.cart).toHaveLength(1);
+    expect(h.setStep).toHaveBeenCalledWith("client");
+    expect(h.setError).toHaveBeenCalledWith(expect.stringContaining("eliminado"));
+  });
+
+  it("ofrece quitar del carrito un producto eliminado sin guardar un pedido inválido", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    h.setCart((lines: any[]) => [...lines, { ...lines[0], productId: "other", presentationId: "other-pres" }]);
+    h.validateSaleDraft.mockResolvedValueOnce(verifiedDraft({ valid: false, issues: [
+      { entity: "product", lineIndex: 0, code: "PRODUCT_UNAVAILABLE", message: "Papa fue eliminada." },
+    ] }));
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    alertButton(h, "Quitar no disponibles").onPress();
+    expect(h.state.cart).toHaveLength(1);
+    expect(h.state.cart[0].productId).toBe("other");
+  });
+
+  it.each(["Mantener precios", "Usar precios actuales"])("avisa un cambio de precio y exige revisar antes de guardar con %s", async (choice) => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    const response = verifiedDraft();
+    response.items[0].priceCents = 2000;
+    h.validateSaleDraft.mockResolvedValue(response);
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    alertButton(h, choice).onPress();
+    const expected = choice === "Mantener precios" ? 1000 : 2000;
+    expect(h.state.cart[0].unitPriceCents).toBe(expected);
+    expect(h.state.cart[0].subtotalCents).toBe(expected);
+    await h.save();
+    expect(h.validateSaleDraft).toHaveBeenCalledTimes(2);
+    expect(h.createOrderLocal).toHaveBeenCalledTimes(1);
+    expect(h.createOrderLocal.mock.calls[0][0].lines[0].unitPriceCents).toBe(expected);
+  });
+
+  it("vuelve a avisar si el precio cambia de nuevo después de aceptar la revisión", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    const first = verifiedDraft(); first.items[0].priceCents = 2000;
+    const next = verifiedDraft(); next.items[0].priceCents = 3000;
+    h.validateSaleDraft.mockResolvedValueOnce(first).mockResolvedValueOnce(next);
+    await h.save();
+    alertButton(h, "Mantener precios").onPress();
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    expect(h.Alert.alert.mock.calls[1][1]).toContain("Bs. 30.00");
+  });
+
+  it("avisa y vuelve a confirmar si cambia la regla del combo aunque sus opciones sigan siendo válidas", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    h.setCart((lines: any[]) => [{ ...lines[0], isCombo: true,
+      comboCatalogSnapshot: { selectionMin: 1, selectionMax: 1, options: [{ presentationId: "option-local", maxQuantity: 1 }] },
+      selections: [{ selectedProductId: "normal-local", selectedPresentationId: "option-local", productNameSnapshot: "Sabor",
+        presentationNameSnapshot: "Unidad", quantity: 1, sortOrder: 0 }],
+    }]);
+    const before = { selectionMin: 1, selectionMax: 1, options: [{ presentationId: "option-remote", maxQuantity: 1 }] };
+    const current = { ...before, selectionMax: 2 };
+    const response: any = verifiedDraft();
+    Object.assign(response.items[0], { productType: "combo", comboDefinition: current, knownComboDefinition: before,
+      selections: [{ selectedProductId: "normal-remote", selectedPresentationId: "option-remote", productName: "Sabor", presentationName: "Unidad", quantity: 1 }],
+    });
+    h.validateSaleDraft.mockResolvedValueOnce(response)
+      .mockResolvedValueOnce({ ...response, items: [{ ...response.items[0], knownComboDefinition: current }] });
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    alertButton(h, "Actualizar pedido").onPress();
+    expect(h.state.cart[0].comboCatalogSnapshot.selectionMax).toBe(2);
+    await h.save();
+    expect(h.createOrderLocal).toHaveBeenCalledTimes(1);
+    expect(h.createOrderLocal.mock.calls[0][0].lines[0].selections[0].selectedPresentationId).toBe("option-local");
+  });
+
+  it("no pierde la elección histórica ya aceptada al abrir una edición", async () => {
+    const h = saveHarness(true);
+    h.state.connection = "online";
+    h.state.priceDecision = "historical";
+    h.state.currentPresMap.set("presentation", { price_cents: 2000 });
+    const response = verifiedDraft(); response.items[0].priceCents = 2000;
+    h.validateSaleDraft.mockResolvedValueOnce(response);
+    await h.save();
+    expect(h.updateOrderLocal).toHaveBeenCalledTimes(1);
+    expect(h.updateOrderLocal.mock.calls[0][1][0].unitPriceCents).toBe(1000);
+  });
+
+  it("una caída de red pide consentimiento para guardar sin verificar y no repite la espera", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    h.validateSaleDraft.mockResolvedValueOnce({ status: "unverified", reason: "network", message: "No se pudo contactar al servidor." });
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    const finished = deferred<void>();
+    h.navigation.navigate.mockImplementationOnce(() => finished.resolve());
+    alertButton(h, "Guardar sin verificar").onPress();
+    await finished.promise;
+    expect(h.validateSaleDraft).toHaveBeenCalledTimes(1);
+    expect(h.createOrderLocal).toHaveBeenCalledTimes(1);
+  });
+
+  it("no guarda una validación de un carrito anterior si el vendedor cambió cantidades durante la consulta", async () => {
+    const h = saveHarness();
+    const gate = deferred<any>(), entered = deferred<void>();
+    h.state.connection = "online";
+    h.validateSaleDraft.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
+    const saving = h.save();
+    await entered.promise;
+    h.setCart((lines: any[]) => [{ ...lines[0], quantity: 2, subtotalCents: 2000 }]);
+    gate.resolve(verifiedDraft());
+    await saving;
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    expect(h.setError).toHaveBeenCalledWith(expect.stringContaining("cambió durante"));
+  });
+
+  it("un error de sesión no ofrece guardar saltando la comprobación", async () => {
+    const h = saveHarness();
+    h.state.connection = "online";
+    h.validateSaleDraft.mockRejectedValueOnce(new Error("Sesión expirada"));
+    await h.save();
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    expect(h.setError).toHaveBeenCalledWith("Sesión expirada");
+    expect(h.Alert.alert.mock.calls[0][0]).toBe("Error al guardar");
+  });
+
+  it("el cleanup real de pantalla invalida una consulta pendiente al salir o desmontar", async () => {
+    const h = saveHarness();
+    const leaveScreen = saleFocusLifecycle(h.focusedRef);
+    h.state.connection = "online";
+    const gate = deferred<any>(), entered = deferred<void>();
+    h.validateSaleDraft.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
+    const saving = h.save();
+    await entered.promise;
+    leaveScreen();
+    gate.resolve(verifiedDraft());
+    await saving;
+    expect(h.createOrderLocal).not.toHaveBeenCalled();
+    expect(h.pushSync).not.toHaveBeenCalled();
+    expect(h.navigation.navigate).not.toHaveBeenCalled();
+    expect(h.focusedRef.current).toBe(false);
   });
 });
 

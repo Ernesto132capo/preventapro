@@ -156,12 +156,26 @@ CREATE TABLE IF NOT EXISTS outbox (
   operation TEXT NOT NULL DEFAULT 'create', -- 'create' | 'update' | 'cancel'
   local_entity_id TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 2,  -- 1 = clientes/productos/categorías primero, 2 = preventas después
-  status TEXT NOT NULL DEFAULT 'pending', -- pending | syncing | failed (retryable legacy) | error (permanent) | done
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | syncing | failed (retryable legacy) | error (permanent) | conflict | done
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   next_retry_at TEXT,
   completed_at TEXT,
   created_at TEXT NOT NULL
+);
+
+-- Conflictos de registros eliminados en otro teléfono. Conserva la referencia al
+-- registro local (que sigue guardando la edición) para permitir resolverlo después.
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,      -- 'client' | 'product' | 'category'
+  local_entity_id TEXT NOT NULL,
+  server_id TEXT,
+  outbox_id TEXT,
+  entity_name TEXT,
+  server_updated_at TEXT,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT
 );
 
 `;

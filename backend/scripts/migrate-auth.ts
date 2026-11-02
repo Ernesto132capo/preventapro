@@ -13,7 +13,7 @@ async function main() {
 
 main()
   .catch((error) => {
-    console.error("No se pudo preparar la autenticación en Neon:", error.message || error);
+    console.error("No se pudo preparar la autenticación en PostgreSQL:", error.message || error);
     process.exitCode = 1;
   })
   .finally(() => pool.end());

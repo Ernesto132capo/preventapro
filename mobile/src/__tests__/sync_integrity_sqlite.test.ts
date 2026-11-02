@@ -1,7 +1,7 @@
 import { LOCAL_SCHEMA } from "../db/schema";
 import { createOrderLocal, updateOrderLocal, cancelOrderLocal, upsertOrderFromServer, getConsolidatedProductsForWorkDay, listOrdersForWorkDay } from "../db/repositories/orders";
 import { createClientLocal, updateClientLocal, upsertFromServer } from "../db/repositories/clients";
-import { upsertCategoryFromServer } from "../db/repositories/categories";
+import { upsertCategoryFromServer, createCategoryLocal } from "../db/repositories/categories";
 import { resolveServerPresentationId, upsertProductFromServer, createProductLocal, updateProductLocal, getProduct, toggleFavoriteLocal, listProducts, isFavoriteLocal } from "../db/repositories/products";
 import { getWorkDay, deleteClosedWorkDayLocal, assertClosedWorkDayDeletable } from "../db/repositories/workdays";
 import { pullCatalog, pushOnlySync, runSync, resetSyncCooldown, withSyncMaintenance } from "../services/sync";
@@ -9,6 +9,7 @@ import { apiFetch, ApiError } from "../services/api";
 import { listPending, retryFailed } from "../db/outbox";
 import { todayBolivia } from "../utils/dates";
 import type { CartLine } from "../domain/types";
+import { getPerformanceMetrics, resetPerformanceMetrics } from "../services/performance";
 
 // Integration checks use real SQLite without adding a native npm dependency.
 // Node 22.13+ exposes SQLite; older Node versions still run the unit suites.
@@ -85,6 +86,7 @@ sqliteDescribe("Offline sync data integrity with real SQLite", () => {
     mockFailOutbox = false;
     jest.clearAllMocks();
     resetSyncCooldown();
+    resetPerformanceMetrics();
     await mockDb.runAsync("INSERT INTO clients(id,server_id,business_name,created_at,updated_at) VALUES ('client','remote-client','Tienda',?,?)", [ts, ts]);
     await mockDb.runAsync("INSERT INTO products(id,server_id,sku,name) VALUES ('p','remote-product','P1','Papa')");
     await mockDb.runAsync("INSERT INTO product_presentations(id,server_id,product_id,name,unit_equivalence,price_cents) VALUES ('pres','remote-pres','p','Unidad',1,1001)");
@@ -96,6 +98,69 @@ sqliteDescribe("Offline sync data integrity with real SQLite", () => {
     });
   });
   afterEach(() => mockSqlite.close());
+
+  it("does not contact the server when a push queue is empty", async () => {
+    await expect(pushOnlySync("user")).resolves.toMatchObject({ ok: true, pushed: { done: 0, failed: 0, deferred: 0 } });
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it("pushes a client without requesting the workday", async () => {
+    const client = await createClientLocal({ businessName: "Sin jornada remota" });
+    (apiFetch as jest.Mock).mockResolvedValue({ client: { id: "new-client", client_local_id: client.id } });
+    const result = await pushOnlySync("user");
+    expect(result.pushed.done).toBe(1);
+    expect((apiFetch as jest.Mock).mock.calls.map(call => call[0])).toEqual(["/clients"]);
+    expect(scalar("SELECT status FROM outbox").status).toBe("done");
+  });
+
+  it("still pushes local changes if downloading the catalog fails", async () => {
+    const client = await createClientLocal({ businessName: "Pendiente independiente" });
+    (apiFetch as jest.Mock).mockImplementation(async (url: string) => {
+      if (url.startsWith("/sync/pull")) throw new ApiError("Catálogo no disponible", 503);
+      if (url === "/clients") return { client: { id: "new-client", client_local_id: client.id } };
+      throw new Error(`Petición innecesaria: ${url}`);
+    });
+    await expect(runSync("user")).resolves.toMatchObject({ ok: false, pullError: "Catálogo no disponible", pushed: { done: 1, failed: 0 } });
+    expect(scalar("SELECT status FROM outbox").status).toBe("done");
+  });
+
+  it("can create a product immediately after its local category and sends the category first", async () => {
+    const category = await createCategoryLocal("Categoría sin esperar red");
+    await createProductLocal({ name: "Nuevo producto", categoryId: category.id,
+      presentations: [{ name: "Unidad", unitEquivalence: 1, priceCents: 100, costCents: 0 }] });
+    (apiFetch as jest.Mock).mockImplementation(async (url: string, options: any) => {
+      if (url === "/catalog/categories") return { category: { id: "remote-new-category" } };
+      if (url === "/catalog/products") {
+        expect(options.body.categoryId).toBe("remote-new-category");
+        return { product: productResponse(options.body) };
+      }
+      throw new Error(`Petición innecesaria: ${url}`);
+    });
+    expect((await pushOnlySync("user")).pushed.done).toBe(2);
+    expect((apiFetch as jest.Mock).mock.calls.map(call => call[0])).toEqual(["/catalog/categories", "/catalog/products"]);
+  });
+
+  it("only reports catalog changes when content, presentations or combo options actually change", async () => {
+    const response = {
+      clients: [{ id: "remote-client", client_local_id: "client", business_name: "Tienda", updated_at: ts, created_at: ts }],
+      categories: [{ id: "remote-category", name: "Mercadería", active: true, updated_at: ts }],
+      products: [{ id: "remote-product", sku: "P1", name: "Papa", product_type: "combo", active: true }],
+      presentations: [{ id: "remote-pres", product_id: "remote-product", name: "Unidad", unit_equivalence: 1, price_cents: 1001, active: true }],
+      comboDefinitions: [{ id: "remote-def", product_id: "remote-product", selection_min: 1, selection_max: 1, active: true }],
+      comboOptions: [{ id: "remote-opt", combo_id: "remote-def", presentation_id: "remote-pres", max_quantity: 2, active: true }],
+      comboOptionsComplete: true, cursor: ts,
+    };
+    (apiFetch as jest.Mock).mockImplementation(async () => response);
+    expect((await pullCatalog("user")).catalogChanged).toBe(true);
+    expect((await pullCatalog("user")).catalogChanged).toBe(false);
+    response.presentations[0].price_cents = 1101;
+    expect((await pullCatalog("user")).catalogChanged).toBe(true);
+    expect((await pullCatalog("user")).catalogChanged).toBe(false);
+    response.comboOptions = [];
+    expect((await pullCatalog("user")).catalogChanged).toBe(true);
+    expect((await pullCatalog("user")).catalogChanged).toBe(false);
+    expect(scalar("SELECT active FROM combo_options").active).toBe(0);
+  });
 
   it("persists an edit made after a lost client create ACK and coalesces its pending events", async () => {
     const client = await createClientLocal({ businessName: "First" });
@@ -277,6 +342,68 @@ sqliteDescribe("Offline sync data integrity with real SQLite", () => {
     expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(0);
     expect(scalar("SELECT COUNT(*) n FROM order_items").n).toBe(0);
     expect(scalar("SELECT COUNT(*) n FROM outbox WHERE entity_type='order'").n).toBe(0);
+  });
+
+  it("rejects a client deleted after selecting it without leaving a header or outbox event", async () => {
+    await mockDb.runAsync("UPDATE clients SET active=0 WHERE id='client'");
+    await expect(createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [line] })).rejects.toThrow(/cliente.*eliminado/i);
+    expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM order_items").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM outbox").n).toBe(0);
+    expect(scalar("SELECT order_count,total_cents FROM work_days")).toMatchObject({ order_count: 0, total_cents: 0 });
+  });
+
+  it("accepts active client and catalog remote aliases while storing the canonical local client", async () => {
+    const saved = await createOrderLocal({ workDayLocalId: "remote-day", clientId: "remote-client", paymentCondition: "Contado", lines: [{ ...line, productId: "remote-product", presentationId: "remote-pres" }] });
+    expect(saved.client_id).toBe("client");
+    expect(saved.total_cents).toBe(1001);
+    expect(scalar("SELECT COUNT(*) n FROM outbox WHERE entity_type='order'").n).toBe(1);
+  });
+
+  it.each(["product-inactive", "product-missing", "presentation-inactive", "presentation-missing", "foreign-presentation"])("rejects a stale %s cart before inserting a new order", async (kind) => {
+    if (kind === "product-inactive") await mockDb.runAsync("UPDATE products SET active=0 WHERE id='p'");
+    if (kind === "product-missing") await mockDb.runAsync("DELETE FROM products WHERE id='p'");
+    if (kind === "presentation-inactive") await mockDb.runAsync("UPDATE product_presentations SET active=0 WHERE id='pres'");
+    if (kind === "presentation-missing") await mockDb.runAsync("DELETE FROM product_presentations WHERE id='pres'");
+    if (kind === "foreign-presentation") await mockDb.runAsync("UPDATE product_presentations SET product_id='different-product' WHERE id='pres'");
+    await expect(createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [line] })).rejects.toThrow(/producto|presentación/i);
+    expect(scalar("SELECT COUNT(*) n FROM orders").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM order_items").n).toBe(0);
+    expect(scalar("SELECT COUNT(*) n FROM outbox").n).toBe(0);
+  });
+
+  it("editing preserves the original inactive client and historical price of an active product", async () => {
+    await seedOrder();
+    await mockDb.runAsync("UPDATE clients SET active=0 WHERE id='client'");
+    await mockDb.runAsync("UPDATE product_presentations SET price_cents=2000 WHERE id='pres'");
+    await updateOrderLocal("local-order", [{ ...line, quantity: 2, subtotalCents: 2002 }]);
+    expect(scalar("SELECT client_id,total_cents FROM orders")).toMatchObject({ client_id: "client", total_cents: 2002 });
+    expect(scalar("SELECT unit_price_cents_snapshot FROM order_items").unit_price_cents_snapshot).toBe(1001);
+  });
+
+  it.each(["client-missing", "product-inactive", "presentation-inactive"])("a stale %s edit keeps the original order, lines and outbox intact", async (kind) => {
+    await seedOrder();
+    if (kind === "client-missing") await mockDb.runAsync("DELETE FROM clients WHERE id='client'");
+    if (kind === "product-inactive") await mockDb.runAsync("UPDATE products SET active=0 WHERE id='p'");
+    if (kind === "presentation-inactive") await mockDb.runAsync("UPDATE product_presentations SET active=0 WHERE id='pres'");
+    await expect(updateOrderLocal("local-order", [{ ...line, quantity: 2, subtotalCents: 2002 }])).rejects.toThrow();
+    expect(scalar("SELECT total_cents FROM orders").total_cents).toBe(1001);
+    expect(scalar("SELECT id,quantity,subtotal_cents FROM order_items")).toMatchObject({ id: "item-local-order", quantity: 1, subtotal_cents: 1001 });
+    expect(scalar("SELECT COUNT(*) n FROM outbox").n).toBe(0);
+  });
+
+  it.each(["product", "presentation"])("does not reuse a historical combo when its selected %s was deactivated", async (kind) => {
+    const combo = await createProductLocal({ name: "Combo", productType: "combo", presentations: [{ name: "Combo", unitEquivalence: 1, priceCents: 200, costCents: 0 }], comboDefinition: { selectionMin: 1, selectionMax: 1, options: [{ presentationId: "pres", maxQuantity: 1 }] } });
+    const comboLine: CartLine = { ...line, productId: combo.id, presentationId: combo.presentations[0].id,
+      unitPriceCents: 200, subtotalCents: 200, isCombo: true,
+      selections: [{ selectedProductId: "p", selectedPresentationId: "pres", productNameSnapshot: "Papa", presentationNameSnapshot: "Unidad", quantity: 1, sortOrder: 0 }] };
+    const order = await createOrderLocal({ workDayLocalId: "day", clientId: "client", paymentCondition: "Contado", lines: [comboLine] });
+    const eventsBefore = scalar("SELECT COUNT(*) n FROM outbox").n;
+    await mockDb.runAsync(kind === "product" ? "UPDATE products SET active=0 WHERE id='p'" : "UPDATE product_presentations SET active=0 WHERE id='pres'");
+    await expect(updateOrderLocal(order.id, [comboLine])).rejects.toThrow(/producto|presentación/i);
+    expect(scalar("SELECT total_cents FROM orders").total_cents).toBe(200);
+    expect(scalar("SELECT COUNT(*) n FROM order_item_selections").n).toBe(1);
+    expect(scalar("SELECT COUNT(*) n FROM outbox").n).toBe(eventsBefore);
   });
 
   it("historical orders and local deletion accept a remote workday ID without orphan selections", async () => {
@@ -553,5 +680,34 @@ sqliteDescribe("Offline sync data integrity with real SQLite", () => {
     await Promise.resolve(); expect(events).toEqual([]);
     release(); await Promise.all([sync, maintenance]);
     expect(events[events.length - 1]).toBe("backup");
+  });
+
+  it("measures one actual push when concurrent callers share a queued synchronization", async () => {
+    const gate = deferred<void>();
+    const maintenance = withSyncMaintenance(() => gate.promise);
+    const first = pushOnlySync("user");
+    const second = pushOnlySync("user");
+    expect(first).toBe(second);
+    await Promise.resolve();
+    expect(getPerformanceMetrics().find(metric => metric.name === "sync.push")).toBeUndefined();
+    gate.resolve();
+    await Promise.all([maintenance, first, second]);
+    for (const name of ["sync.queue_wait", "sync.push", "sync.outbox"]) {
+      expect(getPerformanceMetrics().find(metric => metric.name === name)).toMatchObject({ count: 1, failures: 0 });
+    }
+  });
+
+  it("records a failed full synchronization without changing its normal failure result", async () => {
+    const normalApi = (apiFetch as jest.Mock).getMockImplementation()!;
+    (apiFetch as jest.Mock).mockImplementation(async (url: string, ...args: any[]) => {
+      if (url.startsWith("/sync/pull")) throw new ApiError("Sin conexión", 0);
+      return normalApi(url, ...args);
+    });
+    const warning = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(runSync("user")).resolves.toMatchObject({ ok: false, error: "Sin conexión" });
+      expect(getPerformanceMetrics().find(metric => metric.name === "sync.full")).toMatchObject({ count: 1, failures: 1 });
+      expect(getPerformanceMetrics().find(metric => metric.name === "sync.pull")).toMatchObject({ count: 1, failures: 1 });
+    } finally { warning.mockRestore(); }
   });
 });

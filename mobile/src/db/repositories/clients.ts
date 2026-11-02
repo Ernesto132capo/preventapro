@@ -2,6 +2,7 @@ import { v4 as uuid } from "uuid";
 import { getDb, nowIso, withTx } from "../client";
 import { hasUnresolvedOutbox, enqueue, purgeOutboxForEntity } from "../outbox";
 import { Client } from "../../domain/types";
+import { catalogRowChanged } from "../catalogChanges";
 
 export async function listActiveClients(search?: string): Promise<Client[]> {
   const db = await getDb();
@@ -144,8 +145,8 @@ export async function deleteClientLocal(id: string): Promise<void> {
 /** Usado por el motor de sync al hacer pull: inserta o actualiza clientes que vinieron del servidor. */
 export async function upsertFromServer(serverClient: any) {
   const db = await getDb();
-  const localMatch = await db.getFirstAsync<{ id: string; sync_status: string }>(
-    `SELECT id, sync_status FROM clients WHERE id = ? OR server_id = ? OR id = ?
+  const localMatch = await db.getFirstAsync<Client>(
+    `SELECT * FROM clients WHERE id = ? OR server_id = ? OR id = ?
      ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1`,
     [serverClient.client_local_id || serverClient.id, serverClient.id, serverClient.id, serverClient.client_local_id || serverClient.id]
   );
@@ -153,12 +154,19 @@ export async function upsertFromServer(serverClient: any) {
   // Un pull no confirma una edición local: primero hay que enviar su outbox.
   if (localMatch && (localMatch.sync_status !== "synced" || await hasUnresolvedOutbox(db, "client", localMatch.id))) {
     await db.runAsync(`UPDATE clients SET server_id = ? WHERE id = ?`, [serverClient.id, localMatch.id]);
-    return;
+    return localMatch.server_id !== serverClient.id;
   }
 
   const targetId = localMatch ? localMatch.id : serverClient.id;
   const bName = (serverClient.business_name || serverClient.businessName || serverClient.name || "").trim() || null;
   const cName = (serverClient.contact_name || serverClient.contactName || serverClient.owner_name || serverClient.ownerName || "").trim() || null;
+  const changed = catalogRowChanged(localMatch, {
+    server_id: serverClient.id, business_name: bName, name: bName, contact_name: cName, owner_name: cName,
+    phone: serverClient.phone ?? null, neighborhood_id: serverClient.neighborhood_id ?? null,
+    neighborhood_name: serverClient.neighborhood_name ?? null, address: serverClient.address ?? null,
+    lat: serverClient.lat == null ? null : Number(serverClient.lat), lng: serverClient.lng == null ? null : Number(serverClient.lng),
+    visit_status: serverClient.visit_status || "pending", active: Number(serverClient.active ?? 1),
+  });
 
   await db.runAsync(
     `INSERT INTO clients
@@ -200,6 +208,7 @@ export async function upsertFromServer(serverClient: any) {
       serverClient.updated_at || nowIso(),
     ]
   );
+  return changed;
 }
 
 export async function markClientSynced(localId: string, serverId: string) {

@@ -97,9 +97,42 @@ async function readBackupInfo(uri: string): Promise<BackupInfo> {
   }
 }
 
+/** Escribe y verifica el snapshot en disco, fuera de cualquier transacción. */
+async function writeBackupFile(tables: LocalBackup["tables"]): Promise<BackupInfo> {
+  const backup: LocalBackup = { format: "preventapro-local-backup", version: 1, createdAt: nowIso(), tables };
+  const directory = backupDirectory();
+  await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+  const fileName = `preventapro-${backup.createdAt.replace(/[:.]/g, "-")}-${uuid()}.json`;
+  const uri = directory + fileName;
+  const temporaryUri = uri + ".tmp";
+  try {
+    await FileSystem.writeAsStringAsync(temporaryUri, JSON.stringify(backup));
+    const verified = parseLocalBackup(await FileSystem.readAsStringAsync(temporaryUri));
+    await FileSystem.moveAsync({ from: temporaryUri, to: uri });
+    const info = infoFor(verified, uri);
+    await writeBackupInfo(info).catch(() => undefined);
+    return info;
+  } catch (error) {
+    await FileSystem.deleteAsync(temporaryUri, { idempotent: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 /** Snapshot coherente y escritura verificada antes de permitir cualquier reinicio. */
 export async function createLocalBackup(afterSave?: (db: SQLiteDatabase) => Promise<void>): Promise<BackupInfo> {
   const tables = {} as LocalBackup["tables"];
+
+  // Respaldo simple (Guardar respaldo): tomar el snapshot atómico y liberar el lock
+  // antes del I/O de archivo, para no bloquear ventas/clientes/productos durante el guardado.
+  if (!afterSave) {
+    await withTx(async (db) => {
+      for (const table of BACKUP_TABLES) tables[table] = await db.getAllAsync<BackupRow>(`SELECT * FROM ${table}`);
+    });
+    return writeBackupFile(tables);
+  }
+
+  // Reinicio/restauración: mantener snapshot + operación destructiva atómicos con el I/O,
+  // de modo que una venta guardada durante el guardado se procese después, sin perderse.
   return withTx(async (db) => {
     for (const table of BACKUP_TABLES) tables[table] = await db.getAllAsync<BackupRow>(`SELECT * FROM ${table}`);
     const backup: LocalBackup = { format: "preventapro-local-backup", version: 1, createdAt: nowIso(), tables };
@@ -114,8 +147,6 @@ export async function createLocalBackup(afterSave?: (db: SQLiteDatabase) => Prom
       await FileSystem.moveAsync({ from: temporaryUri, to: uri });
       const info = infoFor(verified, uri);
       await writeBackupInfo(info).catch(() => undefined);
-      // Mantener el mismo lock de escritura hasta terminar un reinicio/restauración.
-      // Una venta guardada durante el I/O se ejecutará después, sin perderse.
       if (afterSave) await afterSave(db);
       return info;
     } catch (error) {

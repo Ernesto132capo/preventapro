@@ -2,6 +2,7 @@ import { v4 as uuid } from "uuid";
 import { getDb, nowIso, withTx } from "../client";
 import { enqueue, hasUnresolvedOutbox } from "../outbox";
 import { Category } from "../../domain/types";
+import { catalogRowChanged } from "../catalogChanges";
 
 export async function listCategories(): Promise<Category[]> {
   const db = await getDb();
@@ -113,7 +114,7 @@ export async function deleteCategoryLocal(id: string): Promise<void> {
   });
 }
 
-export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
+export async function upsertCategoryFromServer(serverCat: any): Promise<boolean> {
   const db = await getDb();
   const existing = await db.getFirstAsync<Category>(
     `SELECT * FROM categories WHERE server_id = ? OR id = ? OR lower(name) = lower(?)`,
@@ -124,9 +125,12 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
 
   if (existing && (existing.sync_status !== "synced" || await hasUnresolvedOutbox(db, "category", existing.id))) {
     await db.runAsync(`UPDATE categories SET server_id = ? WHERE id = ?`, [serverCat.id, existing.id]);
-    return;
+    return existing.server_id !== serverCat.id;
   }
 
+  const changed = catalogRowChanged(existing, {
+    server_id: serverCat.id, name: serverCat.name || "", active: Number(serverCat.active ?? 1),
+  });
   await db.runAsync(
     `INSERT INTO categories (id, server_id, name, active, sync_status, updated_at)
      VALUES (?, ?, ?, ?, 'synced', ?)
@@ -147,6 +151,7 @@ export async function upsertCategoryFromServer(serverCat: any): Promise<void> {
   if (serverCat.active === false || serverCat.active === 0) {
     await db.runAsync(`UPDATE products SET category_id = NULL WHERE category_id = ? OR category_id = ?`, [targetId, serverCat.id]);
   }
+  return changed;
 }
 
 export async function resolveServerCategoryId(localId: string): Promise<string | null> {

@@ -25,7 +25,7 @@ PreventaPro implementa un ciclo de vida de datos resiliente ante caídas de red 
        ├──► POST /api/sync/push ──► Lote de operaciones atómicas
        │                                     │
        │                                     ▼
-       │                              [PostgreSQL (Neon)]
+       │                              [PostgreSQL en EC2]
        │                                     │
        ◄─── GET  /api/sync/pull ◄────────────┘
             (Sincronización incremental con cursores temporales)
@@ -52,8 +52,8 @@ PreventaPro implementa un ciclo de vida de datos resiliente ante caídas de red 
 
 ### Prerrequisitos
 
-- Node.js (v20 o superior recomendado)
-- Cuenta y base de datos en [Neon PostgreSQL](https://neon.tech)
+- Node.js 24 (necesario también para las pruebas de SQLite real)
+- PostgreSQL en EC2 y cliente OpenSSH para el túnel de desarrollo
 - Expo Go o emulador Android/iOS (para la app móvil)
 
 ---
@@ -70,7 +70,7 @@ cp .env.example .env
 ```
 
 Parámetros en `backend/.env`:
-- `DATABASE_URL`: Cadena de conexión con SSL a PostgreSQL en Neon (`postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require`).
+- `DATABASE_URL`: conexión de PostgreSQL. El desarrollo usa `preventapro_dev` mediante `127.0.0.1:55432`; el servicio de EC2 usa su socket Unix local.
 - `AUTH_TOKEN_SECRET`: Secreto criptográfico de al menos 32 caracteres para la firma de JWT. Puedes generar uno seguro con:
   ```bash
   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
@@ -78,7 +78,13 @@ Parámetros en `backend/.env`:
 - `PORT`: Puerto HTTP del servicio (por defecto `4000`).
 - `SYNC_FORCE_TTL_MS`: Tiempo mínimo entre pulls forzados (opcional; por defecto `45000` ms).
 
-#### b. Instalación y Migraciones de Base de Datos
+#### b. Túnel de desarrollo
+
+Configura `EC2_SSH_HOST`, `EC2_SSH_USER`, `EC2_SSH_KEY_PATH`, `EC2_SSH_KNOWN_HOSTS` y `EC2_LOCAL_DB_PORT`, según `.env.example`. La clave privada y la huella verificada quedan fuera de Git.
+
+Desde `backend`, ejecuta `npm run db:tunnel` y mantén esa terminal abierta. Solo escucha en `127.0.0.1:55432`. La base `preventapro_dev` está separada de `preventapro`; su usuario tiene bloqueado el acceso a producción y usa credenciales propias. En otra terminal ejecuta las migraciones y `npm run dev`.
+
+#### c. Instalación y Migraciones de Base de Datos
 
 Instala las dependencias y ejecuta el runner unificado de migraciones:
 
@@ -99,9 +105,9 @@ npm run migrate
 > 9. Registro de jornadas eliminadas (`009_sync_tombstones`) para propagar sus bajas a otros teléfonos.
 > Se puede ejecutar múltiples veces seguidas de manera completamente segura.
 
-#### c. Configuración de Contraseñas de Preventistas
+#### d. Configuración de Contraseñas de Preventistas
 
-Asigna la contraseña a las cuentas registradas en Neon:
+Asigna la contraseña a las cuentas de la base de desarrollo:
 
 ```bash
 npm run user:set-password -- PV001
@@ -110,7 +116,7 @@ npm run user:set-password -- PV002
 
 *(Reemplaza `PV001` y `PV002` por los códigos reales de tus usuarios).*
 
-#### d. Iniciar en Desarrollo
+#### e. Iniciar en Desarrollo
 
 ```bash
 npm run dev
@@ -118,7 +124,7 @@ npm run dev
 
 La API estará escuchando en `http://localhost:4000/api`.
 
-#### e. Ejecutar Pruebas del Backend
+#### f. Ejecutar Pruebas del Backend
 
 ```bash
 npm test
@@ -182,6 +188,24 @@ Las pruebas cubren:
 
 Las pruebas que usan SQLite real requieren Node.js 24. En versiones sin `node:sqlite` se omiten esos casos; para una verificación completa utiliza Node.js 24.
 
+#### Comprobación del catálogo al confirmar una preventa
+
+Con conexión, la app consulta `POST /api/orders/validate` antes de guardar para comprobar el cliente, los productos, las presentaciones y las opciones del carrito. Si otro dispositivo eliminó alguno, bloquea el alta y permite corregir el carrito. Si cambiaron nombres, presentaciones o precios, muestra una revisión; el vendedor puede conservar los precios del pedido o usar los actuales, revisar el total y confirmar de nuevo. La comprobación vuelve a ejecutarse en esa confirmación.
+
+La consulta tiene un límite de 8 segundos. Sin conexión se mantiene el guardado offline con un aviso de verificación pendiente. Si el teléfono aparenta tener conexión pero falla la comprobación, se pide elegir entre volver a revisar o guardar sin verificar. Los errores de sesión no se tratan como modo offline. La consulta no abre ni cierra jornadas; la recuperación de capturas offline de jornadas cerradas conserva su regla actual.
+
+#### Detalle de pendientes de sincronización
+
+En **Inicio → Ver cambios pendientes** puedes consultar todos los cambios aún no confirmados, incluidos los errores permanentes. Los contadores muestran el total completo, aunque haya más de cinco errores. **Por revisar** filtra errores de envío y validaciones que requieren corrección; los reintentos programados se muestran en **Todos**, junto con su motivo y la fecha desde la que se pueden reintentar.
+
+Cada cambio identifica su preventa, cliente, producto o categoría y permite abrir el registro disponible. Las preventas se abren en detalle para conservar las restricciones de jornadas cerradas y anulaciones. Los registros ausentes o dados de baja siguen visibles, sin ofrecer su editor. La lista funciona sin conexión, carga páginas de 30 cambios y se actualiza al volver de una edición o terminar una sincronización. Un mismo registro puede tener varios cambios pendientes.
+
+#### Precios compartidos y mediciones de rendimiento
+
+El móvil y el servidor utilizan el mismo núcleo de cálculo en `backend/src/shared/pricing-core.ts`: reparto de centavos, subtotales, impuestos y totales. Los adaptadores conservan los precios históricos de cada preventa. Para compilar el móvil conserva también esa carpeta del repositorio; Metro está configurado para incluirla.
+
+En **Mi cuenta → Mediciones de rendimiento** puedes consultar los tiempos de comprobación del catálogo, guardado, esperas de escritura y sincronización en este teléfono. Se muestran la última duración, la media, la máxima y los fallos. Repite la misma tarea varias veces y pulsa **Actualizar mediciones** para comparar. Son agregados de la sesión actual: se pierden al cerrar por completo la app, no contienen datos de pedidos y no se envían al servidor. **Borrar mediciones** solo reinicia estos contadores.
+
 #### Respaldos y mantenimiento local
 
 En **Mi cuenta → Guardar respaldo** se crea una copia de los datos de trabajo, incluidas las preventas y operaciones pendientes. Puedes guardarla en una carpeta de Android para conservarla después de reinstalar la app. No incluye contraseñas ni tokens.
@@ -208,24 +232,15 @@ El progreso, el enlace de descarga y el código QR aparecen en Expo.dev. El perf
 
 ---
 
-## ☁️ Despliegue del Backend en Render
+## Despliegue del backend en EC2
 
-Configura el Web Service con estos valores:
+La API instalada está en **https://18.227.163.204/api**. Backend, PostgreSQL y reportes se ejecutan en EC2; Nginx ofrece HTTPS y el servicio `preventapro` se inicia con systemd. La configuración de producción está en `/etc/preventapro/backend.env`, reservada a root. La base usa el socket local de PostgreSQL y el puerto 5432 no está expuesto a Internet.
 
-- **Root Directory:** `backend`
-- **Build Command:** `npm ci --include=dev && npm run build`
-- **Start Command:** `npm start`
-- **Health Check Path:** `/api/health`
+Los scripts y el estado están en [deploy/ec2/README.md](deploy/ec2/README.md) y [deploy/ec2/ESTADO.md](deploy/ec2/ESTADO.md). Las copias diarias se guardan en S3 y se han comprobado con restauraciones en bases temporales.
 
-Variables requeridas en Render:
+Para comprobar las rutas de lectura y la validación de un borrador, ejecuta `npm run verify:ec2` desde `backend`. Usa SSH y la configuración privada del servidor; el PC no necesita las credenciales de producción. No crea pedidos ni cambia el catálogo.
 
-- `DATABASE_URL`: conexión de Neon.
-- `AUTH_TOKEN_SECRET`: secreto estable de al menos 32 caracteres.
-- `NODE_ENV=production`.
-
-Render asigna `PORT` automáticamente. Antes de un despliegue con cambios de esquema, ejecuta `npm run migrate` una vez contra Neon; para migraciones usa preferentemente la conexión directa de Neon.
-
-Esta revisión incorpora `010_clients_assigned_user`, que añade de forma idempotente la columna `clients.assigned_user_id` usada al registrar clientes. El runner la aplica tanto a bases existentes como a instalaciones nuevas. Debe ejecutarse antes de desplegar el backend actualizado.
+El APK 1.0.3 (4) ya apunta a EC2. Actualizar el backend manteniendo esa URL no requiere otro APK. Los servicios anteriores de Render y Neon ya no forman parte de la arquitectura de la aplicación.
 
 ---
 

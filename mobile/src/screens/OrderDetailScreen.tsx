@@ -15,7 +15,7 @@ import { useAuth } from "../context/AuthContext";
 export function OrderDetailScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { forceSync } = useSync();
+  const { pushSync } = useSync();
   const { user } = useAuth();
   const [data, setData] = useState<{ order: any; items: any[] } | null>(null);
   const [orderWorkDay, setOrderWorkDay] = useState<{ id: string; status: string; work_date: string } | null>(null);
@@ -85,7 +85,7 @@ export function OrderDetailScreen() {
     setIsSubmitting(true);
     try {
       await cancelOrderLocal(data.order.id);
-      void forceSync().catch(() => {});
+      void pushSync().catch(() => {});
       navigation.goBack();
     } catch (err: any) {
       Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa localmente.");

@@ -5,9 +5,13 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "db:tunnel": "node scripts/db-tunnel.cjs",
+    "verify:ec2": "node ../deploy/ec2/verify-deployment.cjs",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "vitest run",
+    "simulate:day": "node scripts/simulate-day.mjs",
+    "test:simulation": "node --test scripts/simulation/workload.test.mjs",
     "migrate": "tsx scripts/migrate.ts",
     "migrate:combos": "tsx scripts/migrate-combos.ts",
     "migrate:auth": "tsx scripts/migrate-auth.ts",

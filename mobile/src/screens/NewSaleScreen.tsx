@@ -1,54 +1,45 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert, Modal, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, FlatList, ScrollView, StyleSheet, Pressable, Alert, ActivityIndicator } from "react-native";
 import { useFocusEffect, useIsFocused, useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
+import { ClientPickerItem, ProductPickerItem } from "../components/sale/SaleRows";
+import { CartReviewModal, PriceReviewModal, FinalPriceConfirmModal, PriceDiffItem } from "../components/sale/SaleDialogs";
+export type { PriceDiffItem } from "../components/sale/SaleDialogs";
 import { ComboSelectorModal } from "../components/ComboSelectorModal";
 import { getClient, listActiveClients } from "../db/repositories/clients";
 import {
   listProducts,
-  listFrequentProducts,
-  listRecentProductsForClient,
-  toggleFavoriteLocal,
   getPresentationsByIds,
   ProductWithPresentations,
 } from "../db/repositories/products";
-import { listCategories } from "../db/repositories/categories";
 import { createOrderLocal, getOrderWithItems, updateOrderLocal } from "../db/repositories/orders";
 import { getTodayWorkDay, reopenWorkDayLocal, resolveServerWorkDayId } from "../db/repositories/workdays";
 import { buildCartLine, calcOrderTotals, recalcLineQuantity, updateLineUnitPrice, calcPriceDifference, PricingError } from "../domain/pricing";
 import { centsToBs } from "../domain/pricing";
-import { CartLine, CartLineSelection, Category, Client, Presentation, Product, WorkDay } from "../domain/types";
+import { CartLine, CartLineSelection, Client, Presentation, Product, WorkDay } from "../domain/types";
 import { formatClientDisplayName } from "../domain/client-display";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
-import { resolveSelectedPresentation } from "../utils/catalogSelection";
 import { apiFetch } from "../services/api";
-import { useDebounce } from "../utils/useDebounce";
+import { ProductFilterMode, useSaleCatalog } from "../hooks/useSaleCatalog";
+import { measurePerformance } from "../services/performance";
+import { validateSaleDraft } from "../services/saleValidation";
+import { captureComboCatalog, reviewSaleCatalog, saleDraftKey } from "../utils/saleReview";
 
 type Step = "client" | "products";
-type ProductFilterMode = "all" | "favorites" | "recent" | "frequent" | "category";
 const clientKeyExtractor = (client: Client) => client.id;
 const productKeyExtractor = (product: ProductWithPresentations) => product.id;
 
-export interface PriceDiffItem {
-  productId: string;
-  presentationId: string;
-  productName: string;
-  presentationName: string;
-  historicalPriceCents: number;
-  currentPriceCents: number;
-  quantity: number;
-}
 
 export function NewSaleScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
   const isFocused = useIsFocused();
   const { user } = useAuth();
-  const { forceSync, pushSync, syncTick } = useSync();
+  const { forceSync, pushSync, catalogRevision, connection } = useSync();
 
   const editingOrderId = route.params?.orderId as string | undefined;
   const isEditing = Boolean(editingOrderId);
@@ -57,21 +48,20 @@ export function NewSaleScreen() {
   const [step, setStep] = useState<Step>(isEditing ? "products" : "client");
   const [loadingOrder, setLoadingOrder] = useState(isEditing);
   const [clientSearch, setClientSearch] = useState("");
-  const debouncedClientSearch = useDebounce(clientSearch, 300);
-  const [clients, setClients] = useState<Client[]>([]);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
 
   const [productSearch, setProductSearch] = useState("");
-  const debouncedProductSearch = useDebounce(productSearch, 300);
-  const [products, setProducts] = useState<ProductWithPresentations[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [recentCount, setRecentCount] = useState(0);
 
   // Filtros rápidos
   const [filterMode, setFilterMode] = useState<ProductFilterMode>("all");
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
+  const { clients, setClients, products, categories, recentCount, handleToggleFavorite,
+    loadingClients, loadingProducts, catalogError } = useSaleCatalog({
+    isFocused, catalogRevision, clientSearch, productSearch, filterMode, selectedCategoryId, selectedClient,
+  });
 
   const [cart, setCart] = useState<CartLine[]>([]);
+  const cartRef = useRef(cart);
   const [paymentCondition] = useState("Contado 48h");
   const [saving, setSaving] = useState(false);
   const saveInFlightRef = useRef(false);
@@ -93,6 +83,13 @@ export function NewSaleScreen() {
   const [priceDecision, setPriceDecision] = useState<"historical" | "current" | null>(null);
   const [currentPresMap, setCurrentPresMap] = useState<Map<string, Presentation>>(new Map());
   const [finalConfirmModalVisible, setFinalConfirmModalVisible] = useState(false);
+  const draftKey = useMemo(() => saleDraftKey(selectedClient?.id || "", cart, editingOrderId), [selectedClient?.id, cart, editingOrderId]);
+  const draftKeyRef = useRef(draftKey);
+  const focusedRef = useRef(isFocused);
+  const approvedCatalogRef = useRef<string | null>(null);
+  draftKeyRef.current = draftKey;
+  focusedRef.current = isFocused;
+  cartRef.current = cart;
 
   const checkWorkDay = useCallback(async () => {
     if (!user) return;
@@ -100,62 +97,15 @@ export function NewSaleScreen() {
     setWorkDay(wd);
   }, [user]);
 
-  const loadClients = useCallback(async () => {
-    setClients(await listActiveClients(debouncedClientSearch));
-  }, [debouncedClientSearch]);
-
-  const productSearchForMode = filterMode === "recent" || filterMode === "frequent"
-    ? ""
-    : debouncedProductSearch;
-
-  const loadProducts = useCallback(async () => {
-    if (filterMode === "recent" && selectedClient) {
-      const recents = await listRecentProductsForClient(selectedClient.id);
-      setProducts(recents);
-      return;
-    }
-    if (filterMode === "frequent") {
-      const frequents = await listFrequentProducts(15);
-      setProducts(frequents);
-      return;
-    }
-
-    const [prods, cats] = await Promise.all([
-      listProducts({
-        search: productSearchForMode,
-        categoryId: filterMode === "category" ? selectedCategoryId : undefined,
-        onlyFavorites: filterMode === "favorites" ? true : undefined,
-      }),
-      listCategories(),
-    ]);
-    setProducts(prods);
-    setCategories(cats);
-  }, [productSearchForMode, filterMode, selectedCategoryId, selectedClient]);
-
-  // Cargar contador de compras recientes del cliente seleccionado
-  useEffect(() => {
-    if (selectedClient) {
-      listRecentProductsForClient(selectedClient.id).then((rec) => {
-        setRecentCount(rec.length);
-      });
-    } else {
-      setRecentCount(0);
-    }
-  }, [selectedClient]);
-
   useFocusEffect(
     useCallback(() => {
+      focusedRef.current = true;
       void checkWorkDay();
+      return () => { focusedRef.current = false; };
     }, [checkWorkDay])
   );
 
-  useEffect(() => {
-    if (isFocused) void loadClients();
-  }, [isFocused, loadClients, syncTick]);
-
-  useEffect(() => {
-    if (isFocused) void loadProducts();
-  }, [isFocused, loadProducts, syncTick]);
+  useEffect(() => () => { focusedRef.current = false; }, []);
 
   async function handleReopen() {
     if (!workDay) return;
@@ -206,6 +156,14 @@ export function NewSaleScreen() {
         }
         setSelectedClient(client);
 
+        const comboProductIds = [...new Set(items.filter((item: any) => item.selections?.length > 0).map((item: any) => String(item.product_id)))];
+        const comboProducts = comboProductIds.length ? await listProducts({ productIds: comboProductIds }) : [];
+        const comboDefinitions = new Map<string, ProductWithPresentations["combo_definition"]>();
+        for (const product of comboProducts) {
+          comboDefinitions.set(product.id, product.combo_definition);
+          if (product.server_id) comboDefinitions.set(product.server_id, product.combo_definition);
+        }
+
         const loadedCart: CartLine[] = items.map((item: any) => ({
           productId: item.product_id,
           presentationId: item.presentation_id,
@@ -217,6 +175,7 @@ export function NewSaleScreen() {
           quantity: item.quantity,
           subtotalCents: item.subtotal_cents,
           isCombo: item.selections && item.selections.length > 0,
+          comboCatalogSnapshot: captureComboCatalog(comboDefinitions.get(item.product_id)),
           selections: (item.selections || []).map((s: any) => ({
             selectedProductId: s.selected_product_id,
             selectedPresentationId: s.selected_presentation_id,
@@ -285,18 +244,18 @@ export function NewSaleScreen() {
 
   const addToCart = useCallback((product: Product, presentation: Presentation, quantity: number) => {
     try {
-      setCart((prev) => {
-        const existingIdx = prev.findIndex((l) => l.presentationId === presentation.id && !l.isCombo);
-        if (existingIdx >= 0) {
-          const updated = recalcLineQuantity(prev[existingIdx], prev[existingIdx].quantity + quantity);
-          return prev.map((l, i) => (i === existingIdx ? updated : l));
-        } else {
-          const line = buildCartLine(product, presentation, quantity);
-          return [...prev, line];
-        }
-      });
+      const current = cartRef.current;
+      const existingIdx = current.findIndex((l) => l.presentationId === presentation.id && !l.isCombo);
+      if (existingIdx >= 0) {
+        const updated = recalcLineQuantity(current[existingIdx], current[existingIdx].quantity + quantity);
+        setCart(current.map((l, i) => (i === existingIdx ? updated : l)));
+      } else {
+        const line = buildCartLine(product, presentation, quantity);
+        setCart([...current, line]);
+      }
     } catch (err) {
       if (err instanceof PricingError) Alert.alert("No se pudo agregar", err.message);
+      else Alert.alert("No se pudo agregar", "Ocurrió un error inesperado al agregar el producto.");
     }
   }, []);
 
@@ -317,12 +276,18 @@ export function NewSaleScreen() {
       quantity: number,
       selections: CartLineSelection[]
     ) => {
-      const line: CartLine = {
-        ...buildCartLine(product, presentation, quantity),
-        isCombo: true,
-        selections,
-      };
-      setCart((prev) => [...prev, line]);
+      try {
+        const line: CartLine = {
+          ...buildCartLine(product, presentation, quantity),
+          isCombo: true,
+          comboCatalogSnapshot: captureComboCatalog(product.combo_definition),
+          selections,
+        };
+        setCart((prev) => [...prev, line]);
+      } catch (err) {
+        if (err instanceof PricingError) Alert.alert("No se pudo agregar", err.message);
+        else Alert.alert("No se pudo agregar", "Ocurrió un error inesperado al agregar el combo.");
+      }
     },
     []
   );
@@ -334,22 +299,20 @@ export function NewSaleScreen() {
   }, []);
 
   const changeLineQuantity = useCallback((index: number, delta: number) => {
-    setCart((prev) =>
-      prev
+    try {
+      const current = cartRef.current;
+      const next = current
         .map((line, i) => {
           if (i !== index) return line;
           const quantity = line.quantity + delta;
           return quantity > 0 ? recalcLineQuantity(line, quantity) : null;
         })
-        .filter((line): line is CartLine => line !== null)
-    );
-  }, []);
-
-  const handleToggleFavorite = useCallback(async (productId: string) => {
-    const nowFav = await toggleFavoriteLocal(productId);
-    setProducts((prev) =>
-      prev.map((p) => (p.id === productId ? { ...p, is_favorite: nowFav } : p))
-    );
+        .filter((line): line is CartLine => line !== null);
+      setCart(next);
+    } catch (err) {
+      if (err instanceof PricingError) Alert.alert("No se pudo actualizar", err.message);
+      else Alert.alert("No se pudo actualizar", "Ocurrió un error inesperado al actualizar la cantidad.");
+    }
   }, []);
 
   const handleSelectClient = useCallback(
@@ -404,16 +367,24 @@ export function NewSaleScreen() {
     void executeSaveOrder();
   }
 
-  async function executeSaveOrder() {
+  async function executeSaveOrder(offlineConsentKey?: string) {
     if (saveInFlightRef.current) return;
     if (!selectedClient) {
       setError("Selecciona un cliente antes de guardar.");
       return;
     }
+    if (cart.length === 0) {
+      setError("Agrega al menos un producto.");
+      return;
+    }
+    const capturedDraftKey = saleDraftKey(selectedClient.id, cart, editingOrderId);
+    const draftIsCurrent = () => focusedRef.current && draftKeyRef.current === capturedDraftKey;
+    if (!draftIsCurrent()) return;
     saveInFlightRef.current = true;
     setSaving(true);
     try {
       const currentWd = await getTodayWorkDay(user!.id);
+      if (!draftIsCurrent()) return;
       const localWdId = currentWd.id;
       setWorkDay(currentWd);
 
@@ -430,24 +401,100 @@ export function NewSaleScreen() {
         return;
       }
 
-      if (editingOrderId) {
-        await updateOrderLocal(editingOrderId, cart, paymentCondition);
-      } else {
-        await createOrderLocal({
-          workDayLocalId: localWdId,
-          clientId: selectedClient.id,
-          paymentCondition,
-          lines: cart,
-        });
+      let unverified = offlineConsentKey === capturedDraftKey;
+      if (!unverified) {
+        const validation = await measurePerformance("sale.catalog_validation", () => validateSaleDraft(selectedClient, cart, {
+          online: connection !== "offline", editingOrderId,
+        }));
+        if (!draftIsCurrent()) {
+          if (focusedRef.current) setError("El pedido cambió durante la comprobación. Revisa el carrito y vuelve a guardar.");
+          return;
+        }
+        if (validation.status === "unverified") {
+          unverified = true;
+          if (validation.reason !== "offline") {
+            Alert.alert("No se pudo verificar el catálogo", `${validation.message}\n\nSi guardas sin verificar, los cambios quedarán pendientes y podrían requerir corregir el cliente o los productos al sincronizar.`, [
+              { text: "Volver a revisar", style: "cancel" },
+              { text: "Guardar sin verificar", onPress: () => {
+                if (draftIsCurrent()) void executeSaveOrder(capturedDraftKey);
+              } },
+            ]);
+            return;
+          }
+        } else if (!validation.valid) {
+          const messages = [...new Set(validation.issues.map(issue => issue.message))];
+          const message = messages.slice(0, 6).join("\n") || "El cliente o los productos cambiaron. Revisa la preventa antes de guardar.";
+          setError(message);
+          const clientUnavailable = validation.issues.some(issue => issue.entity === "client");
+          if (clientUnavailable && !isEditing) {
+            setSelectedClient(null);
+            setClients(previous => previous.filter(client => client.id !== selectedClient.id));
+            setStep("client");
+            setCartModalVisible(false);
+            setFinalConfirmModalVisible(false);
+          }
+          const blockedLines = new Set(validation.issues.flatMap(issue => issue.lineIndex == null ? [] : [issue.lineIndex]));
+          Alert.alert(clientUnavailable ? "Cliente no disponible" : "El catálogo cambió", message, [
+            { text: "Revisar", style: "cancel" },
+            ...(blockedLines.size > 0 && !clientUnavailable ? [{ text: "Quitar no disponibles", onPress: () => {
+              if (!draftIsCurrent()) return;
+              setCart(previous => previous.filter((_line, index) => !blockedLines.has(index)));
+              approvedCatalogRef.current = null;
+            } }] : []),
+            { text: "Actualizar lista", onPress: () => { void forceSync().catch(() => {}); } },
+          ]);
+          return;
+        } else {
+          unverified = validation.unchecked;
+          const historicalPrices = priceDecision === "historical"
+            ? new Map([...currentPresMap.entries()].map(([id, presentation]) => [id, presentation.price_cents]))
+            : undefined;
+          const review = reviewSaleCatalog(selectedClient, cart, validation, historicalPrices);
+          const approvalKey = JSON.stringify([review.catalogKey, capturedDraftKey]);
+          if (review.changes.length > 0 && approvedCatalogRef.current !== approvalKey) {
+            const summary = review.changes.slice(0, 6).join("\n") + (review.changes.length > 6 ? `\nY ${review.changes.length - 6} cambio(s) más.` : "");
+            const applyReview = (useCurrentPrices: boolean) => {
+              if (!draftIsCurrent()) return;
+              const reviewedLines = useCurrentPrices ? review.currentLines : review.preservedLines;
+              approvedCatalogRef.current = JSON.stringify([review.catalogKey, saleDraftKey(selectedClient.id, reviewedLines, editingOrderId)]);
+              setSelectedClient(review.refreshedClient);
+              setCart(reviewedLines);
+              setError("Catálogo revisado. Verifica el total del carrito y vuelve a confirmar para guardar.");
+            };
+            Alert.alert(review.priceChanged ? "Los precios cambiaron" : "El catálogo cambió", `${summary}${review.priceChanged ? `\n\nTotal del carrito: ${centsToBs(review.previousTotalCents)}\nCon precios actuales: ${centsToBs(review.currentTotalCents)}` : ""}\n\nRevisa los cambios y vuelve a confirmar el pedido.`, [
+              { text: "Volver", style: "cancel" },
+              { text: review.priceChanged ? "Mantener precios" : "Actualizar pedido", onPress: () => applyReview(false) },
+              ...(review.priceChanged ? [{ text: "Usar precios actuales", onPress: () => applyReview(true) }] : []),
+            ]);
+            return;
+          }
+        }
       }
-      // SQLite y su outbox ya están confirmados; la red no retrasa ni revierte el guardado.
+      if (!draftIsCurrent()) return;
+
+      await measurePerformance("sale.local_save", async () => {
+        if (editingOrderId) {
+          await updateOrderLocal(editingOrderId, cart, paymentCondition);
+        } else {
+          await createOrderLocal({
+            workDayLocalId: localWdId,
+            clientId: selectedClient.id,
+            paymentCondition,
+            lines: cart,
+          });
+        }
+      });
+      // Después de la comprobación breve, SQLite y outbox se confirman sin esperar al push.
       void pushSync().catch(() => {});
       setCart([]);
       setSelectedClient(null);
       setCartModalVisible(false);
       setFinalConfirmModalVisible(false);
       setStep("client");
-      Alert.alert(editingOrderId ? "Preventa actualizada" : "Preventa guardada", "Se sincronizará automáticamente.");
+      approvedCatalogRef.current = null;
+      Alert.alert(editingOrderId ? "Preventa actualizada" : "Preventa guardada", unverified
+        ? "Guardada en este teléfono. El cliente y los productos se comprobarán al sincronizar; si cambiaron, la preventa se conservará pendiente para revisarla."
+        : "Se sincronizará automáticamente.");
       if (editingOrderId) navigation.goBack();
       else navigation.navigate("Registros");
     } catch (err: any) {
@@ -539,13 +586,14 @@ export function NewSaleScreen() {
           onPress={() => navigation.navigate("NuevoCliente", { returnToPreventa: true })}
           style={{ marginHorizontal: spacing.lg, marginBottom: spacing.md }}
         />
+        {catalogError && <Text style={[styles.error, { marginHorizontal: spacing.lg }]}>{catalogError}</Text>}
 
         <FlatList
           data={clients}
           keyExtractor={clientKeyExtractor}
           keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingTop: 0 }}
-          ListEmptyComponent={<EmptyState message="No se encontraron clientes." />}
+          ListEmptyComponent={loadingClients ? <ActivityIndicator color={colors.emerald} /> : <EmptyState message="No se encontraron clientes." />}
           renderItem={renderClientItem}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
@@ -579,6 +627,9 @@ export function NewSaleScreen() {
               Cliente: {formatClientDisplayName(selectedClient).primary} · Cambiar
             </Text>
           </Pressable>
+        )}
+        {connection === "offline" && (
+          <Text style={styles.offlineHint}>Sin conexión: el cliente y los productos se verificarán al sincronizar.</Text>
         )}
       </View>
 
@@ -682,6 +733,7 @@ export function NewSaleScreen() {
         </ScrollView>
       </View>
 
+      {catalogError && <Text style={[styles.error, { marginHorizontal: spacing.lg }]}>{catalogError}</Text>}
       <FlatList
         data={products}
         keyExtractor={productKeyExtractor}
@@ -692,7 +744,7 @@ export function NewSaleScreen() {
         maxToRenderPerBatch={8}
         windowSize={5}
         removeClippedSubviews={true}
-        ListEmptyComponent={<EmptyState message="No hay productos disponibles para este filtro." />}
+        ListEmptyComponent={loadingProducts ? <ActivityIndicator color={colors.emerald} /> : <EmptyState message="No hay productos disponibles para este filtro." />}
       />
 
       {/* Barra fija inferior cuando hay productos en el carrito */}
@@ -719,67 +771,9 @@ export function NewSaleScreen() {
         </View>
       )}
 
-      {/* Modal para revisar el pedido y guardar sin necesidad de scrollear al fondo del catálogo */}
-      <Modal
-        visible={cartModalVisible}
-        animationType="slide"
-        transparent={true}
-        onRequestClose={() => setCartModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <View style={styles.modalHeaderRow}>
-              <View style={{ flex: 1, marginRight: spacing.sm }}>
-                <Text style={styles.modalTitle}>Resumen del Pedido</Text>
-                <Text style={styles.modalClientSub}>Cliente: {formatClientDisplayName(selectedClient).primary}</Text>
-              </View>
-              <Pressable onPress={() => setCartModalVisible(false)} style={styles.modalCloseBtn}>
-                <Text style={styles.modalCloseBtnText}>✕ Seguir agregando</Text>
-              </Pressable>
-            </View>
-
-            <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-              {cart.length > 0 ? (
-                <>
-                  <Text style={styles.cartTitle}>Productos añadidos ({totals.itemCount} items)</Text>
-                  {cart.map((line, idx) => (
-                    <CartLineItemRow
-                      key={`${line.presentationId}-${idx}`}
-                      line={line}
-                      index={idx}
-                      onChangeQty={changeLineQuantity}
-                    />
-                  ))}
-
-                  <View style={styles.totalsBlock}>
-                    <TotalRow label="Subtotal bruto" value={centsToBs(totals.subtotalCents)} />
-                    <TotalRow label="Total" value={centsToBs(totals.totalCents)} bold />
-                  </View>
-                </>
-              ) : (
-                <EmptyState message="El carrito está vacío. Agrega productos desde el catálogo." />
-              )}
-
-              {error && <Text style={styles.error}>{error}</Text>}
-            </ScrollView>
-
-            <View style={styles.modalFooter}>
-              <Button
-                label={editingOrderId ? "GUARDAR CAMBIOS" : "GUARDAR PREVENTA"}
-                onPress={handleSaveOrder}
-                loading={saving}
-                disabled={saving || cart.length === 0}
-              />
-              <Button
-                label="Volver al catálogo"
-                variant="outline"
-                onPress={() => setCartModalVisible(false)}
-                style={{ marginTop: spacing.sm }}
-              />
-            </View>
-          </View>
-        </View>
-      </Modal>
+      <CartReviewModal visible={cartModalVisible} selectedClient={selectedClient} offline={connection === "offline"}
+        cart={cart} totals={totals} error={error} saving={saving} editing={isEditing}
+        onClose={() => setCartModalVisible(false)} onChangeQty={changeLineQuantity} onSave={handleSaveOrder} />
 
       <ComboSelectorModal
         visible={comboModalVisible}
@@ -789,313 +783,19 @@ export function NewSaleScreen() {
         onClose={handleCloseComboModal}
       />
 
-      {/* Modal para elegir precio histórico o actual */}
-      <Modal
-        visible={priceDiffModalVisible}
-        animationType="fade"
-        transparent={true}
-        onRequestClose={handleCancelEditing}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalCard, { maxHeight: "85%" }]}>
-            <View style={styles.modalHeaderRow}>
-              <View style={{ flex: 1, marginRight: spacing.sm }}>
-                <Text style={styles.modalTitle}>Precios Actualizados</Text>
-                <Text style={styles.modalClientSub}>
-                  Hay diferencias entre los precios guardados y los precios actuales del catálogo.
-                </Text>
-              </View>
-            </View>
+      <PriceReviewModal visible={priceDiffModalVisible} differences={priceDifferences}
+        originalTotalCents={originalOrderTotalCents} estimatedTotalCents={estimatedNewTotalCents}
+        onKeepHistorical={handleKeepHistoricalPrices} onUseCurrent={handleUseCurrentPrices} onCancel={handleCancelEditing} />
 
-            <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-              <Text style={[styles.cartTitle, { marginBottom: spacing.xs }]}>Productos con cambio de precio:</Text>
-              {priceDifferences.map((diff, idx) => (
-                <View key={`${diff.presentationId}-${idx}`} style={styles.priceDiffCard}>
-                  <Text style={styles.priceDiffProdName}>
-                    {diff.productName} · <Text style={{ fontWeight: "400" }}>{diff.presentationName}</Text>
-                  </Text>
-                  <Text style={styles.priceDiffQty}>Cantidad en preventa: {diff.quantity}</Text>
-                  <View style={styles.priceDiffRow}>
-                    <View style={styles.priceDiffCol}>
-                      <Text style={styles.priceDiffLabel}>Precio guardado:</Text>
-                      <Text style={styles.priceDiffOldVal}>{centsToBs(diff.historicalPriceCents)}</Text>
-                    </View>
-                    <Text style={styles.priceDiffArrow}>➔</Text>
-                    <View style={styles.priceDiffCol}>
-                      <Text style={styles.priceDiffLabel}>Precio actual:</Text>
-                      <Text style={styles.priceDiffNewVal}>{centsToBs(diff.currentPriceCents)}</Text>
-                    </View>
-                  </View>
-                </View>
-              ))}
-
-              <View style={[styles.totalsBlock, { marginTop: spacing.md }]}>
-                <TotalRow label="Total original de la preventa" value={centsToBs(originalOrderTotalCents)} bold />
-                <TotalRow label="Total estimado si se actualizan precios" value={centsToBs(estimatedNewTotalCents)} bold />
-                <TotalRow
-                  label="Diferencia estimada"
-                  value={
-                    estimatedNewTotalCents - originalOrderTotalCents > 0
-                      ? `+${centsToBs(estimatedNewTotalCents - originalOrderTotalCents)}`
-                      : estimatedNewTotalCents - originalOrderTotalCents < 0
-                      ? `-${centsToBs(Math.abs(estimatedNewTotalCents - originalOrderTotalCents))}`
-                      : centsToBs(0)
-                  }
-                />
-              </View>
-            </ScrollView>
-
-            <View style={[styles.modalFooter, { paddingTop: spacing.md }]}>
-              <Button
-                label="Mantener precios anteriores"
-                variant="outline"
-                onPress={handleKeepHistoricalPrices}
-                style={{ marginBottom: spacing.xs }}
-              />
-              <Button
-                label="Usar precios actuales"
-                variant="primary"
-                onPress={handleUseCurrentPrices}
-                style={{ marginBottom: spacing.xs }}
-              />
-              <Button
-                label="Cancelar edición"
-                variant="danger"
-                onPress={handleCancelEditing}
-              />
-            </View>
-          </View>
-        </View>
-      </Modal>
-
-      {/* Modal de confirmación final antes de guardar con precios actuales */}
-      <Modal
-        visible={finalConfirmModalVisible}
-        animationType="fade"
-        transparent={true}
-        onRequestClose={() => setFinalConfirmModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <View style={styles.modalHeaderRow}>
-              <View style={{ flex: 1, marginRight: spacing.sm }}>
-                <Text style={styles.modalTitle}>Confirmar cambio de precios</Text>
-                <Text style={styles.modalClientSub}>
-                  Esta preventa se guardará aplicando los precios vigentes del catálogo.
-                </Text>
-              </View>
-            </View>
-
-            <View style={{ paddingVertical: spacing.md }}>
-              <View style={styles.totalsBlock}>
-                <TotalRow label="Total anterior" value={centsToBs(originalOrderTotalCents)} />
-                <TotalRow label="Total nuevo" value={centsToBs(totals.totalCents)} bold />
-                <TotalRow
-                  label="Diferencia"
-                  value={
-                    totals.totalCents - originalOrderTotalCents > 0
-                      ? `+${centsToBs(totals.totalCents - originalOrderTotalCents)}`
-                      : totals.totalCents - originalOrderTotalCents < 0
-                      ? `-${centsToBs(Math.abs(totals.totalCents - originalOrderTotalCents))}`
-                      : centsToBs(0)
-                  }
-                  bold
-                />
-              </View>
-            </View>
-
-            <View style={styles.modalFooter}>
-              <Button
-                label="Confirmar cambio"
-                onPress={() => {
-                  setFinalConfirmModalVisible(false);
-                  void executeSaveOrder();
-                }}
-                loading={saving}
-                disabled={saving}
-                style={{ marginBottom: spacing.xs }}
-              />
-              <Button
-                label="Volver a editar"
-                variant="outline"
-                onPress={() => setFinalConfirmModalVisible(false)}
-                disabled={saving}
-              />
-            </View>
-          </View>
-        </View>
-      </Modal>
-    </View>
-  );
-}
-
-const ClientPickerItem = React.memo(function ClientPickerItem({
-  client,
-  onSelect,
-}: {
-  client: Client;
-  onSelect: (client: Client) => void;
-}) {
-  const display = formatClientDisplayName(client);
-  return (
-    <Pressable onPress={() => onSelect(client)}>
-      <Card style={{ marginBottom: spacing.sm }}>
-        <Text style={styles.clientName}>{display.primary}</Text>
-        {!!display.secondary && <Text style={styles.clientSub}>{display.secondary}</Text>}
-      </Card>
-    </Pressable>
-  );
-});
-
-const CartLineItemRow = React.memo(function CartLineItemRow({
-  line,
-  index,
-  onChangeQty,
-}: {
-  line: CartLine;
-  index: number;
-  onChangeQty: (idx: number, delta: number) => void;
-}) {
-  return (
-    <View style={styles.cartLine}>
-      <View style={{ flex: 1, marginRight: spacing.xs }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-          <Text style={styles.cartLineName}>{line.productName}</Text>
-          {line.isCombo && (
-            <View style={styles.miniComboBadge}>
-              <Text style={styles.miniComboText}>🎁 Combo</Text>
-            </View>
-          )}
-        </View>
-        <Text style={styles.cartLineSub}>
-          {line.presentationName} · Contiene {line.unitEquivalence} unidad{line.unitEquivalence === 1 ? "" : "es"} · {centsToBs(line.unitPriceCents)}
-        </Text>
-        {line.selections && line.selections.length > 0 && (
-          <View style={styles.cartSelectionsWrap}>
-            {line.selections.map((sel, sIdx) => (
-              <Text key={sIdx} style={styles.cartSelectionItem}>
-                • {sel.quantity} × {sel.productNameSnapshot} ({sel.presentationNameSnapshot})
-              </Text>
-            ))}
-          </View>
-        )}
-      </View>
-      <Pressable onPress={() => onChangeQty(index, -1)} style={styles.qtyBtn}><Text>-</Text></Pressable>
-      <Text style={styles.qtyText}>{line.quantity}</Text>
-      <Pressable onPress={() => onChangeQty(index, 1)} style={styles.qtyBtn}><Text>+</Text></Pressable>
-      <Text style={styles.lineSubtotal}>{centsToBs(line.subtotalCents)}</Text>
-    </View>
-  );
-});
-
-const ProductPickerItem = React.memo(function ProductPickerItem({
-  product,
-  onAdd,
-  onConfigureCombo,
-  onToggleFavorite,
-}: {
-  product: ProductWithPresentations;
-  onAdd: (p: Product, pres: Presentation, qty: number) => void;
-  onConfigureCombo: (p: ProductWithPresentations, pres: Presentation) => void;
-  onToggleFavorite: (id: string) => void;
-}) {
-  // Guardar solo el ID: el objeto y su precio siempre vienen del catálogo actual.
-  const [selectedPresentationId, setSelectedPresentationId] = useState<string | null>(product.presentations[0]?.id ?? null);
-  const selectedPres = useMemo(
-    () => resolveSelectedPresentation(product.presentations, selectedPresentationId),
-    [product.presentations, selectedPresentationId]
-  );
-  const [qty, setQty] = useState("1");
-  const isCombo = product.product_type === "combo";
-
-  useEffect(() => {
-    setSelectedPresentationId(product.presentations[0]?.id ?? null);
-    setQty("1");
-  }, [product.id]);
-
-  if (product.presentations.length === 0) return null;
-
-  return (
-    <Card style={{ marginBottom: spacing.sm }}>
-      <View style={styles.pickerHeader}>
-        <View style={{ flexDirection: "row", alignItems: "center", flex: 1, marginRight: spacing.xs }}>
-          <Text style={styles.pickerName}>{product.name}</Text>
-        </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <Pressable onPress={() => onToggleFavorite(product.id)} style={styles.starBtn}>
-            <Text style={{ fontSize: 18 }}>{product.is_favorite ? "⭐" : "☆"}</Text>
-          </Pressable>
-          {isCombo && (
-            <View style={styles.miniComboBadge}>
-              <Text style={styles.miniComboText}>🎁 Combo</Text>
-            </View>
-          )}
-        </View>
-      </View>
-      <Text style={styles.pickerSku}>SKU: {product.sku}</Text>
-      <View style={styles.presChoices}>
-        {product.presentations.map((p) => (
-          <Pressable
-            key={p.id}
-            onPress={() => {
-              setSelectedPresentationId(p.id);
-              setQty("1");
-            }}
-            style={[styles.presChoice, selectedPres?.id === p.id && styles.presChoiceActive]}
-          >
-            <Text style={[styles.presChoiceText, selectedPres?.id === p.id && { color: "#fff" }]}>{p.name}</Text>
-            <Text style={[styles.presChoicePrice, selectedPres?.id === p.id && { color: "#fff" }]}>{centsToBs(p.price_cents)}</Text>
-            <Text style={[styles.presChoicePrice, selectedPres?.id === p.id && { color: "#fff" }]}>Contiene {p.unit_equivalence} unidad{p.unit_equivalence === 1 ? "" : "es"}</Text>
-          </Pressable>
-        ))}
-      </View>
-
-      {isCombo ? (
-        <View style={styles.comboActionRow}>
-          <Button
-            label="🎁 Configurar opciones del combo"
-            onPress={() => {
-              if (selectedPres) onConfigureCombo(product, selectedPres);
-            }}
-            style={{ flex: 1 }}
-          />
-        </View>
-      ) : (
-        <View style={styles.addRow}>
-          <TextInput
-            style={styles.qtyInput}
-            value={qty}
-            onChangeText={setQty}
-            keyboardType="number-pad"
-            maxLength={4}
-          />
-          <Button
-            label="Agregar"
-            onPress={() => {
-              const n = parseInt(qty, 10);
-              if (selectedPres && n > 0) {
-                onAdd(product, selectedPres, n);
-                setQty("1");
-              }
-            }}
-            style={{ flex: 1, marginLeft: spacing.sm }}
-          />
-        </View>
-      )}
-    </Card>
-  );
-});
-
-function TotalRow({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
-  return (
-    <View style={styles.totalRow}>
-      <Text style={[styles.totalLabel, bold && { fontWeight: "700", color: colors.textPrimary }]}>{label}</Text>
-      <Text style={[styles.totalValue, bold && { fontWeight: "700", fontSize: 16 }]}>{value}</Text>
+      <FinalPriceConfirmModal visible={finalConfirmModalVisible} originalTotalCents={originalOrderTotalCents}
+        totals={totals} saving={saving} onClose={() => setFinalConfirmModalVisible(false)}
+        onConfirm={() => { setFinalConfirmModalVisible(false); void executeSaveOrder(); }} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  error: { color: colors.errorText, marginTop: spacing.sm },
   screen: { flex: 1, backgroundColor: colors.bg },
   stepHeader: { padding: spacing.lg, paddingBottom: spacing.sm },
   stepTitle: { fontSize: 18, fontWeight: "700", color: colors.textPrimary },
@@ -1148,55 +848,7 @@ const styles = StyleSheet.create({
   filterChipTextActive: {
     color: "#fff",
   },
-  clientName: { fontSize: 15, fontWeight: "700", color: colors.textPrimary },
-  clientSub: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
-  pickerHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  pickerName: { fontSize: 15, fontWeight: "700", color: colors.textPrimary },
-  pickerSku: { fontSize: 12, color: colors.textMuted, marginTop: 2, marginBottom: spacing.sm },
-  starBtn: { padding: 2 },
-  miniComboBadge: {
-    backgroundColor: "#ede9fe",
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: radius.pill,
-  },
-  miniComboText: {
-    fontSize: 10,
-    fontWeight: "700",
-    color: "#6d28d9",
-  },
-  presChoices: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
-  presChoice: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingHorizontal: 10, paddingVertical: 6, alignItems: "center" },
-  presChoiceActive: { backgroundColor: colors.emerald, borderColor: colors.emerald },
-  presChoiceText: { fontSize: 12, fontWeight: "600", color: colors.textPrimary },
-  presChoicePrice: { fontSize: 11, color: colors.textSecondary },
-  addRow: { flexDirection: "row", marginTop: spacing.md, alignItems: "center" },
-  comboActionRow: { marginTop: spacing.md },
-  qtyInput: { width: 56, minHeight: touchTarget.min, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, textAlign: "center", backgroundColor: colors.surface },
-  cartSummary: { marginTop: spacing.md, marginBottom: spacing.lg },
-  cartTitle: { fontWeight: "700", color: colors.textPrimary, marginBottom: spacing.sm },
-  cartLine: { flexDirection: "row", alignItems: "flex-start", marginBottom: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.surfaceAlt3, paddingBottom: spacing.xs },
-  cartLineName: { fontSize: 13, fontWeight: "600", color: colors.textPrimary },
-  cartLineSub: { fontSize: 11, color: colors.textMuted, marginTop: 1 },
-  cartSelectionsWrap: {
-    backgroundColor: colors.surfaceAlt,
-    padding: 6,
-    borderRadius: radius.sm,
-    marginTop: 4,
-  },
-  cartSelectionItem: {
-    fontSize: 11,
-    color: colors.textSecondary,
-    lineHeight: 15,
-  },
-  qtyBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: colors.surfaceAlt, alignItems: "center", justifyContent: "center", marginTop: 2 },
-  qtyText: { width: 24, textAlign: "center", fontWeight: "600", marginTop: 6 },
-  lineSubtotal: { width: 70, textAlign: "right", fontWeight: "700", color: colors.emeraldDark, fontSize: 12, marginTop: 6 },
-  totalsBlock: { borderTopWidth: 1, borderTopColor: colors.surfaceAlt3, marginTop: spacing.sm, paddingTop: spacing.sm },
-  totalRow: { flexDirection: "row", justifyContent: "space-between", marginBottom: 4 },
-  totalLabel: { fontSize: 12, color: colors.textSecondary },
-  totalValue: { fontSize: 12, color: colors.textPrimary },
-  error: { color: colors.errorText, marginTop: spacing.sm },
+  offlineHint: { color: colors.amberText, marginTop: spacing.xs, fontSize: 12 },
   headerCartBadge: {
     backgroundColor: colors.emerald,
     paddingHorizontal: 10,
@@ -1271,107 +923,5 @@ const styles = StyleSheet.create({
   dockedViewBtn: {
     minHeight: 40,
     paddingHorizontal: 16,
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.5)",
-    justifyContent: "flex-end",
-  },
-  modalCard: {
-    backgroundColor: colors.bg,
-    borderTopLeftRadius: radius.lg,
-    borderTopRightRadius: radius.lg,
-    maxHeight: "85%",
-    padding: spacing.lg,
-  },
-  modalHeaderRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    paddingBottom: spacing.sm,
-    marginBottom: spacing.md,
-  },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: "700",
-    color: colors.textPrimary,
-  },
-  modalClientSub: {
-    fontSize: 13,
-    color: colors.emeraldDark,
-    fontWeight: "600",
-    marginTop: 2,
-  },
-  modalCloseBtn: {
-    paddingVertical: 5,
-    paddingHorizontal: 10,
-    borderRadius: radius.sm,
-    backgroundColor: colors.surfaceAlt,
-  },
-  modalCloseBtnText: {
-    fontSize: 12,
-    fontWeight: "600",
-    color: colors.textSecondary,
-  },
-  modalScroll: {
-    maxHeight: 380,
-  },
-  modalFooter: {
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    paddingTop: spacing.md,
-    marginTop: spacing.sm,
-  },
-  priceDiffCard: {
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: radius.md,
-    padding: spacing.md,
-    marginBottom: spacing.sm,
-  },
-  priceDiffProdName: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: colors.textPrimary,
-    marginBottom: 2,
-  },
-  priceDiffQty: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    marginBottom: spacing.xs,
-  },
-  priceDiffRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    backgroundColor: colors.surfaceAlt,
-    padding: spacing.sm,
-    borderRadius: radius.sm,
-  },
-  priceDiffCol: {
-    flex: 1,
-  },
-  priceDiffLabel: {
-    fontSize: 11,
-    color: colors.textSecondary,
-    marginBottom: 2,
-  },
-  priceDiffOldVal: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: colors.textSecondary,
-  },
-  priceDiffNewVal: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: colors.emerald,
-  },
-  priceDiffArrow: {
-    fontSize: 14,
-    color: colors.textSecondary,
-    marginHorizontal: spacing.sm,
   },
 });

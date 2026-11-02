@@ -13,7 +13,7 @@ import { settingsRouter } from "./routes/settings";
 import { ensureClientsSchema } from "./db/pg";
 
 const app = express();
-// Solo confiar en X-Forwarded-For tras un proxy de confianza (p. ej. Render).
+// Solo confiar en X-Forwarded-For tras un proxy de confianza (Nginx en EC2).
 // Fuera de producción, usa la dirección real del socket para que el rate limit
 // de login no pueda eludirse rotando la cabecera X-Forwarded-For.
 app.set("trust proxy", process.env.NODE_ENV === "production" ? 1 : false);

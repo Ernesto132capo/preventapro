@@ -16,20 +16,33 @@ import { API_BASE_URL } from "../services/config";
 import { apiFetch } from "../services/api";
 import { useSync } from "../context/SyncContext";
 
+const PAGE_SIZE = 50;
+
 /** Registros Históricos (Fase 29) — jornadas cerradas, de solo lectura, con enlaces a reportes. */
 export function HistoryScreen() {
   const { user } = useAuth();
-  const { syncTick } = useSync();
+  const { pullRevision } = useSync();
   const isFocused = useIsFocused();
   const [workDays, setWorkDays] = useState<WorkDay[]>([]);
   const [expandedWorkDayId, setExpandedWorkDayId] = useState<string | null>(null);
   const [ordersMap, setOrdersMap] = useState<Record<string, any[]>>({});
   const [loadingOrders, setLoadingOrders] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const serverOffsetRef = useRef(0);
   const historyRequest = useRef(0);
   const ordersRequest = useRef(0);
   const expandedIdRef = useRef(expandedWorkDayId);
-  const observedSyncTick = useRef(syncTick);
+  const observedPullRevision = useRef(pullRevision);
+  const visibleDays = useRef<WorkDay[]>([]);
+  const moreBusy = useRef(false);
+  const [orderPage, setOrderPage] = useState(0);
   expandedIdRef.current = expandedWorkDayId;
+
+  function showDays(days: WorkDay[]) { visibleDays.current = days; setWorkDays(days); }
+  function matchDay(days: WorkDay[], id: string | null) {
+    return days.find(day => day.id === id || day.server_id === id);
+  }
 
   const loadOrders = useCallback(async (item: WorkDay) => {
     const requestId = ++ordersRequest.current;
@@ -37,7 +50,8 @@ export function HistoryScreen() {
     try {
       const localOrders = await listOrdersForWorkDay(item.id);
       if (requestId !== ordersRequest.current) return;
-      setOrdersMap((previous) => ({ ...previous, [item.id]: localOrders }));
+      setOrdersMap((previous) => localOrders.length > 0 || !previous[item.id]
+        ? { ...previous, [item.id]: localOrders } : previous);
       const serverId = item.server_id || await resolveServerWorkDayId(item.id);
       if (!serverId) return;
       const res = await apiFetch<any>(`/workdays/${serverId}/orders`);
@@ -55,41 +69,78 @@ export function HistoryScreen() {
     if (!user) return;
     const requestId = ++historyRequest.current;
     ++ordersRequest.current;
-    setOrdersMap({});
-    let days = await listClosedWorkDays(user.id);
-    const localDays = days;
+    const localDays = await listClosedWorkDays(user.id);
     if (requestId !== historyRequest.current) return;
-    setWorkDays(days);
+    const requestedExpanded = expandedIdRef.current;
+    const expandedLocal = matchDay(localDays, requestedExpanded) || matchDay(visibleDays.current, requestedExpanded);
+    // El detalle local se recupera sin esperar la petición del historial.
+    if (expandedLocal) void loadOrders(expandedLocal);
+    const previous = visibleDays.current;
+    const known = new Set(previous.flatMap(day => [day.id, day.server_id]));
+    showDays(previous.length ? [...localDays.filter(day => !known.has(day.id) && !known.has(day.server_id)), ...previous] : localDays);
     try {
-      const res = await apiFetch<{ workDays: any[] }>("/workdays/history");
+      const res = await apiFetch<{ workDays: any[]; hasMore?: boolean }>(`/workdays/history?limit=${PAGE_SIZE}&offset=0`);
       if (res?.workDays) {
-        days = res.workDays;
         if (requestId !== historyRequest.current) return;
-        setWorkDays(days);
+        const days = res.workDays.map(remote => {
+          const local = matchDay(localDays, remote.id);
+          return local ? { ...remote, id: local.id, server_id: remote.id } : remote;
+        });
+        showDays(days);
+        serverOffsetRef.current = 0;
+        setHasMore(Boolean(res.hasMore));
+        if (expandedIdRef.current === requestedExpanded) {
+          const expanded = matchDay(days, requestedExpanded) || (expandedLocal && matchDay(days, expandedLocal.server_id || expandedLocal.id));
+          if (expanded) {
+            expandedIdRef.current = expanded.id;
+            setExpandedWorkDayId(expanded.id);
+            if (!expandedLocal) void loadOrders(expanded);
+          } else {
+            expandedIdRef.current = null;
+            setExpandedWorkDayId(null);
+            ++ordersRequest.current;
+            setLoadingOrders(null);
+          }
+        }
       }
     } catch {
       // Fallback offline
     }
-    if (requestId !== historyRequest.current) return;
-    const localExpanded = localDays.find((day) => day.id === expandedIdRef.current || day.server_id === expandedIdRef.current);
-    const aliases = new Set([expandedIdRef.current, localExpanded?.id, localExpanded?.server_id].filter(Boolean));
-    const expanded = days.find((day) => aliases.has(day.id) || (!!day.server_id && aliases.has(day.server_id)));
-    if (expanded) {
-      setExpandedWorkDayId(expanded.id);
-      await loadOrders(expanded);
-    } else {
-      setExpandedWorkDayId(null);
-      setLoadingOrders(null);
-    }
   }, [user, loadOrders]);
+
+  const loadMore = useCallback(async () => {
+    if (!hasMore || moreBusy.current) return;
+    moreBusy.current = true;
+    const requestId = historyRequest.current;
+    setLoadingMore(true);
+    const offset = serverOffsetRef.current + PAGE_SIZE;
+    try {
+      const res = await apiFetch<{ workDays: any[]; hasMore?: boolean }>(`/workdays/history?limit=${PAGE_SIZE}&offset=${offset}`);
+      if (requestId !== historyRequest.current) return;
+      if (res?.workDays) {
+        serverOffsetRef.current = offset;
+        const seen = new Set(visibleDays.current.flatMap(day => [day.id, day.server_id]));
+        showDays([...visibleDays.current, ...res.workDays.filter((day: any) => !seen.has(day.id))]);
+        setHasMore(Boolean(res.hasMore));
+      }
+    } catch {
+      // Sin conexión no se puede paginar; el usuario puede reintentar con el botón.
+    } finally {
+      moreBusy.current = false;
+      setLoadingMore(false);
+    }
+  }, [hasMore, loadingMore]);
 
   const toggleExpand = async (item: WorkDay) => {
     if (expandedWorkDayId === item.id) {
+      expandedIdRef.current = null;
       setExpandedWorkDayId(null);
       ++ordersRequest.current;
       setLoadingOrders(null);
       return;
     }
+    expandedIdRef.current = item.id;
+    setOrderPage(0);
     setExpandedWorkDayId(item.id);
     await loadOrders(item);
   };
@@ -102,10 +153,10 @@ export function HistoryScreen() {
   );
 
   useEffect(() => {
-    const changed = observedSyncTick.current !== syncTick;
-    observedSyncTick.current = syncTick;
-    if (isFocused && changed && syncTick > 0) void load().catch(() => {});
-  }, [isFocused, syncTick, load]);
+    const changed = observedPullRevision.current !== pullRevision;
+    observedPullRevision.current = pullRevision;
+    if (isFocused && changed && pullRevision > 0) void load().catch(() => {});
+  }, [isFocused, pullRevision, load]);
 
   async function openReport(workDayServerId: string, fileName: string) {
     try {
@@ -123,6 +174,7 @@ export function HistoryScreen() {
       if (!serverId) throw new Error("Sincroniza esta jornada antes de eliminarla del historial.");
       await apiFetch(`/workdays/${serverId}`, { method: "DELETE" });
       await deleteClosedWorkDayLocal(item.id);
+      showDays(visibleDays.current.filter(day => day.id !== item.id && day.server_id !== serverId && day.id !== serverId));
       await load();
     } catch (err: any) {
       Alert.alert("No se pudo eliminar", err.message || "Intenta nuevamente.");
@@ -141,6 +193,18 @@ export function HistoryScreen() {
         keyExtractor={(w) => w.id}
         contentContainerStyle={{ padding: spacing.lg }}
         ListEmptyComponent={<EmptyState message="Aún no tienes jornadas cerradas." />}
+        ListFooterComponent={
+          hasMore ? (
+            <Button
+              label={loadingMore ? "Cargando..." : "Cargar más jornadas"}
+              variant="outline"
+              onPress={loadMore}
+              loading={loadingMore}
+              disabled={loadingMore}
+              style={{ marginTop: spacing.sm, minHeight: 44 }}
+            />
+          ) : null
+        }
         renderItem={({ item }) => (
           <Card style={{ marginBottom: spacing.sm }}>
             <View style={styles.rowBetween}>
@@ -154,6 +218,8 @@ export function HistoryScreen() {
               const serverId = item.server_id || item.id;
               if (!serverId) return null;
               const isExpanded = expandedWorkDayId === item.id;
+              const dayOrders = ordersMap[item.id] || [];
+              const page = Math.min(orderPage, Math.max(0, Math.ceil(dayOrders.length / 10) - 1));
               return (
                 <View style={{ marginTop: spacing.md }}>
                   <Text style={styles.sectionLabel}>Archivos y reportes descargables:</Text>
@@ -192,7 +258,7 @@ export function HistoryScreen() {
                       ) : (ordersMap[item.id] || []).length === 0 ? (
                         <Text style={styles.loadingOrdersText}>No hay preventas registradas en esta jornada.</Text>
                       ) : (
-                        (ordersMap[item.id] || []).map((ord: any, idx: number) => {
+                        <>{dayOrders.slice(page * 10, (page + 1) * 10).map((ord: any, idx: number) => {
                           const clientDisplay = formatClientDisplayName({
                             business_name: ord.business_name || ord.businessName || ord.client_name,
                             contact_name: ord.contact_name || ord.contactName,
@@ -213,7 +279,14 @@ export function HistoryScreen() {
                               </Text>
                             </View>
                           );
-                        })
+                        })}
+                        {dayOrders.length > 10 && <View>
+                          <Text style={styles.orderSubText}>{page * 10 + 1}–{Math.min((page + 1) * 10, dayOrders.length)} de {dayOrders.length} preventas</Text>
+                          <View style={styles.reportsRow}>
+                            <Button label="Anterior" variant="outline" disabled={page === 0} onPress={() => setOrderPage(page - 1)} />
+                            <Button label="Siguiente" variant="outline" disabled={(page + 1) * 10 >= dayOrders.length} onPress={() => setOrderPage(page + 1)} />
+                          </View>
+                        </View>}</>
                       )}
                     </View>
                   )}

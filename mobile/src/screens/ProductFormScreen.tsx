@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, TextInput, StyleSheet, ScrollView, Pressable, Alert, Modal, FlatList } from "react-native";
+import { View, Text, TextInput, StyleSheet, ScrollView, Pressable, Alert, Modal, FlatList, ActivityIndicator } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Button } from "../components/Button";
@@ -18,6 +18,9 @@ import {
 import { getCategory } from "../db/repositories/categories";
 import { Category, ProductType } from "../domain/types";
 import { centsToBs } from "../domain/pricing";
+import { parseBsToCents } from "../utils/money";
+import { LoadErrorBanner } from "../components/LoadErrorBanner";
+import { useDebounce } from "../utils/useDebounce";
 
 interface FormPresentation {
   id?: string;
@@ -31,12 +34,6 @@ const DEFAULT_PRESENTATIONS: FormPresentation[] = [
   { name: "Unidad", unitEquivalence: "1", priceText: "", costText: "" },
 ];
 
-function parseBsToCents(text: string): number {
-  if (!text || !text.trim()) return 0;
-  const val = parseFloat(text.trim());
-  return isNaN(val) || val < 0 ? 0 : Math.round(val * 100);
-}
-
 interface FormComboOption {
   presentationId: string;
   productName: string;
@@ -48,7 +45,7 @@ interface FormComboOption {
 export function ProductFormScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { pushSync } = useSync();
+  const { pushSync, catalogRevision } = useSync();
   const productId = route.params?.productId as string | undefined;
   const isEditing = !!productId;
 
@@ -68,6 +65,15 @@ export function ProductFormScreen() {
   const [showOptionPicker, setShowOptionPicker] = useState(false);
   const [availableProducts, setAvailableProducts] = useState<ProductWithPresentations[]>([]);
   const [optionSearch, setOptionSearch] = useState("");
+  const debouncedOptionSearch = useDebounce(optionSearch, 250);
+  const [loadingOptions, setLoadingOptions] = useState(false);
+  const [optionsError, setOptionsError] = useState<string | null>(null);
+  const [optionsHaveMore, setOptionsHaveMore] = useState(false);
+  const optionOffset = useRef(0);
+  const optionRequest = useRef(0);
+  const optionsBusy = useRef(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
 
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -76,17 +82,21 @@ export function ProductFormScreen() {
 
   useEffect(() => {
     navigation.setOptions({ title: isEditing ? "Editar Producto" : "Registrar Producto" });
+    let current = true;
+    setLoadError(null);
+    setLoading(isEditing);
     (async () => {
-      const allProds = await listProducts();
-      setAvailableProducts(allProds.filter((p) => p.id !== productId && p.server_id !== productId && p.product_type !== "combo"));
-
+      try {
       if (productId) {
         const product = await getProduct(productId);
+        if (!current) return;
+        if (!product) throw new Error("El producto ya no está disponible en este teléfono.");
         if (product) {
           setName(product.name);
           setProductType(product.product_type || "standard");
           if (product.category_id) {
             const cat = await getCategory(product.category_id);
+            if (!current) return;
             setCategoryName(cat?.name ?? null);
             setCategoryId(cat ? (cat.server_id || cat.id) : product.category_id);
           } else {
@@ -123,9 +133,38 @@ export function ProductFormScreen() {
           }
         }
       }
-      setLoading(false);
+      } catch (error: any) {
+        if (current) setLoadError(error?.message || "No se pudo cargar el producto.");
+      } finally { if (current) setLoading(false); }
     })();
-  }, [productId]);
+    return () => { current = false; };
+  }, [productId, loadAttempt]);
+
+  async function loadOptions(replace = true) {
+    if (!replace && optionsBusy.current) return;
+    const request = ++optionRequest.current;
+    optionsBusy.current = true;
+    setLoadingOptions(true);
+    setOptionsError(null);
+    if (replace) { optionOffset.current = 0; setAvailableProducts([]); setOptionsHaveMore(false); }
+    try {
+      const rows = await listProducts({ search: debouncedOptionSearch, productType: "standard", limit: 50, offset: optionOffset.current });
+      if (request !== optionRequest.current) return;
+      optionOffset.current += rows.length;
+      const candidates = rows.filter(p => p.id !== productId && p.server_id !== productId);
+      setAvailableProducts(previous => replace ? candidates : [...previous, ...candidates]);
+      setOptionsHaveMore(rows.length === 50);
+    } catch (error: any) {
+      if (request === optionRequest.current) setOptionsError(error?.message || "No se pudieron cargar las opciones.");
+    } finally {
+      if (request === optionRequest.current) { optionsBusy.current = false; setLoadingOptions(false); }
+    }
+  }
+
+  useEffect(() => {
+    if (showOptionPicker) void loadOptions();
+    return () => { ++optionRequest.current; optionsBusy.current = false; };
+  }, [showOptionPicker, debouncedOptionSearch, productId, catalogRevision]);
 
   function updatePresentation(idx: number, field: keyof FormPresentation, value: string) {
     setPresentations((prev) =>
@@ -243,14 +282,14 @@ export function ProductFormScreen() {
       const firstPres = presentations[0] || { name: "Pack", unitEquivalence: "1", priceText: "0", costText: "0" };
       const priceCents = parseBsToCents(firstPres.priceText);
       if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
-        setError("El precio de venta del combo no puede ser negativo.");
-        Alert.alert("Precio inválido", "El precio de venta del combo debe ser un monto válido mayor o igual a 0.");
+        setError("El precio de venta del combo es inválido o negativo.");
+        Alert.alert("Precio inválido", "Ingresa el precio del combo con hasta 2 decimales (punto o coma), mayor o igual a 0.");
         return;
       }
       const costCents = firstPres.costText && firstPres.costText.trim() !== "" ? parseBsToCents(firstPres.costText) : 0;
       if (!Number.isSafeInteger(costCents) || costCents < 0) {
-        setError("El costo del combo no puede ser negativo.");
-        Alert.alert("Costo inválido", "El costo del combo debe ser un monto válido mayor o igual a 0.");
+        setError("El costo del combo es inválido o negativo.");
+        Alert.alert("Costo inválido", "Ingresa el costo del combo con hasta 2 decimales (punto o coma), mayor o igual a 0.");
         return;
       }
 
@@ -306,15 +345,15 @@ export function ProductFormScreen() {
 
         const priceCents = parseBsToCents(p.priceText);
         if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
-          setError(`El precio de "${pName}" no puede ser negativo.`);
-          Alert.alert("Precio inválido", `El precio de venta para "${pName}" debe ser un monto válido mayor o igual a 0.`);
+          setError(`El precio de "${pName}" es inválido o negativo.`);
+          Alert.alert("Precio inválido", `Ingresa el precio de "${pName}" con hasta 2 decimales (punto o coma), mayor o igual a 0.`);
           return;
         }
 
         const costCents = p.costText && p.costText.trim() !== "" ? parseBsToCents(p.costText) : undefined;
         if (costCents !== undefined && (!Number.isSafeInteger(costCents) || costCents < 0)) {
-          setError(`El costo de "${pName}" no puede ser negativo.`);
-          Alert.alert("Costo inválido", `El costo para "${pName}" debe ser mayor o igual a 0.`);
+          setError(`El costo de "${pName}" es inválido o negativo.`);
+          Alert.alert("Costo inválido", `Ingresa el costo de "${pName}" con hasta 2 decimales (punto o coma), mayor o igual a 0.`);
           return;
         }
 
@@ -387,7 +426,8 @@ export function ProductFormScreen() {
     ]);
   }
 
-  if (loading) return null;
+  if (loading) return <View style={[styles.screen, { padding: spacing.lg }]}><ActivityIndicator color={colors.emerald} /><Text style={styles.hint}>Cargando producto…</Text></View>;
+  if (loadError) return <View style={[styles.screen, { padding: spacing.lg }]}><LoadErrorBanner message={loadError} onRetry={() => setLoadAttempt(attempt => attempt + 1)} /></View>;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
@@ -621,11 +661,12 @@ export function ProductFormScreen() {
               maxLength={60}
             />
             <FlatList
-              data={availableProducts.filter((p) =>
-                p.name.toLowerCase().includes(optionSearch.toLowerCase())
-              )}
+              data={availableProducts}
               keyExtractor={(p) => p.id}
               style={{ maxHeight: 350 }}
+              ListHeaderComponent={optionsError ? <LoadErrorBanner message={optionsError} onRetry={() => { void loadOptions(); }} /> : null}
+              ListEmptyComponent={loadingOptions ? <ActivityIndicator color={colors.emerald} /> : <Text style={styles.hint}>No hay opciones para esta búsqueda.</Text>}
+              ListFooterComponent={optionsHaveMore ? <Button label="Cargar más opciones" variant="outline" loading={loadingOptions} disabled={loadingOptions} onPress={() => { void loadOptions(false); }} /> : null}
               renderItem={({ item: prod }) => (
                 <View style={styles.pickerProdGroup}>
                   <Text style={styles.pickerProdName}>{prod.name}</Text>

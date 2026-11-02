@@ -5,6 +5,7 @@ import { colors, spacing, radius, touchTarget } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { EmptyState } from "../components/EmptyState";
+import { LoadErrorBanner } from "../components/LoadErrorBanner";
 import { Button } from "../components/Button";
 import { listActiveClients, deleteClientLocal } from "../db/repositories/clients";
 import { Client } from "../domain/types";
@@ -16,13 +17,20 @@ const clientKeyExtractor = (c: Client) => c.id;
 
 export function ClientsScreen() {
   const navigation = useNavigation<any>();
-  const { syncTick, pushSync } = useSync();
+  const { catalogRevision, pushSync } = useSync();
   const [clients, setClients] = useState<Client[]>([]);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setClients(await listActiveClients(debouncedSearch));
+    try {
+      setClients(await listActiveClients(debouncedSearch));
+      setLoadError(null);
+    } catch {
+      // Conserva los datos visibles previos y permite reintentar.
+      setLoadError("No se pudieron cargar los clientes. Revisa la conexión e inténtalo de nuevo.");
+    }
   }, [debouncedSearch]);
 
   useFocusEffect(
@@ -32,8 +40,8 @@ export function ClientsScreen() {
   );
 
   useEffect(() => {
-    if (syncTick > 0) load();
-  }, [syncTick]);
+    if (catalogRevision > 0) load();
+  }, [catalogRevision]);
 
   const confirmDelete = useCallback((c: Client) => {
     const displayName = formatClientDisplayName(c).primary;
@@ -84,6 +92,8 @@ export function ClientsScreen() {
         autoCorrect={false}
         clearButtonMode="while-editing"
       />
+
+      {loadError && <LoadErrorBanner message={loadError} onRetry={() => load()} />}
 
       <FlatList
         data={clients}

@@ -2,7 +2,7 @@ import "dotenv/config";
 import { Pool, types } from "pg";
 
 // ─── IMPORTANTE: columnas de fecha son TIMESTAMPTZ, no TEXT ────────────────
-// El esquema real de Neon guarda created_at/updated_at/closed_at como
+// El esquema de PostgreSQL guarda created_at/updated_at/closed_at como
 // `timestamp with time zone`. Por defecto, node-postgres parsea esas columnas
 // como objetos `Date` de JS, lo cual rompería el contrato JSON con el móvil
 // (que espera un string ISO 8601 como el contrato que usaba la app con
@@ -29,14 +29,13 @@ function safeDateIso(value: string | null, isUtcSuffix = false): string | null {
 types.setTypeParser(TIMESTAMP_OID, (value: string | null) => safeDateIso(value, true));
 types.setTypeParser(TIMESTAMPTZ_OID, (value: string | null) => safeDateIso(value, false));
 
-// Connection string pooleado de Neon. Ejemplo:
-// postgres://user:password@ep-xxxx-pooler.region.aws.neon.tech/neondb?sslmode=require
+// PostgreSQL local o a través de un túnel SSH. La URL determina el modo TLS.
 if (!process.env.DATABASE_URL) {
   if (process.env.NODE_ENV === "test" || Boolean(process.env.VITEST)) {
     process.env.DATABASE_URL = "postgres://test:test@localhost:5432/test_db";
   } else {
     throw new Error(
-      "Falta la variable de entorno DATABASE_URL (connection string de Neon)."
+      "Falta la variable de entorno DATABASE_URL (conexión a PostgreSQL)."
     );
   }
 }

@@ -10,7 +10,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://preventapro-backend.onrender.com/api"
+        "EXPO_PUBLIC_API_URL": "https://18.227.163.204/api"
       }
     },
     "production": {
@@ -18,7 +18,7 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://preventapro-backend.onrender.com/api"
+        "EXPO_PUBLIC_API_URL": "https://18.227.163.204/api"
       }
     }
   }

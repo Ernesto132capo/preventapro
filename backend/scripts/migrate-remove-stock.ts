@@ -13,7 +13,7 @@ async function main() {
 
 main()
   .catch((error) => {
-    console.error("No se pudo retirar la columna de inventario de Neon:", error.message || error);
+    console.error("No se pudo retirar la columna de inventario de PostgreSQL:", error.message || error);
     process.exitCode = 1;
   })
   .finally(() => pool.end());

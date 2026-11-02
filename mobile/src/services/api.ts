@@ -27,9 +27,13 @@ function notifyUnauthorized(rejectedToken: string | null): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  body?: any;
+  constructor(message: string, status: number, body?: any) {
     super(message);
     this.status = status;
+    this.body = body;
+    this.code = body?.code;
   }
 }
 
@@ -118,7 +122,7 @@ export async function apiFetch<T = any>(path: string, opts: RequestOptions = {})
         // Conserva el mensaje genérico si el formato de validación cambia.
       }
     }
-    throw new ApiError(message, res.status);
+    throw new ApiError(message, res.status, data);
   }
   return data as T;
 }

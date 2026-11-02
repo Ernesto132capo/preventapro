@@ -1,5 +1,6 @@
 import { getDb, getMeta, setMeta, withTx } from "../db/client";
 import { apiFetch, ApiError } from "./api";
+import { beginPerformanceMeasure, measurePerformance } from "./performance";
 import {
   enqueue,
   enqueueInTx,
@@ -27,18 +28,30 @@ import {
 } from "../db/repositories/products";
 import { markOrderFailed, upsertOrderFromServerInTx } from "../db/repositories/orders";
 import { resolveServerWorkDayId, upsertServerWorkDay, getTodayWorkDay } from "../db/repositories/workdays";
+import { recordEntityDeletedConflict, markConflictResolvedByOutbox } from "../db/conflicts";
+import { catalogRowChanged } from "../db/catalogChanges";
 
 export interface SyncResult {
   ok: boolean;
   pulled: { clients: number; products: number };
   pushed: { done: number; deferred: number; failed: number };
   error?: string;
+  didPull?: boolean;
+  catalogChanged?: boolean;
+  pullError?: string;
+  pushError?: string;
 }
+
+interface CatalogPullResult { clients: number; products: number; catalogChanged: boolean }
 
 export const SYNC_PROTOCOL_VERSION = "orders-catalog-tombstones-v2";
 
 /** PULL: trae catálogo/clientes actualizados desde el servidor (Fase 31). */
-export async function pullCatalog(userId: string, force = false): Promise<{ clients: number; products: number }> {
+export async function pullCatalog(userId: string, force = false): Promise<CatalogPullResult> {
+  return measurePerformance("sync.pull", () => performCatalogPull(userId, force));
+}
+
+async function performCatalogPull(userId: string, force = false): Promise<CatalogPullResult> {
   const db = await getDb();
   const prodCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM products WHERE active = 1`))?.n ?? 0;
   const clientCount = (await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) as n FROM clients WHERE active = 1`))?.n ?? 0;
@@ -71,6 +84,7 @@ function chunkArray(items: any[], size = 200): any[][] {
 }
 
   const data = await apiFetch<any>(`/sync/pull?since=${encodeURIComponent(since)}${force ? "&force=1" : ""}`);
+  let catalogChanged = false;
 
   // 1. Actualizar la jornada local de hoy y las jornadas compartidas FUERA de withTx (antes del catálogo)
   // para que upsertOrderFromServerInTx encuentre siempre su jornada local sin deadlocks de candado.
@@ -93,7 +107,7 @@ function chunkArray(items: any[], size = 200): any[][] {
     for (const chunk of chunkArray(data.categories, 200)) {
       await withTx(async () => {
         for (const cat of chunk) {
-          await upsertCategoryFromServer(cat);
+          catalogChanged = (await upsertCategoryFromServer(cat)) || catalogChanged;
         }
       });
     }
@@ -103,7 +117,7 @@ function chunkArray(items: any[], size = 200): any[][] {
     for (const chunk of chunkArray(data.clients, 200)) {
       await withTx(async () => {
         for (const c of chunk) {
-          await upsertClientFromServer(c);
+          catalogChanged = (await upsertClientFromServer(c)) || catalogChanged;
         }
       });
     }
@@ -119,7 +133,7 @@ function chunkArray(items: any[], size = 200): any[][] {
       await withTx(async () => {
         for (const prod of chunk) {
           const presentations = presByProduct[prod.id] || [];
-          await upsertProductFromServer({ ...prod, presentations });
+          catalogChanged = (await upsertProductFromServer({ ...prod, presentations })) || catalogChanged;
         }
       });
     }
@@ -141,15 +155,19 @@ function chunkArray(items: any[], size = 200): any[][] {
           const existingDef = canonicalDefId ? { id: canonicalDefId } : await txDb.getFirstAsync<{ id: string }>(
             `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR product_id = ? OR id = ?`, [cd.id, targetProdId, cd.product_id, cd.id]);
           const targetDefId = existingDef ? existingDef.id : cd.id;
-          await txDb.runAsync(
+          const definitionResult = await txDb.runAsync(
             `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
              VALUES (?, ?, ?, ?, ?, ?, 'synced')
              ON CONFLICT(id) DO UPDATE SET
                server_id = excluded.server_id, product_id = excluded.product_id,
                selection_min = excluded.selection_min, selection_max = excluded.selection_max,
-               active = excluded.active, sync_status = 'synced'`,
+               active = excluded.active, sync_status = 'synced'
+             WHERE combo_definitions.server_id IS NOT excluded.server_id OR combo_definitions.product_id IS NOT excluded.product_id
+                OR combo_definitions.selection_min IS NOT excluded.selection_min OR combo_definitions.selection_max IS NOT excluded.selection_max
+                OR combo_definitions.active IS NOT excluded.active OR combo_definitions.sync_status <> 'synced'`,
             [targetDefId, cd.id, targetProdId, cd.selection_min, cd.selection_max, cd.active ?? 1]
           );
+          catalogChanged = definitionResult.changes > 0 || catalogChanged;
         }
       });
     }
@@ -158,12 +176,20 @@ function chunkArray(items: any[], size = 200): any[][] {
   if (data.comboOptions && Array.isArray(data.comboOptions)) {
     if (data.comboOptionsComplete === true) {
       await withTx(async (txDb) => {
-        await txDb.runAsync(
-          `UPDATE combo_options SET active = 0 WHERE combo_id IN (
-             SELECT cd.id FROM combo_definitions cd JOIN products p ON (p.id = cd.product_id OR p.server_id = cd.product_id)
-             WHERE cd.sync_status = 'synced' AND p.sync_status = 'synced'
-           )`
+        const incoming = new Set<string>(data.comboOptions.map((option: any) => option.id));
+        const currentOptions = await txDb.getAllAsync<{ id: string; server_id: string | null }>(
+          `SELECT co.id, co.server_id FROM combo_options co
+           JOIN combo_definitions cd ON co.combo_id = cd.id
+           JOIN products p ON p.id = cd.product_id OR p.server_id = cd.product_id
+           WHERE co.active = 1 AND cd.sync_status = 'synced' AND p.sync_status = 'synced'
+             AND NOT EXISTS (SELECT 1 FROM outbox b WHERE b.entity_type = 'product' AND b.local_entity_id = p.id AND b.status <> 'done')`
         );
+        for (const option of currentOptions) {
+          if (!incoming.has(option.server_id || option.id)) {
+            await txDb.runAsync(`UPDATE combo_options SET active = 0 WHERE id = ?`, [option.id]);
+            catalogChanged = true;
+          }
+        }
       });
     }
     for (const chunk of chunkArray(data.comboOptions, 200)) {
@@ -182,11 +208,17 @@ function chunkArray(items: any[], size = 200): any[][] {
           );
           if (localDef && (localDef.sync_status !== "synced" || (localDef.product_sync_status && localDef.product_sync_status !== "synced"))) continue;
           const targetComboId = localDef ? localDef.id : co.combo_id;
-          const existingOpt = await txDb.getFirstAsync<{ id: string }>(
-            `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+          const existingOpt = await txDb.getFirstAsync<any>(
+            `SELECT * FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
             [co.id, co.id, targetComboId, targetPresId]
           );
           const targetOptId = existingOpt ? existingOpt.id : co.id;
+          const comparableOption = existingOpt && { ...existingOpt, presentation_id: existingOpt.presentation_id === co.presentation_id ? targetPresId : existingOpt.presentation_id };
+          catalogChanged = catalogRowChanged(comparableOption, {
+            server_id: co.id, combo_id: targetComboId, presentation_id: targetPresId,
+            max_quantity: co.max_quantity == null ? null : Number(co.max_quantity),
+            sort_order: Number(co.sort_order ?? 0), active: Number(co.active ?? 1),
+          }) || catalogChanged;
           await txDb.runAsync(
             `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
              VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
@@ -247,7 +279,7 @@ function chunkArray(items: any[], size = 200): any[][] {
   if (needsProtocolUpgrade) {
     await setMeta("protocol_version", SYNC_PROTOCOL_VERSION);
   }
-  return { clients: data.clients ? data.clients.length : 0, products: data.products ? data.products.length : 0 };
+  return { clients: data.clients ? data.clients.length : 0, products: data.products ? data.products.length : 0, catalogChanged };
 }
 
 /**
@@ -269,8 +301,10 @@ async function reconcileResetServerMappings() {
   );
   for (const client of localClients) {
     if (!clientIds.has(client.server_id)) {
-      await db.runAsync(`UPDATE clients SET server_id = NULL, sync_status = 'pending' WHERE id = ?`, [client.id]);
-      await enqueue("client", client.id, 1);
+      await withTx(async (txDb) => {
+        await txDb.runAsync(`UPDATE clients SET server_id = NULL, sync_status = 'pending' WHERE id = ?`, [client.id]);
+        await enqueueInTx(txDb, "client", client.id, 1);
+      });
     }
   }
 
@@ -279,11 +313,11 @@ async function reconcileResetServerMappings() {
   );
   for (const product of localProducts) {
     if (!productIds.has(product.server_id)) {
-      await withTx(async () => {
-        await db.runAsync(`UPDATE products SET server_id = NULL, sync_status = 'pending' WHERE id = ?`, [product.id]);
-        await db.runAsync(`UPDATE product_presentations SET server_id = NULL WHERE product_id = ?`, [product.id]);
+      await withTx(async (txDb) => {
+        await txDb.runAsync(`UPDATE products SET server_id = NULL, sync_status = 'pending' WHERE id = ?`, [product.id]);
+        await txDb.runAsync(`UPDATE product_presentations SET server_id = NULL WHERE product_id = ?`, [product.id]);
+        await enqueueInTx(txDb, "product", product.id, 1);
       });
-      await enqueue("product", product.id, 1);
     }
   }
 
@@ -299,20 +333,6 @@ async function reconcileResetServerMappings() {
     );
     if (!queued) await enqueue("order", order.id, 2);
   }
-}
-
-/** Asegura que la jornada local de hoy tenga un server_id y estado resuelto antes de subir preventas. */
-async function resolveTodayWorkDay(userId: string) {
-  const local = await getTodayWorkDay(userId);
-  const res = await apiFetch<any>(`/workdays/current`);
-  if (!res?.workDay) return;
-  await upsertServerWorkDay(local.id, res.workDay);
-  const db = await getDb();
-  const allTodayDays = await db.getAllAsync<{ id: string }>(
-    `SELECT id FROM work_days WHERE work_date = ?`,
-    [local.work_date]
-  );
-  for (const day of allTodayDays) await upsertServerWorkDay(day.id, res.workDay);
 }
 
 /** Captura eventos y datos juntos: un ACK no confirma una edicion posterior al envio. */
@@ -332,7 +352,7 @@ async function pushCategory(row: OutboxRow) {
       if (!(err instanceof ApiError) || err.status !== 404) throw err;
     });
   } else {
-    const body = { name: category.name, categoryLocalId: category.id };
+    const body = { name: category.name, categoryLocalId: category.id, ...(row.operation === "restore" ? { restore: true } : {}) };
     const res = await apiFetch<any>(serverId ? `/catalog/categories/${serverId}` : `/catalog/categories`, { method: serverId ? "PUT" : "POST", body });
     serverId = res.category.id;
     if (!category.server_id && res.deduped) await apiFetch<any>(`/catalog/categories/${serverId}`, { method: "PUT", body });
@@ -341,6 +361,7 @@ async function pushCategory(row: OutboxRow) {
     await completeOutboxSnapshot(db, row, eventIds, serverId);
     if (serverId) await remapCategoryReferences(category.id, serverId);
   });
+  if (row.operation === "restore") await markConflictResolvedByOutbox(row.id);
 }
 
 async function pushClient(row: OutboxRow) {
@@ -364,12 +385,14 @@ async function pushClient(row: OutboxRow) {
       contactName: effectiveContactName, contact_name: effectiveContactName, ownerName: effectiveContactName, owner_name: effectiveContactName,
       phone: client.phone ?? null, address: client.address ?? null, lat: client.lat ?? null, lng: client.lng ?? null,
       neighborhoodId: client.neighborhood_id ?? null, neighborhoodName: client.neighborhood_name ?? null,
+      ...(row.operation === "restore" ? { restore: true } : {}),
     };
     const res = await apiFetch<any>(serverId ? `/clients/${serverId}` : `/clients`, { method: serverId ? "PUT" : "POST", body });
     serverId = res.client.id;
     if (!client.server_id && (res.deduped || row.operation === "update")) await apiFetch<any>(`/clients/${serverId}`, { method: "PUT", body });
   }
   await withTx(db => completeOutboxSnapshot(db, row, eventIds, serverId));
+  if (row.operation === "restore") await markConflictResolvedByOutbox(row.id);
 }
 
 async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
@@ -450,6 +473,7 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
       costCents: p.cost_cents,
     })),
     comboDefinition: comboDefinitionBody,
+    ...(row.operation === "restore" ? { restore: true } : {}),
   };
 
   let serverProduct: any;
@@ -494,6 +518,7 @@ async function pushProduct(row: OutboxRow): Promise<PushOutcome> {
   await completeOutboxSnapshot(db, row, eventIds, serverProduct.id);
   if (comboDef) await db.runAsync(`UPDATE combo_definitions SET sync_status = (SELECT sync_status FROM products WHERE id = ?) WHERE id = ?`, [product.id, comboDef.id]);
   });
+  if (row.operation === "restore") await markConflictResolvedByOutbox(row.id);
   return "done";
 }
 
@@ -532,6 +557,16 @@ async function markPermanentOutboxFailure(row: OutboxRow, message: string): Prom
 
 async function recordPushError(row: OutboxRow, err: unknown): Promise<PushOutcome> {
   const message = errorMessage(err);
+  if (err instanceof ApiError && (err.code === "ENTITY_DELETED" || err.body?.code === "ENTITY_DELETED") && row.entity_type !== "order") {
+    await recordEntityDeletedConflict({
+      entityType: row.entity_type as "client" | "product" | "category",
+      localEntityId: row.local_entity_id,
+      serverId: err.body?.serverId ?? null,
+      outboxId: row.id,
+      serverUpdatedAt: err.body?.updatedAt ?? null,
+    });
+    return "failed";
+  }
   if (!(err instanceof ApiError) || isRetryablePushError(err)) {
     await deferForRetry(row.id, message);
     return "deferred";
@@ -771,6 +806,10 @@ async function pushOrder(row: OutboxRow, userId: string): Promise<PushOutcome> {
 
 /** PUSH: sincroniza primero las entidades padre y después las preventas que dependen de ellas. */
 async function pushOutbox(userId: string): Promise<{ done: number; deferred: number; failed: number }> {
+  return measurePerformance("sync.outbox", () => performOutboxPush(userId), result => result.failed === 0);
+}
+
+async function performOutboxPush(userId: string): Promise<{ done: number; deferred: number; failed: number }> {
   // Reparar bases de versiones anteriores que confirmaban el pedido antes de
   // encolarlo. Un error permanente existente también cuenta como operación.
   await withTx(async (txDb) => {
@@ -851,12 +890,8 @@ const MIN_PULL_INTERVAL_MS = 60_000; // el timer ya es de 60 s; evita pulls dupl
  */
 async function performPushOnlySync(userId: string): Promise<SyncResult> {
   try {
-    try {
-      await resolveTodayWorkDay(userId);
-    } catch (e) {
-      // Network failure resolving workday should not abort pushing clients/products/categories
-      console.warn('[performPushOnlySync] Could not resolve workday (will retry later):', e);
-    }
+    // Cada preventa resuelve su jornada cuando hace falta. Las otras entidades
+    // y una cola vacía no dependen de una consulta de jornada al servidor.
     const pushed = await pushOutbox(userId);
     return { ok: true, pulled: { clients: 0, products: 0 }, pushed };
   } catch (err: any) {
@@ -895,7 +930,13 @@ function runSerializedSync(userId: string, mode: SyncMode, task: () => Promise<S
   );
   if (existing) return existing.promise;
 
-  const promise = syncQueue.then(task, task);
+  const finishWaiting = beginPerformanceMeasure("sync.queue_wait");
+  const timedTask = () => {
+    finishWaiting();
+    return measurePerformance(mode === "full" ? "sync.full" : "sync.push", task,
+      result => result.ok && result.pushed.failed === 0);
+  };
+  const promise = syncQueue.then(timedTask, timedTask);
   const flight: SyncFlight = { userId, mode, promise };
   syncFlights.push(flight);
   syncQueue = promise.then(() => undefined, () => undefined);
@@ -955,44 +996,44 @@ async function rescueLocalConflict(userId: string) {
  */
 async function performRunSync(
   userId: string,
-  options: { forcePull?: boolean } = {},
+  options: { forcePull?: boolean; refresh?: boolean } = {},
   skipOutboxPush = false
 ): Promise<SyncResult> {
+  let pulled = { clients: 0, products: 0 };
+  let pushed = { done: 0, deferred: 0, failed: 0 };
+  let didPull = false;
+  let catalogChanged = false;
+  let pullError: string | undefined;
+  let pushError: string | undefined;
+  let authenticationBlocked = false;
   try {
     const now = Date.now();
     // El refresh manual siempre hace pull; sólo los triggers automáticos
     // respetan el cooldown para no duplicar lecturas.
-    const skipPull = !options.forcePull && now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
+    const skipPull = !options.forcePull && !options.refresh && now - lastFullPullAt < MIN_PULL_INTERVAL_MS;
 
     if (options.forcePull) await rescueLocalConflict(userId);
-    // También corre después del rescate forzado: las preventas no salen sin
-    // haber intentado resolver primero su jornada padre.
-    try {
-      await resolveTodayWorkDay(userId);
-    } catch (e) {
-      console.warn('[performRunSync] Could not resolve workday:', e);
-    }
-
-    let pulled = { clients: 0, products: 0 };
     if (!skipPull) {
-      pulled = await pullCatalog(userId, options.forcePull);
+      const result = await pullCatalog(userId, options.forcePull);
+      pulled = { clients: result.clients, products: result.products };
+      catalogChanged = result.catalogChanged;
+      didPull = true;
       lastFullPullAt = Date.now();
     }
-
-    // Si un push-only ya corrió para este usuario en esta ventana concurrente,
-    // la llamada completa hace el pull pendiente sin reenviar sus filas.
-    const pushed = skipOutboxPush
-      ? { done: 0, deferred: 0, failed: 0 }
-      : await pushOutbox(userId);
-    return { ok: true, pulled, pushed };
   } catch (err: any) {
-    console.warn("Error detallado en runSync:", err);
-    const message = err instanceof ApiError ? err.message : err?.message || "No se pudo sincronizar.";
-    return { ok: false, pulled: { clients: 0, products: 0 }, pushed: { done: 0, deferred: 0, failed: 0 }, error: message };
+    pullError = err?.message || "No se pudieron recibir los cambios.";
+    authenticationBlocked = err instanceof ApiError && [401, 403, 429].includes(err.status);
   }
+  if (!skipOutboxPush && !authenticationBlocked) {
+    try { pushed = await pushOutbox(userId); }
+    catch (err: any) { pushError = err?.message || "No se pudieron enviar los cambios."; }
+  }
+  const error = [pullError, pushError].filter(Boolean).join(" · ") || undefined;
+  return { ok: !error, pulled, pushed, didPull, catalogChanged,
+    ...(error ? { error } : {}), ...(pullError ? { pullError } : {}), ...(pushError ? { pushError } : {}) };
 }
 
-export function runSync(userId: string, options: { forcePull?: boolean } = {}): Promise<SyncResult> {
+export function runSync(userId: string, options: { forcePull?: boolean; refresh?: boolean } = {}): Promise<SyncResult> {
   const pushAlreadyInFlight = syncFlights.some((flight) => flight.userId === userId && flight.mode === "push");
   return runSerializedSync(userId, "full", () => performRunSync(userId, options, pushAlreadyInFlight));
 }

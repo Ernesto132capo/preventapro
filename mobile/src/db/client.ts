@@ -1,6 +1,7 @@
 import * as SQLite from "expo-sqlite";
 import { LOCAL_INDEXES, LOCAL_SCHEMA } from "./schema";
 import { migrateClientsTableIfNeeded } from "./client-migration";
+import { beginPerformanceMeasure, measurePerformance } from "../services/performance";
 
 export { migrateClientsTableIfNeeded };
 
@@ -61,6 +62,7 @@ const REQUIRED_COLUMNS: Record<string, string[]> = {
   order_item_selections: ["id", "order_item_id", "selected_product_id", "selected_presentation_id", "product_name_snapshot", "presentation_name_snapshot", "quantity", "sort_order"],
   product_favorites: ["product_id", "created_at"],
   outbox: ["id", "entity_type", "operation", "local_entity_id", "priority", "status", "attempts", "last_error", "next_retry_at", "completed_at", "created_at"],
+  sync_conflicts: ["id", "entity_type", "local_entity_id", "server_id", "outbox_id", "entity_name", "server_updated_at", "created_at", "resolved_at"],
 };
 
 async function tableColumnNames(db: SQLite.SQLiteDatabase, table: string): Promise<Set<string>> {
@@ -110,6 +112,7 @@ export async function withTx<T>(
   existingDb?: SQLite.SQLiteDatabase
 ): Promise<T> {
   const db = existingDb || (await getDb());
+  const finishWaiting = beginPerformanceMeasure("db.transaction_wait");
   const prev = txQueue;
   let release!: () => void;
   txQueue = new Promise<void>((resolve) => (release = resolve));
@@ -122,19 +125,24 @@ export async function withTx<T>(
   }
 
   await prev;
+  finishWaiting();
   if (timer) clearTimeout(timer);
 
+  const finishTransaction = beginPerformanceMeasure("db.transaction");
+  let committed = false;
   try {
     await db.execAsync("BEGIN IMMEDIATE");
     try {
       const result = await task(db);
       await db.execAsync("COMMIT");
+      committed = true;
       return result;
     } catch (err) {
       try { await db.execAsync("ROLLBACK"); } catch {}
       throw err;
     }
   } finally {
+    finishTransaction(committed);
     release();
   }
 }
@@ -169,7 +177,7 @@ async function initializeDb(): Promise<SQLite.SQLiteDatabase> {
 export async function getDb(): Promise<SQLite.SQLiteDatabase> {
   if (dbInstance) return dbInstance;
   if (!dbInitialization) {
-    dbInitialization = initializeDb().catch((error) => {
+    dbInitialization = measurePerformance("db.open", initializeDb).catch((error) => {
       dbInitialization = null;
       throw error;
     });

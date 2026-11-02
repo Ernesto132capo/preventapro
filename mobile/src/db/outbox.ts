@@ -3,7 +3,7 @@ import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso } from "./client";
 
 export type OutboxEntity = "client" | "product" | "order" | "category";
-export type OrderOperation = "create" | "update" | "cancel" | "delete";
+export type OrderOperation = "create" | "update" | "cancel" | "delete" | "restore";
 
 export async function enqueue(entityType: OutboxEntity, localEntityId: string, priority = 2, operation: OrderOperation = "create") {
   const db = await getDb();
@@ -25,12 +25,98 @@ export interface OutboxRow {
   local_entity_id: string;
   operation: OrderOperation;
   priority: number;
-  status: "pending" | "syncing" | "failed" | "error" | "done";
+  status: "pending" | "syncing" | "failed" | "error" | "conflict" | "done";
   attempts: number;
   last_error: string | null;
   created_at: string;
   next_retry_at?: string | null;
   completed_at?: string | null;
+}
+
+/** Counts operations, including permanent errors that need a local correction. */
+export interface OutboxSummary {
+  total: number;
+  pending: number;
+  syncing: number;
+  failed: number;
+  error: number;
+  conflict: number;
+}
+
+export interface OutboxDetail extends OutboxRow {
+  entity_name: string;
+  entity_subtitle: string | null;
+  entity_exists: number;
+  entity_active: number;
+}
+
+export async function getOutboxSummary(): Promise<OutboxSummary> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<OutboxSummary>(
+    `SELECT COUNT(*) AS total,
+       COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+       COALESCE(SUM(CASE WHEN status = 'syncing' THEN 1 ELSE 0 END), 0) AS syncing,
+       COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+       COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS error,
+       COALESCE(SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END), 0) AS conflict
+     FROM outbox WHERE status <> 'done'`
+  );
+  return row ?? { total: 0, pending: 0, syncing: 0, failed: 0, error: 0, conflict: 0 };
+}
+
+/** Read-only pages: left joins keep operations whose local record disappeared visible. */
+export async function listOutboxDetails(options: { offset?: number; limit?: number; errorsOnly?: boolean } = {}): Promise<OutboxDetail[]> {
+  const db = await getDb();
+  const offset = Number.isFinite(options.offset)
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.trunc(options.offset!))) : 0;
+  const limit = Number.isFinite(options.limit)
+    ? Math.min(100, Math.max(1, Math.trunc(options.limit!))) : 30;
+  return db.getAllAsync<OutboxDetail>(
+    `SELECT q.*,
+       CASE q.entity_type
+         WHEN 'order' THEN CASE WHEN ord.id IS NULL THEN 'Preventa no disponible'
+           ELSE 'Preventa · ' || COALESCE(NULLIF(TRIM(ord.client_name), ''), 'Cliente') END
+         WHEN 'client' THEN CASE WHEN cl.id IS NULL THEN 'Cliente no disponible'
+           ELSE COALESCE(NULLIF(TRIM(cl.business_name), ''), NULLIF(TRIM(cl.name), ''),
+             NULLIF(TRIM(cl.contact_name), ''), NULLIF(TRIM(cl.owner_name), ''), 'Cliente sin nombre') END
+         WHEN 'product' THEN COALESCE(NULLIF(TRIM(pr.name), ''), 'Producto no disponible')
+         WHEN 'category' THEN COALESCE(NULLIF(TRIM(cat.name), ''), 'Categoría no disponible')
+         ELSE 'Registro no disponible'
+       END AS entity_name,
+       CASE q.entity_type
+         WHEN 'order' THEN 'Ref. ' || SUBSTR(q.local_entity_id, 1, 8) ||
+           COALESCE(' · ' || STRFTIME('%d/%m/%Y %H:%M', ord.created_at, '-4 hours'), '')
+         WHEN 'client' THEN CASE
+           WHEN COALESCE(NULLIF(TRIM(cl.business_name), ''), NULLIF(TRIM(cl.name), '')) IS NOT NULL
+             THEN COALESCE(NULLIF(TRIM(cl.contact_name), ''), NULLIF(TRIM(cl.owner_name), ''), NULLIF(TRIM(cl.phone), ''))
+           ELSE NULLIF(TRIM(cl.phone), '') END
+         WHEN 'product' THEN NULLIF(TRIM(pr.sku), '')
+         ELSE NULL
+       END AS entity_subtitle,
+       CASE q.entity_type
+         WHEN 'order' THEN CASE WHEN ord.id IS NULL THEN 0 ELSE 1 END
+         WHEN 'client' THEN CASE WHEN cl.id IS NULL THEN 0 ELSE 1 END
+         WHEN 'product' THEN CASE WHEN pr.id IS NULL THEN 0 ELSE 1 END
+         WHEN 'category' THEN CASE WHEN cat.id IS NULL THEN 0 ELSE 1 END
+         ELSE 0
+       END AS entity_exists,
+       CASE q.entity_type
+         WHEN 'order' THEN CASE WHEN ord.status = 'active' THEN 1 ELSE 0 END
+         WHEN 'client' THEN CASE WHEN cl.active = 1 THEN 1 ELSE 0 END
+         WHEN 'product' THEN CASE WHEN pr.active = 1 THEN 1 ELSE 0 END
+         WHEN 'category' THEN CASE WHEN cat.active = 1 THEN 1 ELSE 0 END
+         ELSE 0
+       END AS entity_active
+     FROM outbox q
+     LEFT JOIN orders ord ON q.entity_type = 'order' AND ord.id = q.local_entity_id
+     LEFT JOIN clients cl ON q.entity_type = 'client' AND cl.id = q.local_entity_id
+     LEFT JOIN products pr ON q.entity_type = 'product' AND pr.id = q.local_entity_id
+     LEFT JOIN categories cat ON q.entity_type = 'category' AND cat.id = q.local_entity_id
+     WHERE q.status IN (${options.errorsOnly ? "'failed','error','conflict'" : "'pending','syncing','failed','error','conflict'"})
+     ORDER BY q.created_at DESC, q.id DESC
+     LIMIT ? OFFSET ?`,
+    [limit, offset]
+  );
 }
 
 export async function listPending(): Promise<OutboxRow[]> {
@@ -106,6 +192,15 @@ export async function markPermanentError(id: string, error: string) {
   const db = await getDb();
   await db.runAsync(
     `UPDATE outbox SET status = 'error', attempts = attempts + 1, last_error = ?, next_retry_at = NULL WHERE id = ?`,
+    [error, id]
+  );
+}
+
+/** Marca un conflicto de registro eliminado: no se reintenta ni se descarta automáticamente. */
+export async function markConflict(id: string, error: string) {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE outbox SET status = 'conflict', last_error = ?, next_retry_at = NULL WHERE id = ?`,
     [error, id]
   );
 }

@@ -1,11 +1,12 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { View, Text, FlatList, ScrollView, Pressable, StyleSheet, TextInput, Alert } from "react-native";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { View, Text, FlatList, Pressable, StyleSheet, TextInput, Alert } from "react-native";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
+import { LoadErrorBanner } from "../components/LoadErrorBanner";
 import { useAuth } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
 import { getOrCreateOpenWorkDay, resolveServerWorkDayId, markWorkDayClosed, upsertServerWorkDay, reopenWorkDayLocal } from "../db/repositories/workdays";
@@ -32,26 +33,35 @@ export function DailySalesScreen() {
   const [confirmText, setConfirmText] = useState("");
   const [closing, setClosing] = useState(false);
   const [reopening, setReopening] = useState(false);
+  const closeInFlightRef = useRef(false);
+  const reopenInFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!user) return;
-    const wd = await getOrCreateOpenWorkDay(user.id);
-    const [ords, consolidated] = await Promise.all([
-      listOrdersForWorkDay(wd.id),
-      getConsolidatedProductsForWorkDay(wd.id),
-    ]);
-    setOrders(ords);
-    setConsolidatedData(consolidated);
-    const totalCents = wd.status === "closed"
-      ? wd.total_cents
-      : ords.reduce((sum, o) => sum + (o.total_cents || 0), 0);
-    const orderCount = wd.status === "closed" ? wd.order_count : ords.length;
-    setWorkDay({
-      ...wd,
-      total_cents: totalCents,
-      order_count: orderCount,
-    });
+    try {
+      const wd = await getOrCreateOpenWorkDay(user.id);
+      const [ords, consolidated] = await Promise.all([
+        listOrdersForWorkDay(wd.id),
+        getConsolidatedProductsForWorkDay(wd.id),
+      ]);
+      setOrders(ords);
+      setConsolidatedData(consolidated);
+      const totalCents = wd.status === "closed"
+        ? wd.total_cents
+        : ords.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+      const orderCount = wd.status === "closed" ? wd.order_count : ords.length;
+      setWorkDay({
+        ...wd,
+        total_cents: totalCents,
+        order_count: orderCount,
+      });
+      setLoadError(null);
+    } catch {
+      // Conserva los datos visibles previos y permite reintentar.
+      setLoadError("No se pudo cargar la jornada. Revisa la conexión e inténtalo de nuevo.");
+    }
   }, [user]);
 
   useFocusEffect(
@@ -66,7 +76,7 @@ export function DailySalesScreen() {
   }, [syncTick]);
 
   async function handleClose() {
-    if (closing || reopening) return;
+    if (closeInFlightRef.current || reopenInFlightRef.current) return;
     setError(null);
     if (confirmText !== "CONFIRMAR") {
       setError('Debes escribir exactamente "CONFIRMAR".');
@@ -74,6 +84,7 @@ export function DailySalesScreen() {
     }
     if (!workDay) return;
 
+    closeInFlightRef.current = true;
     setClosing(true);
     try {
       // Confirmar que altas, ediciones y cancelaciones llegaron al servidor
@@ -85,7 +96,15 @@ export function DailySalesScreen() {
         return;
       }
 
-      const serverId = await resolveServerWorkDayId(workDay.id);
+      let serverId = await resolveServerWorkDayId(workDay.id);
+      if (!serverId) {
+        // Una jornada sin preventas todavía puede existir sólo en este teléfono.
+        const current = await apiFetch<any>("/workdays/current");
+        if (current?.workDay?.work_date === workDay.work_date) {
+          await upsertServerWorkDay(workDay.id, current.workDay);
+          serverId = current.workDay.id;
+        }
+      }
       if (!serverId) {
         setError("No se pudo confirmar la jornada con el servidor. Verifica tu conexión.");
         return;
@@ -110,18 +129,19 @@ export function DailySalesScreen() {
       );
       // El cierre ya está confirmado; un fallo de refresco no debe reportarlo
       // como si el servidor hubiera rechazado el cierre.
-      try { await forceSync(); } catch { /* cierre confirmado */ }
-      try { await load(); } catch { /* se conserva el total confirmado arriba */ }
+      void forceSync().then(() => load()).catch(() => { /* cierre confirmado */ });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo cerrar la jornada.");
     } finally {
+      closeInFlightRef.current = false;
       setClosing(false);
     }
   }
 
   async function handleReopen() {
-    if (reopening || closing) return;
+    if (reopenInFlightRef.current || closeInFlightRef.current) return;
     if (!workDay) return;
+    reopenInFlightRef.current = true;
     setReopening(true);
     try {
       const serverId = await resolveServerWorkDayId(workDay.id);
@@ -135,11 +155,23 @@ export function DailySalesScreen() {
     } catch (err: any) {
       Alert.alert("Error al reabrir", err?.message || "No se pudo reabrir la jornada.");
     } finally {
+      reopenInFlightRef.current = false;
       setReopening(false);
     }
   }
 
-  if (!workDay) return null;
+  if (!workDay) {
+    if (loadError) {
+      return (
+        <View style={styles.screen}>
+          <View style={{ paddingTop: spacing.lg }}>
+            <LoadErrorBanner message={loadError} onRetry={() => load()} />
+          </View>
+        </View>
+      );
+    }
+    return null;
+  }
 
   return (
     <View style={styles.screen}>
@@ -147,6 +179,8 @@ export function DailySalesScreen() {
         <Text style={styles.title}>Jornada Activa</Text>
         <Button label="Registros Históricos" variant="outline" onPress={() => navigation.navigate("Historial")} style={styles.historyBtn} />
       </View>
+
+      {loadError && <LoadErrorBanner message={loadError} onRetry={() => load()} />}
 
       <Card style={{ marginHorizontal: spacing.lg, marginBottom: spacing.md }}>
         <View style={styles.rowBetween}>
@@ -177,25 +211,27 @@ export function DailySalesScreen() {
       </View>
 
       {activeTab === "products" ? (
-        <ScrollView
+        <FlatList
+          data={consolidatedData.items}
+          keyExtractor={(prod, index) => `${prod.productName}-${prod.presentationName}-${prod.unitPriceCents}-${index}`}
           style={{ flex: 1 }}
           contentContainerStyle={{ paddingHorizontal: spacing.lg, paddingBottom: spacing.lg }}
-        >
-          <Card style={{ padding: 0, overflow: "hidden" }}>
+          initialNumToRender={12}
+          windowSize={5}
+          ListHeaderComponent={
             <View style={styles.tableHeaderRow}>
               <Text style={[styles.tableHeaderCell, styles.colProduct]}>Producto</Text>
               <Text style={[styles.tableHeaderCell, styles.colPrice]}>P. Unit.</Text>
               <Text style={[styles.tableHeaderCell, styles.colPrice]}>P. Total</Text>
               <Text style={[styles.tableHeaderCell, styles.colUnits]}>Unid.</Text>
             </View>
-
-            {consolidatedData.items.length === 0 ? (
+          }
+          ListEmptyComponent={
               <View style={{ padding: spacing.lg }}>
                 <EmptyState message="Aún no hay productos pedidos en esta jornada." />
               </View>
-            ) : (
-              <>
-                {consolidatedData.items.map((prod, idx) => (
+          }
+          renderItem={({ item: prod, index: idx }) => (
                   <View
                     key={`${prod.productName}-${prod.unitPriceCents}-${idx}`}
                     style={[styles.tableRow, idx % 2 === 1 && styles.tableRowAlt]}
@@ -213,8 +249,8 @@ export function DailySalesScreen() {
                       {prod.totalUnits}
                     </Text>
                   </View>
-                ))}
-
+          )}
+          ListFooterComponent={consolidatedData.items.length > 0 ?
                 <View style={styles.tableTotalRow}>
                   <Text style={[styles.tableTotalCell, styles.colProduct]}>TOTAL GENERAL</Text>
                   <Text style={[styles.tableTotalCell, styles.colPrice]}>-</Text>
@@ -225,10 +261,8 @@ export function DailySalesScreen() {
                     {consolidatedData.grandTotalUnits}
                   </Text>
                 </View>
-              </>
-            )}
-          </Card>
-        </ScrollView>
+            : null}
+        />
       ) : workDay.status === "closed" ? (
         <View style={{ paddingHorizontal: spacing.lg }}>
           <Card>

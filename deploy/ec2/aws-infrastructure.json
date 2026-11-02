@@ -1,0 +1,460 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "PreventaPro private PostgreSQL backups, health alerts and restricted EC2 role",
+  "Parameters": {
+    "InstanceId": {
+      "Type": "AWS::EC2::Instance::Id",
+      "Default": "i-0a3cbf8f99989b78e"
+    },
+    "NotificationEmail": {
+      "Type": "String",
+      "Description": "Email address authorized for AWS alerts"
+    },
+    "MonthlyBudgetUSD": {
+      "Type": "Number",
+      "Default": 30,
+      "MinValue": 1
+    }
+  },
+  "Resources": {
+    "BackupBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "preventapro-backups-${AWS::AccountId}-${AWS::Region}"
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "PreventaPro-daily-backups",
+              "Status": "Enabled",
+              "Prefix": "postgresql/preventapro/",
+              "ExpirationInDays": 30,
+              "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 7
+              },
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "PreventaPro"
+          }
+        ]
+      }
+    },
+    "BackupBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "BackupBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "RequireTLS",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "BackupBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${BackupBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AlertTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "TopicName": "PreventaPro-alerts",
+        "DisplayName": "PreventaPro",
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "PreventaPro"
+          }
+        ],
+        "Subscription": [
+          {
+            "Protocol": "email",
+            "Endpoint": {
+              "Ref": "NotificationEmail"
+            }
+          }
+        ]
+      }
+    },
+    "AlertTopicPolicy": {
+      "Type": "AWS::SNS::TopicPolicy",
+      "Properties": {
+        "Topics": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountOwner",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": [
+                "SNS:Publish",
+                "SNS:RemovePermission",
+                "SNS:SetTopicAttributes",
+                "SNS:DeleteTopic",
+                "SNS:ListSubscriptionsByTopic",
+                "SNS:GetTopicAttributes",
+                "SNS:AddPermission",
+                "SNS:Subscribe"
+              ],
+              "Resource": {
+                "Ref": "AlertTopic"
+              }
+            },
+            {
+              "Sid": "CloudWatchAlarms",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudwatch.amazonaws.com"
+              },
+              "Action": "SNS:Publish",
+              "Resource": {
+                "Ref": "AlertTopic"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:PreventaPro-*"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "Ec2OpsRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "PreventaProEc2Ops",
+        "Description": "Private PostgreSQL backups and server health notifications",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "PreventaPro"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "PreventaProBackupAndAlerts",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ListBackupPrefix",
+                  "Effect": "Allow",
+                  "Action": "s3:ListBucket",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "BackupBucket",
+                      "Arn"
+                    ]
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": [
+                        "postgresql/preventapro/",
+                        "postgresql/preventapro/*"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadWriteOwnBackups",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject",
+                    "s3:GetObject",
+                    "s3:AbortMultipartUpload"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${BackupBucket.Arn}/postgresql/preventapro/*"
+                  }
+                },
+                {
+                  "Sid": "SendHealthAlerts",
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": {
+                    "Ref": "AlertTopic"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Ec2OpsProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "InstanceProfileName": "PreventaProEc2Ops",
+        "Roles": [
+          {
+            "Ref": "Ec2OpsRole"
+          }
+        ]
+      }
+    },
+    "MonthlyCostBudget": {
+      "Type": "AWS::Budgets::Budget",
+      "Properties": {
+        "Budget": {
+          "BudgetName": "PreventaPro-monthly-30USD",
+          "BudgetLimit": {
+            "Amount": {
+              "Ref": "MonthlyBudgetUSD"
+            },
+            "Unit": "USD"
+          },
+          "TimeUnit": "MONTHLY",
+          "BudgetType": "COST",
+          "CostTypes": {
+            "IncludeCredit": false,
+            "IncludeRefund": false
+          }
+        },
+        "NotificationsWithSubscribers": [
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "Threshold": 80,
+              "ThresholdType": "PERCENTAGE"
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "FORECASTED",
+              "ComparisonOperator": "GREATER_THAN",
+              "Threshold": 100,
+              "ThresholdType": "PERCENTAGE"
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "InstanceStatusAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "PreventaPro-InstanceStatus",
+        "AlarmDescription": "PreventaPro EC2 StatusCheckFailed",
+        "ActionsEnabled": true,
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "OKActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "MetricName": "StatusCheckFailed",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Maximum",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "InstanceId"
+            }
+          }
+        ],
+        "Period": 300,
+        "EvaluationPeriods": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "CPUHighAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "PreventaPro-CPUHigh",
+        "AlarmDescription": "PreventaPro EC2 CPUUtilization",
+        "ActionsEnabled": true,
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "OKActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "InstanceId"
+            }
+          }
+        ],
+        "Period": 300,
+        "EvaluationPeriods": 3,
+        "Threshold": 85,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "CPUCreditsLowAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "PreventaPro-CPUCreditsLow",
+        "AlarmDescription": "PreventaPro EC2 CPUCreditBalance",
+        "ActionsEnabled": true,
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "OKActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ],
+        "MetricName": "CPUCreditBalance",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Minimum",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "InstanceId"
+            }
+          }
+        ],
+        "Period": 300,
+        "EvaluationPeriods": 3,
+        "Threshold": 12,
+        "ComparisonOperator": "LessThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "BackupBucketName": {
+      "Value": {
+        "Ref": "BackupBucket"
+      }
+    },
+    "AlertTopicArn": {
+      "Value": {
+        "Ref": "AlertTopic"
+      }
+    },
+    "InstanceProfileName": {
+      "Value": {
+        "Ref": "Ec2OpsProfile"
+      }
+    },
+    "RoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Ec2OpsRole",
+          "Arn"
+        ]
+      }
+    }
+  }
+}

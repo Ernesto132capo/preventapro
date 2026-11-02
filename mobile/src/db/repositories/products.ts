@@ -2,8 +2,10 @@ import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
 import { enqueue, hasUnresolvedOutbox } from "../outbox";
+import { forEachIdChunk, placeholdersFor } from "../sqlChunks";
 import { Product, Presentation, ComboDefinition, ComboOption } from "../../domain/types";
 import { listRecentProductIdsForClient } from "./orders";
+import { catalogRowChanged } from "../catalogChanges";
 
 export interface ProductWithPresentations extends Product {
   presentations: Presentation[];
@@ -13,6 +15,7 @@ export interface ProductWithPresentations extends Product {
 
 export interface ListProductsOptions {
   search?: string;
+  productType?: "standard" | "combo";
   categoryId?: string | null;
   onlyFavorites?: boolean;
   productIds?: string[];
@@ -82,12 +85,13 @@ async function hydrateProducts(db: SQLiteDatabase, products: Product[]): Promise
       products.flatMap((p) => [p.id, p.server_id]).filter((id): id is string => Boolean(id))
     )
   );
-  const placeholders = allIds.map(() => "?").join(",");
-
-  const allPresentations = await db.getAllAsync<Presentation>(
-    `SELECT id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active FROM product_presentations WHERE product_id IN (${placeholders}) AND active = 1 ORDER BY sort_order ASC`,
-    allIds
+  const allPresentations = await forEachIdChunk<Presentation>(allIds, (chunk) =>
+    db.getAllAsync<Presentation>(
+      `SELECT id, server_id, product_id, name, sort_order, unit_equivalence, price_cents, cost_cents, active FROM product_presentations WHERE product_id IN (${placeholdersFor(chunk)}) AND active = 1`,
+      chunk
+    )
   );
+  allPresentations.sort((a, b) => a.sort_order - b.sort_order);
   const byProduct = new Map<string, Presentation[]>();
   for (const pres of allPresentations) {
     const list = byProduct.get(pres.product_id) || [];
@@ -106,25 +110,27 @@ async function hydrateProducts(db: SQLiteDatabase, products: Product[]): Promise
 
   const comboDefsMap = new Map<string, ComboDefinition>();
   if (comboProductIds.length > 0) {
-    const ph = comboProductIds.map(() => "?").join(",");
-    const defs = await db.getAllAsync<any>(
-      `SELECT * FROM combo_definitions WHERE product_id IN (${ph}) AND active = 1`,
-      comboProductIds
+    const defs = await forEachIdChunk<any>(comboProductIds, (chunk) =>
+      db.getAllAsync<any>(
+        `SELECT * FROM combo_definitions WHERE product_id IN (${placeholdersFor(chunk)}) AND active = 1`,
+        chunk
+      )
     );
     if (defs.length > 0) {
       const allDefIds = Array.from(
         new Set(defs.flatMap((d) => [d.id, d.server_id]).filter((id): id is string => Boolean(id)))
       );
-      const defPh = allDefIds.map(() => "?").join(",");
-      const options = await db.getAllAsync<any>(
-        `SELECT co.*, COALESCE(pp.name, 'Opción') as presentation_name, COALESCE(p.name, 'Producto') as product_name, COALESCE(p.id, pp.product_id) as prod_id
-         FROM combo_options co
-         LEFT JOIN product_presentations pp ON co.presentation_id = pp.id OR (co.presentation_id IS NOT NULL AND co.presentation_id = pp.server_id)
-         LEFT JOIN products p ON pp.product_id = p.id OR (pp.product_id IS NOT NULL AND pp.product_id = p.server_id)
-         WHERE co.combo_id IN (${defPh}) AND co.active = 1
-         ORDER BY co.sort_order ASC`,
-        allDefIds
+      const options = await forEachIdChunk<any>(allDefIds, (chunk) =>
+        db.getAllAsync<any>(
+          `SELECT co.*, COALESCE(pp.name, 'Opción') as presentation_name, COALESCE(p.name, 'Producto') as product_name, COALESCE(p.id, pp.product_id) as prod_id
+           FROM combo_options co
+           LEFT JOIN product_presentations pp ON co.presentation_id = pp.id OR (co.presentation_id IS NOT NULL AND co.presentation_id = pp.server_id)
+           LEFT JOIN products p ON pp.product_id = p.id OR (pp.product_id IS NOT NULL AND pp.product_id = p.server_id)
+           WHERE co.combo_id IN (${placeholdersFor(chunk)}) AND co.active = 1`,
+          chunk
+        )
       );
+      options.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
       const optionsByDef = new Map<string, ComboOption[]>();
       for (const opt of options) {
         const list = optionsByDef.get(opt.combo_id) || [];
@@ -187,6 +193,7 @@ export async function listProducts(optionsOrSearch?: string | ListProductsOption
   let productIds: string[] | undefined;
   let limit: number | undefined;
   let offset: number | undefined;
+  let productType: "standard" | "combo" | undefined;
 
   if (typeof optionsOrSearch === "string") {
     search = optionsOrSearch;
@@ -197,10 +204,12 @@ export async function listProducts(optionsOrSearch?: string | ListProductsOption
     productIds = optionsOrSearch.productIds;
     limit = optionsOrSearch.limit;
     offset = optionsOrSearch.offset;
+    productType = optionsOrSearch.productType;
   }
 
   const conditions: string[] = ["p.active = 1"];
   const params: any[] = [];
+  if (productType) { conditions.push("p.product_type = ?"); params.push(productType); }
 
   if (search && search.trim()) {
     conditions.push("(p.name LIKE ? OR p.sku LIKE ?)");
@@ -593,20 +602,28 @@ export async function remapCategoryReferences(oldCategoryId: string, canonicalCa
 
 export async function upsertProductFromServer(serverProduct: any) {
   const db = await getDb();
-  let localMatch = await db.getFirstAsync<{ id: string; sync_status: string }>(
-    `SELECT id, sync_status FROM products WHERE server_id = ? OR sku = ?`,
+  const localMatch = await db.getFirstAsync<Product>(
+    `SELECT * FROM products WHERE server_id = ? OR sku = ?`,
     [serverProduct.id, serverProduct.sku]
   );
 
   // Si el producto local tiene cambios pendientes de subir, no sobreescribir
   if (localMatch && (localMatch.sync_status !== "synced" || await hasUnresolvedOutbox(db, "product", localMatch.id))) {
     await db.runAsync(`UPDATE products SET server_id = ? WHERE id = ?`, [serverProduct.id, localMatch.id]);
-    return;
+    return localMatch.server_id !== serverProduct.id;
   }
 
+  let changed = catalogRowChanged(localMatch, {
+    server_id: serverProduct.id, sku: serverProduct.sku || "", name: serverProduct.name || "",
+    category_id: serverProduct.category_id ?? null, base_cost_cents: Number(serverProduct.base_cost_cents ?? 0),
+    base_unit_name: serverProduct.base_unit_name || "Unidad", product_type: serverProduct.product_type || "standard",
+    active: Number(serverProduct.active ?? 1), promo_active: Number(serverProduct.promo_active ?? 0),
+  });
   const targetId = localMatch ? localMatch.id : serverProduct.id;
-  if (localMatch && localMatch.id !== serverProduct.id) {
+  if (localMatch && localMatch.id !== serverProduct.id && localMatch.server_id !== serverProduct.id) {
     await remapProductReferences(localMatch.id, serverProduct.id, false);
+  } else if (localMatch && localMatch.id !== serverProduct.id) {
+    await normalizeFavoriteAlias(db, localMatch.id, serverProduct.id);
   }
 
   await db.runAsync(
@@ -632,7 +649,7 @@ export async function upsertProductFromServer(serverProduct: any) {
   );
 
   const existingPresentations = await db.getAllAsync<any>(
-    `SELECT id, server_id, name FROM product_presentations WHERE product_id = ? OR product_id = ?`,
+    `SELECT * FROM product_presentations WHERE product_id = ? OR product_id = ?`,
     [targetId, serverProduct.id]
   );
 
@@ -646,6 +663,12 @@ export async function upsertProductFromServer(serverProduct: any) {
     );
 
     const presLocalId = match ? match.id : pres.id;
+    const comparablePresentation = match && { ...match, product_id: match.product_id === serverProduct.id ? targetId : match.product_id };
+    changed = catalogRowChanged(comparablePresentation, {
+      server_id: pres.id, product_id: targetId, name: pres.name || "", sort_order: Number(pres.sort_order ?? 0),
+      unit_equivalence: Number(pres.unit_equivalence ?? 1), price_cents: Number(pres.price_cents ?? 0),
+      cost_cents: Number(pres.cost_cents ?? 0), active: Number(pres.active ?? 1),
+    }) || changed;
 
     await db.runAsync(
       `INSERT INTO product_presentations
@@ -670,7 +693,7 @@ export async function upsertProductFromServer(serverProduct: any) {
     );
 
     // Si la presentación local tenía otro ID pero coincide con la del servidor, actualizar ítems de preventas locales
-    if (match && match.id !== pres.id) {
+    if (match && match.id !== pres.id && match.server_id !== pres.id) {
       await remapProductReferences(match.id, pres.id, true);
     }
   }
@@ -679,6 +702,7 @@ export async function upsertProductFromServer(serverProduct: any) {
   for (const ep of existingPresentations) {
     const epNameKey = (ep.name || "").trim().toLowerCase();
     if (!serverPresNames.has(epNameKey) && !serverPresList.some((p: any) => p.id === ep.server_id)) {
+      if (Number(ep.active) !== 0) changed = true;
       await db.runAsync(`UPDATE product_presentations SET active = 0 WHERE id = ?`, [ep.id]);
     }
   }
@@ -690,29 +714,46 @@ export async function upsertProductFromServer(serverProduct: any) {
     const existingDef = canonicalDefId ? { id: canonicalDefId } : await db.getFirstAsync<{ id: string }>(
       `SELECT id FROM combo_definitions WHERE server_id = ? OR product_id = ? OR product_id = ?`, [cd.id, targetId, serverProduct.id]);
     const targetDefId = existingDef ? existingDef.id : cd.id;
-    await db.runAsync(
+    const definitionResult = await db.runAsync(
       `INSERT INTO combo_definitions (id, server_id, product_id, selection_min, selection_max, active, sync_status)
        VALUES (?, ?, ?, ?, ?, ?, 'synced')
        ON CONFLICT(id) DO UPDATE SET
          server_id = excluded.server_id, product_id = excluded.product_id,
          selection_min = excluded.selection_min, selection_max = excluded.selection_max,
-         active = excluded.active, sync_status = 'synced'`,
+         active = excluded.active, sync_status = 'synced'
+       WHERE combo_definitions.server_id IS NOT excluded.server_id OR combo_definitions.product_id IS NOT excluded.product_id
+          OR combo_definitions.selection_min IS NOT excluded.selection_min OR combo_definitions.selection_max IS NOT excluded.selection_max
+          OR combo_definitions.active IS NOT excluded.active OR combo_definitions.sync_status <> 'synced'`,
       [targetDefId, cd.id, targetId, cd.selection_min, cd.selection_max, cd.active ?? 1]
     );
+    changed = definitionResult.changes > 0 || changed;
 
     if (Array.isArray(cd.options)) {
-      await db.runAsync(`UPDATE combo_options SET active = 0 WHERE combo_id = ?`, [targetDefId]);
+      const incoming = new Set<string>(cd.options.map((option: any) => option.id));
+      const currentOptions = await db.getAllAsync<any>(`SELECT id, server_id FROM combo_options WHERE combo_id = ? AND active = 1`, [targetDefId]);
+      for (const option of currentOptions) {
+        if (!incoming.has(option.server_id || option.id)) {
+          await db.runAsync(`UPDATE combo_options SET active = 0 WHERE id = ?`, [option.id]);
+          changed = true;
+        }
+      }
       for (const co of cd.options) {
         const localPres = await db.getFirstAsync<{ id: string }>(
           `SELECT id FROM product_presentations WHERE server_id = ? OR id = ?`,
           [co.presentation_id, co.presentation_id]
         );
         const targetPresId = localPres ? localPres.id : co.presentation_id;
-        const existingOpt = await db.getFirstAsync<{ id: string }>(
-          `SELECT id FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
+        const existingOpt = await db.getFirstAsync<any>(
+          `SELECT * FROM combo_options WHERE server_id = ? OR id = ? OR (combo_id = ? AND presentation_id = ?)`,
           [co.id, co.id, targetDefId, targetPresId]
         );
         const targetOptId = existingOpt ? existingOpt.id : co.id;
+        const comparableOption = existingOpt && { ...existingOpt, presentation_id: existingOpt.presentation_id === co.presentation_id ? targetPresId : existingOpt.presentation_id };
+        changed = catalogRowChanged(comparableOption, {
+          server_id: co.id, combo_id: targetDefId, presentation_id: targetPresId,
+          max_quantity: co.max_quantity == null ? null : Number(co.max_quantity),
+          sort_order: Number(co.sort_order ?? 0), active: Number(co.active ?? 1),
+        }) || changed;
         await db.runAsync(
           `INSERT INTO combo_options (id, server_id, combo_id, presentation_id, max_quantity, sort_order, active, sync_status)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
@@ -725,6 +766,7 @@ export async function upsertProductFromServer(serverProduct: any) {
       }
     }
   }
+  return changed;
 }
 
 export async function resolveServerProductId(localId: string): Promise<string | null> {
@@ -798,10 +840,11 @@ export async function resolveServerPresentationId(localId: string): Promise<stri
 export async function getPresentationsByIds(ids: string[]): Promise<Map<string, Presentation>> {
   if (ids.length === 0) return new Map();
   const db = await getDb();
-  const placeholders = ids.map(() => "?").join(",");
-  const rows = await db.getAllAsync<Presentation>(
-    `SELECT * FROM product_presentations WHERE id IN (${placeholders}) OR server_id IN (${placeholders})`,
-    [...ids, ...ids]
+  const rows = await forEachIdChunk<Presentation>(ids, (chunk) =>
+    db.getAllAsync<Presentation>(
+      `SELECT * FROM product_presentations WHERE id IN (${placeholdersFor(chunk)}) OR server_id IN (${placeholdersFor(chunk)})`,
+      [...chunk, ...chunk]
+    )
   );
   const map = new Map<string, Presentation>();
   for (const r of rows) {

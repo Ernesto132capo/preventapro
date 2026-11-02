@@ -10,12 +10,22 @@ import ts from "typescript";
  * Los respaldos y sus transacciones SQLite se prueban en local_backup_outbox.
  */
 interface ProviderActions {
-  forceSync(): Promise<void>;
+  forceSync(options?: { fullRecovery?: boolean }): Promise<void>;
   pushSync(): Promise<void>;
   backupLocalData(): Promise<unknown>;
   restoreLocalData(uri: string): Promise<void>;
   resetLocalData(): Promise<unknown>;
   discardFailedItems(): Promise<void>;
+  refreshPending(): Promise<OutboxSummary>;
+}
+
+interface OutboxSummary {
+  total: number;
+  pending: number;
+  syncing: number;
+  failed: number;
+  error: number;
+  conflict: number;
 }
 
 const okResult = { ok: true, pushed: { done: 1, deferred: 0, failed: 0 } };
@@ -33,7 +43,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function mountProvider() {
+function mountProvider(options: { connected?: boolean } = {}) {
   const services = {
     runSync: jest.fn(async (..._args: any[]) => okResult),
     pushOnlySync: jest.fn(async (..._args: any[]) => okResult),
@@ -42,20 +52,25 @@ function mountProvider() {
   };
   const db = { resetLocalDatabase: jest.fn(async (..._args: any[]) => {}) };
   const outbox = {
-    countPending: jest.fn(async () => 1), getFailedErrors: jest.fn(async () => []),
+    getOutboxSummary: jest.fn(async (): Promise<OutboxSummary> => ({ total: 1, pending: 1, syncing: 0, failed: 0, error: 0, conflict: 0 })),
     discardFailed: jest.fn(async () => 1), purgeCompletedOutbox: jest.fn(async () => 0),
   };
   const backups = {
     createLocalBackup: jest.fn(async (..._args: any[]) => backupInfo),
     restoreLocalBackup: jest.fn(async (..._args: any[]) => backupInfo),
   };
+  const setters: jest.Mock[] = [];
   const react = {
     createContext: () => ({ Provider: "SyncContext.Provider" }),
     createElement: (type: unknown, props: any) => ({ type, props }),
     useContext: jest.fn(),
     useEffect: jest.fn(), // No iniciar listeners ni temporizadores en este harness.
     useRef: (value: unknown) => ({ current: value }),
-    useState: (value: unknown) => [value, jest.fn()],
+    useState: (value: unknown) => {
+      const setter = jest.fn();
+      const index = setters.push(setter) - 1;
+      return [index === 0 ? options.connected ?? value : value, setter];
+    },
     useCallback: (callback: unknown) => callback,
   };
   const dependencies: Record<string, unknown> = {
@@ -78,11 +93,52 @@ function mountProvider() {
     console, setInterval: jest.fn(), clearInterval: jest.fn(),
   }, { filename: sourcePath });
   const value = module.exports.SyncProvider!({ children: null }).props.value;
-  return { value, services, db, outbox, backups };
+  const [isConnected, connection, pendingCount, failedCount, correctionCount, lastSyncedAt, lastError, syncTick, catalogRevision, pullRevision] = setters;
+  return { value, services, db, outbox, backups, state: { isConnected, connection, pendingCount, failedCount, correctionCount, lastSyncedAt, lastError, syncTick, catalogRevision, pullRevision } };
 }
 
 describe("Coordinación de acciones públicas de SyncContext", () => {
-  it("forceSync espera un push activo antes de iniciar su pull forzado", async () => {
+  it("informa el total real de errores aunque existan más de cinco operaciones fallidas", async () => {
+    const { value, outbox, state } = mountProvider();
+    outbox.getOutboxSummary.mockResolvedValue({ total: 13, pending: 2, syncing: 1, failed: 3, error: 7, conflict: 0 });
+
+    await value.pushSync();
+
+    expect(state.pendingCount).toHaveBeenLastCalledWith(13);
+    expect(state.failedCount).toHaveBeenLastCalledWith(10);
+    expect(state.correctionCount).toHaveBeenLastCalledWith(7);
+    expect(state.lastError).toHaveBeenLastCalledWith(expect.stringContaining("10"));
+    expect(state.lastSyncedAt).not.toHaveBeenCalled();
+  });
+
+  it("conserva visibles los errores permanentes al refrescar pendientes sin conexión", async () => {
+    const { value, services, outbox, state } = mountProvider({ connected: false });
+    outbox.getOutboxSummary.mockResolvedValue({ total: 9, pending: 0, syncing: 0, failed: 0, error: 9, conflict: 0 });
+
+    await value.pushSync();
+
+    expect(services.runSync).not.toHaveBeenCalled();
+    expect(services.pushOnlySync).not.toHaveBeenCalled();
+    expect(state.pendingCount).toHaveBeenLastCalledWith(9);
+    expect(state.failedCount).toHaveBeenLastCalledWith(9);
+    expect(state.correctionCount).toHaveBeenLastCalledWith(9);
+  });
+
+  it("permite refrescar el resumen local sin iniciar tráfico de sincronización", async () => {
+    const { value, services, outbox, state } = mountProvider();
+    const summary = { total: 4, pending: 2, syncing: 0, failed: 1, error: 1, conflict: 0 };
+    outbox.getOutboxSummary.mockResolvedValue(summary);
+
+    await expect(value.refreshPending()).resolves.toEqual(summary);
+
+    expect(state.pendingCount).toHaveBeenLastCalledWith(4);
+    expect(state.failedCount).toHaveBeenLastCalledWith(2);
+    expect(state.correctionCount).toHaveBeenLastCalledWith(1);
+    expect(services.runSync).not.toHaveBeenCalled();
+    expect(services.pushOnlySync).not.toHaveBeenCalled();
+  });
+
+  it("forceSync espera un push activo antes de refrescar incrementalmente", async () => {
     const { value, services } = mountProvider();
     const pushing = deferred<typeof okResult>();
     services.pushOnlySync.mockImplementationOnce(() => pushing.promise);
@@ -93,7 +149,26 @@ describe("Coordinación de acciones públicas de SyncContext", () => {
     pushing.resolve(okResult);
     await Promise.all([push, full]);
     expect(services.runSync).toHaveBeenCalledTimes(1);
+    expect(services.runSync).toHaveBeenCalledWith("user-1", { forcePull: false, refresh: true });
+  });
+
+  it("reserva la descarga completa para la recuperación explícita", async () => {
+    const { value, services } = mountProvider();
+    await value.forceSync({ fullRecovery: true });
     expect(services.runSync).toHaveBeenCalledWith("user-1", { forcePull: true });
+  });
+
+  it("no invalida el catálogo sin cambios y refleja un envío aunque falle el pull", async () => {
+    const { value, services, state } = mountProvider();
+    services.runSync.mockResolvedValueOnce({ ...okResult, didPull: true, catalogChanged: false } as any);
+    await value.forceSync();
+    expect(state.catalogRevision).not.toHaveBeenCalled();
+    expect(state.pullRevision).toHaveBeenCalledTimes(1);
+    services.runSync.mockResolvedValueOnce({ ...okResult, ok: false, error: "Falló el catálogo", catalogChanged: true } as any);
+    await value.forceSync();
+    expect(state.catalogRevision).toHaveBeenCalledTimes(1);
+    expect(state.syncTick).toHaveBeenCalledTimes(2);
+    expect(state.lastError).toHaveBeenLastCalledWith("Falló el catálogo");
   });
 
   it("dos disparos de push no se solapan y el segundo se atiende después del primero", async () => {
@@ -121,6 +196,19 @@ describe("Coordinación de acciones públicas de SyncContext", () => {
     expect(services.pushOnlySync).toHaveBeenCalledTimes(2);
     expect(maximum).toBe(1);
     expect(services.runSync).not.toHaveBeenCalled();
+  });
+
+  it("un push posterior no oculta un fallo pendiente del pull y una descarga exitosa lo limpia", async () => {
+    const { value, services, state } = mountProvider();
+    services.runSync.mockResolvedValueOnce({ ...okResult, ok: false, error: "Catálogo caído", pullError: "Catálogo caído" } as any);
+    await value.forceSync();
+    await value.pushSync();
+    expect(state.lastError).toHaveBeenLastCalledWith(expect.stringContaining("Catálogo caído"));
+    expect(state.lastSyncedAt).not.toHaveBeenCalled();
+    services.runSync.mockResolvedValueOnce({ ...okResult, didPull: true, catalogChanged: false } as any);
+    await value.forceSync();
+    expect(state.lastError).toHaveBeenLastCalledWith(null);
+    expect(state.lastSyncedAt).toHaveBeenCalledTimes(1);
   });
 
   it("un mantenimiento fallido no bloquea el siguiente mantenimiento ni una sincronización", async () => {

@@ -4,6 +4,7 @@ import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { colors, spacing, radius } from "../theme/tokens";
 import { Card } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
+import { LoadErrorBanner } from "../components/LoadErrorBanner";
 import { Button } from "../components/Button";
 import { useAuth, normalizeUserName } from "../context/AuthContext";
 import { useSync } from "../context/SyncContext";
@@ -18,10 +19,11 @@ import { BackupInfo, listLocalBackups, exportLocalBackup, importLocalBackups, de
 
 export function DashboardScreen() {
   const { user, logout } = useAuth();
-  const { connection, pendingCount, forceSync, lastError, discardFailedItems, resetLocalData, backupLocalData, restoreLocalData, syncTick } = useSync();
+  const { connection, pendingCount, failedCount, correctionCount, refreshPending, forceSync, pushSync, lastError, discardFailedItems, resetLocalData, backupLocalData, restoreLocalData, syncTick } = useSync();
   const navigation = useNavigation<any>();
 
   const [workDay, setWorkDay] = useState<WorkDay | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [recentOrders, setRecentOrders] = useState<LocalOrder[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [showUserModal, setShowUserModal] = useState(false);
@@ -256,25 +258,32 @@ export function DashboardScreen() {
 
   const load = useCallback(async () => {
     if (!user) return;
-    const wd = await getOrCreateOpenWorkDay(user.id);
-    const orders = await listOrdersForWorkDay(wd.id);
-    setRecentOrders(orders);
+    try {
+      const wd = await getOrCreateOpenWorkDay(user.id);
+      const orders = await listOrdersForWorkDay(wd.id);
+      setRecentOrders(orders);
 
-    const totalCents = wd.status === "closed"
-      ? wd.total_cents
-      : orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
-    const orderCount = wd.status === "closed" ? wd.order_count : orders.length;
-    setWorkDay({
-      ...wd,
-      total_cents: totalCents,
-      order_count: orderCount,
-    });
+      const totalCents = wd.status === "closed"
+        ? wd.total_cents
+        : orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+      const orderCount = wd.status === "closed" ? wd.order_count : orders.length;
+      setWorkDay({
+        ...wd,
+        total_cents: totalCents,
+        order_count: orderCount,
+      });
+      setLoadError(null);
+    } catch {
+      // Conserva los datos visibles previos y permite reintentar.
+      setLoadError("No se pudo cargar el inicio. Revisa la conexión e inténtalo de nuevo.");
+    }
   }, [user]);
 
   useFocusEffect(
     useCallback(() => {
       load();
-    }, [load])
+      void refreshPending().catch(() => undefined);
+    }, [load, refreshPending])
   );
 
   // Recarga automática cada vez que termina un sync en background
@@ -298,7 +307,7 @@ export function DashboardScreen() {
   async function handleManualForceSync() {
     if (isSyncing) return;
     try {
-      await forceSync();
+      await forceSync({ fullRecovery: true });
       await load();
     } catch (err) {
       console.warn("Error en sincronización forzada:", err);
@@ -326,14 +335,26 @@ export function DashboardScreen() {
       await cancelOrderLocal(orderId);
       // Actualizar vista local de inmediato para que no se congele o buguee
       setRecentOrders((prev) => prev.filter((o) => o.id !== orderId));
-      await forceSync();
+      void pushSync().catch(() => {});
       await load();
     } catch (err: any) {
       Alert.alert("No se pudo eliminar", err?.message || "Ocurrió un problema al eliminar la preventa.");
     }
   }
 
-  if (!user || !workDay) return null;
+  if (!user) return null;
+  if (!workDay) {
+    if (loadError) {
+      return (
+        <View style={styles.screen}>
+          <View style={{ paddingTop: spacing.lg }}>
+            <LoadErrorBanner message={loadError} onRetry={() => load()} />
+          </View>
+        </View>
+      );
+    }
+    return null;
+  }
 
   return (
     <ScrollView
@@ -368,6 +389,8 @@ export function DashboardScreen() {
           />
         </View>
       </View>
+
+      {loadError && <LoadErrorBanner message={loadError} onRetry={() => load()} />}
 
       <Modal visible={showUserModal} transparent animationType="fade" onRequestClose={() => setShowUserModal(false)}>
         <Pressable style={styles.modalOverlay} onPress={() => setShowUserModal(false)}>
@@ -422,6 +445,7 @@ export function DashboardScreen() {
             />
             <Button label="Guardar respaldo" variant="outline" onPress={saveBackup} disabled={backupBusy} style={{ marginTop: spacing.sm }} />
             <Button label="Restaurar respaldo" variant="outline" onPress={openBackups} disabled={backupBusy} style={{ marginTop: spacing.sm }} />
+            <Button label="Mediciones de rendimiento" variant="outline" onPress={() => { setShowUserModal(false); navigation.navigate("Rendimiento"); }} style={{ marginTop: spacing.sm }} />
             <Button label="Cerrar" variant="outline" onPress={() => setShowUserModal(false)} style={{ marginTop: spacing.sm }} />
             </ScrollView>
           </Pressable>
@@ -585,6 +609,13 @@ export function DashboardScreen() {
           <Text style={{ color: colors.amberText, fontWeight: "600" }}>
             {pendingCount} cambio{pendingCount === 1 ? "" : "s"} pendiente{pendingCount === 1 ? "" : "s"} de sincronizar
           </Text>
+          {correctionCount > 0 && <Text style={{ color: colors.errorTextDark, marginTop: spacing.xs }}>{correctionCount} requieren corrección</Text>}
+          <Button
+            label="Ver cambios pendientes"
+            onPress={() => navigation.navigate("PendientesSincronizacion", { errorsOnly: false })}
+            variant="outline"
+            style={{ marginTop: spacing.sm }}
+          />
           <Button
             label="Forzar Sincro"
             onPress={handleManualForceSync}
@@ -601,6 +632,12 @@ export function DashboardScreen() {
             style={{ marginTop: spacing.sm }}
           />
         </Card>
+      )}
+
+      {failedCount > 0 && (
+        <Button label={`Revisar cambios con error (${failedCount})`} variant="outline"
+          onPress={() => navigation.navigate("PendientesSincronizacion", { errorsOnly: true })}
+          style={{ marginTop: spacing.sm }} />
       )}
 
       {lastError && (
@@ -690,7 +727,7 @@ export function DashboardScreen() {
           <Text style={{ color: colors.textMuted }}>Aún no registras preventas hoy.</Text>
         </Card>
       ) : (
-        recentOrders.map((o) => (
+        <>{recentOrders.slice(0, 8).map((o) => (
           <Card key={o.id} style={{ marginBottom: spacing.sm }}>
             <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
               <Text style={styles.orderClient}>{o.client_name}</Text>
@@ -711,7 +748,8 @@ export function DashboardScreen() {
               />
             </View>
           </Card>
-        ))
+        ))}
+        {recentOrders.length > 8 && <Button label={`Ver todas las preventas (${recentOrders.length})`} variant="outline" onPress={() => navigation.navigate("Registros")} />}</>
       )}
     </ScrollView>
   );

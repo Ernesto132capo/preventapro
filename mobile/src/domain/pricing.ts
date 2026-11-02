@@ -1,78 +1,11 @@
-// REGLA COMPARTIDA: mantener las fórmulas y redondeos idénticos a backend/src/services/pricing.ts.
-// Cualquier cambio en precios, descuentos, combos o impuestos debe replicarse en su contraparte.
+// El núcleo monetario es único; aquí se adapta al carrito y a los snapshots del móvil.
 import { CartLine, Presentation, Product } from "./types";
+import {
+  PricingError, calculateLineSubtotalCents, calculatePricedTotals,
+  centsToDisplay, PriceTotals,
+} from "../../../backend/src/shared/pricing-core";
 
-/**
- * Lógica de precios CENTRALIZADA del lado móvil (Fase 20 / 44 — nunca duplicar cálculo
- * de precios en varias pantallas). Debe producir EXACTAMENTE los mismos resultados que
- * backend/src/services/pricing.ts, porque ambos representan la misma regla de negocio:
- * el precio usado es el de la presentación en el momento de agregar al carrito.
- */
-
-export class PricingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "PricingError";
-  }
-}
-
-const TAX_RATE_DENOMINATOR = 1_000;
-
-/**
- * Reparte centavos por peso sin importes negativos ni pérdida de centavos.
- * Los residuos se asignan de mayor a menor; los empates conservan el orden original.
- * BigInt evita redondeos incluso cuando el producto total * peso excede el entero seguro.
- */
-export function allocateProportionalCents(totalCents: number, weights: number[]): number[] {
-  if (!Number.isSafeInteger(totalCents) || totalCents < 0) {
-    throw new PricingError("El total debe expresarse en centavos enteros no negativos.");
-  }
-  if (weights.some((weight) => !Number.isSafeInteger(weight) || weight < 0)) {
-    throw new PricingError("Los pesos deben ser enteros no negativos.");
-  }
-  const weightSum = weights.reduce((sum, weight) => sum + BigInt(weight), 0n);
-  if (weightSum === 0n) {
-    if (totalCents === 0) return weights.map(() => 0);
-    throw new PricingError("Se necesita al menos un peso mayor a cero.");
-  }
-
-  const total = BigInt(totalCents);
-  const shares = weights.map((weight, index) => {
-    const weightedTotal = total * BigInt(weight);
-    return {
-      index,
-      cents: Number(weightedTotal / weightSum),
-      remainder: weightedTotal % weightSum,
-    };
-  });
-  const allocations = shares.map((share) => share.cents);
-  let remaining = totalCents - allocations.reduce((sum, cents) => sum + cents, 0);
-  shares.sort((left, right) => left.remainder === right.remainder
-    ? left.index - right.index
-    : left.remainder > right.remainder ? -1 : 1);
-  for (let index = 0; remaining > 0; index++, remaining--) {
-    allocations[shares[index].index]++;
-  }
-  return allocations;
-}
-
-export function calculateLineSubtotalCents(unitPriceCents: number, quantity: number): number {
-  if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0) {
-    throw new PricingError("El precio debe expresarse en centavos enteros.");
-  }
-  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
-    throw new PricingError("La cantidad debe ser un entero mayor a 0.");
-  }
-  const subtotalCents = unitPriceCents * quantity;
-  if (!Number.isSafeInteger(subtotalCents)) {
-    throw new PricingError("El subtotal excede el monto seguro en centavos.");
-  }
-  return subtotalCents;
-}
-
-export function calculateTaxCents(subtotalCents: number, taxRatePermille: number): number {
-  return Math.round((subtotalCents * taxRatePermille) / TAX_RATE_DENOMINATOR);
-}
+export { PricingError, allocateProportionalCents, calculateLineSubtotalCents, calculateTaxCents } from "../../../backend/src/shared/pricing-core";
 
 export function buildCartLine(
   product: Product,
@@ -130,26 +63,14 @@ export function calcPriceDifference(newTotalCents: number, originalTotalCents: n
   return newTotalCents - originalTotalCents;
 }
 
-export interface OrderTotals {
-  subtotalCents: number;
-  taxCents: number;
-  totalCents: number;
-  itemCount: number;
-}
+export interface OrderTotals extends PriceTotals {}
 
 /** taxRatePermille: milésimas (130 = 13.0%). 0 = exento (valor actual del diseño). */
 export function calcOrderTotals(lines: CartLine[], taxRatePermille = 0): OrderTotals {
-  if (lines.length === 0) throw new PricingError("La preventa debe tener al menos un producto.");
-  const subtotalCents = lines.reduce(
-    (acc, line) => acc + calculateLineSubtotalCents(line.unitPriceCents, line.quantity),
-    0
-  );
-  const taxCents = calculateTaxCents(subtotalCents, taxRatePermille);
-  const totalCents = subtotalCents + taxCents;
-  const itemCount = lines.reduce((acc, l) => acc + l.quantity, 0);
-  return { subtotalCents, taxCents, totalCents, itemCount };
+  return calculatePricedTotals(lines.map((line) => ({
+    subtotalCents: calculateLineSubtotalCents(line.unitPriceCents, line.quantity),
+    quantity: line.quantity,
+  })), taxRatePermille);
 }
 
-export function centsToBs(cents: number): string {
-  return "Bs. " + (cents / 100).toFixed(2);
-}
+export const centsToBs = centsToDisplay;

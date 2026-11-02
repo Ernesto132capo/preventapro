@@ -3,7 +3,7 @@ import { verifyAccessToken, verifyReportDownloadToken } from "../services/auth";
 import { pool } from "../db/pg";
 
 export interface AuthedRequest extends Request {
-  userId?: string; // id de la fila en la tabla "users" de Neon
+  userId?: string; // id de la fila en la tabla "users" de PostgreSQL
   userCode?: string;
   userRole?: string;
   sessionId?: string;

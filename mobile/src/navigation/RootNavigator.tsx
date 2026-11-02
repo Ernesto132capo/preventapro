@@ -9,6 +9,8 @@ import { ClientFormScreen } from "../screens/ClientFormScreen";
 import { ProductFormScreen } from "../screens/ProductFormScreen";
 import { OrderDetailScreen } from "../screens/OrderDetailScreen";
 import { NewSaleScreen } from "../screens/NewSaleScreen";
+import { SyncDetailsScreen } from "../screens/SyncDetailsScreen";
+import { PerformanceScreen } from "../screens/PerformanceScreen";
 
 export type RootStackParamList = {
   Login: undefined;
@@ -18,6 +20,8 @@ export type RootStackParamList = {
   NuevoProducto: { productId?: string } | undefined;
   DetallePreventa: { orderId: string };
   EditarPreventa: { orderId: string };
+  PendientesSincronizacion: { errorsOnly?: boolean } | undefined;
+  Rendimiento: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -40,6 +44,8 @@ export function RootNavigator() {
             <Stack.Screen name="NuevoProducto" component={ProductFormScreen} options={{ headerShown: true, title: "Registrar Producto", presentation: "modal" }} />
             <Stack.Screen name="DetallePreventa" component={OrderDetailScreen} options={{ headerShown: true, title: "Detalle de preventa" }} />
             <Stack.Screen name="EditarPreventa" component={NewSaleScreen} options={{ headerShown: true, title: "Editar preventa" }} />
+            <Stack.Screen name="PendientesSincronizacion" component={SyncDetailsScreen} options={{ headerShown: true, title: "Pendientes de sincronización" }} />
+            <Stack.Screen name="Rendimiento" component={PerformanceScreen} options={{ headerShown: true, title: "Rendimiento en este teléfono" }} />
           </>
         )}
       </Stack.Navigator>

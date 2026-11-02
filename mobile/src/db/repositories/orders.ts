@@ -2,10 +2,10 @@ import { v4 as uuid } from "uuid";
 import type { SQLiteDatabase } from "expo-sqlite";
 import { getDb, nowIso, withTx } from "../client";
 import { enqueueInTx, hasUnresolvedOutbox } from "../outbox";
-import { CartLine, LocalOrder } from "../../domain/types";
+import { forEachIdChunk, placeholdersFor } from "../sqlChunks";
+import { CartLine, Client, LocalOrder } from "../../domain/types";
 import { calcOrderTotals, PricingError, allocateProportionalCents } from "../../domain/pricing";
 import { formatClientDisplayName } from "../../domain/client-display";
-import { getClient } from "./clients";
 import { withUserWorkDayLock } from "./workdays";
 
 export interface CreateOrderInput {
@@ -14,6 +14,43 @@ export interface CreateOrderInput {
   paymentCondition: string;
   lines: CartLine[];
   taxRatePermille?: number;
+}
+
+/** Releer dentro del mismo lock SQLite evita guardar con una selección de pantalla obsoleta. */
+async function requireAvailableClient(db: SQLiteDatabase, clientId: string, allowInactive = false): Promise<Client> {
+  const client = await db.getFirstAsync<Client>(
+    `SELECT * FROM clients WHERE id = ? OR server_id = ?`, [clientId, clientId]
+  );
+  if (!client || (!allowInactive && client.active !== 1)) {
+    throw new PricingError("Este cliente fue eliminado o ya no está disponible. Selecciona otro cliente antes de guardar.");
+  }
+  return client;
+}
+
+async function validateLocalCatalog(db: SQLiteDatabase, lines: CartLine[]): Promise<void> {
+  const references = lines.flatMap(line => [line, ...(line.selections || []).map(selection => ({
+    productId: selection.selectedProductId,
+    presentationId: selection.selectedPresentationId,
+    productName: selection.productNameSnapshot,
+    presentationName: selection.presentationNameSnapshot,
+  }))]);
+  for (const line of references) {
+    const product = await db.getFirstAsync<{ id: string; server_id: string | null; active: number }>(
+      `SELECT id, server_id, active FROM products WHERE id = ? OR server_id = ?`, [line.productId, line.productId]
+    );
+    if (!product || product.active !== 1) {
+      throw new PricingError(`El producto "${line.productName}" fue eliminado o ya no está disponible. Quítalo de la preventa antes de guardar.`);
+    }
+    const presentation = await db.getFirstAsync<{ product_id: string; active: number }>(
+      `SELECT product_id, active FROM product_presentations WHERE id = ? OR server_id = ?`, [line.presentationId, line.presentationId]
+    );
+    if (!presentation || presentation.active !== 1) {
+      throw new PricingError(`La presentación "${line.presentationName}" de "${line.productName}" fue eliminada o ya no está disponible. Vuelve a elegirla antes de guardar.`);
+    }
+    if (presentation.product_id !== product.id && presentation.product_id !== product.server_id) {
+      throw new PricingError(`La presentación de "${line.productName}" no pertenece a este producto. Vuelve a elegirla antes de guardar.`);
+    }
+  }
 }
 
 /** Validacion offline: un combo nunca puede guardarse con selecciones vacias o ajenas. */
@@ -46,7 +83,8 @@ async function validateLocalCombos(db: SQLiteDatabase, lines: CartLine[], existi
       const option = await db.getFirstAsync<any>(
         `SELECT co.id, co.max_quantity, pp.product_id FROM combo_options co
          JOIN product_presentations pp ON (pp.id = co.presentation_id OR pp.server_id = co.presentation_id)
-         WHERE co.combo_id = ? AND co.active = 1 AND (pp.id = ? OR pp.server_id = ?)
+         JOIN products selected_product ON (selected_product.id = pp.product_id OR selected_product.server_id = pp.product_id)
+         WHERE co.combo_id = ? AND co.active = 1 AND pp.active = 1 AND selected_product.active = 1 AND (pp.id = ? OR pp.server_id = ?)
            AND (pp.product_id = ? OR pp.product_id IN (SELECT id FROM products WHERE server_id = ?)
              OR pp.product_id IN (SELECT server_id FROM products WHERE id = ?))`,
         [definition.id, selection.selectedPresentationId, selection.selectedPresentationId, selection.selectedProductId, selection.selectedProductId, selection.selectedProductId]);
@@ -77,10 +115,6 @@ export async function createOrderLocal(input: CreateOrderInput): Promise<LocalOr
 async function createOrderLocalLocked(input: CreateOrderInput, userId: string): Promise<LocalOrder> {
   const totals = calcOrderTotals(input.lines, input.taxRatePermille ?? 0);
 
-  const client = await getClient(input.clientId);
-  if (!client) throw new PricingError("Cliente no encontrado.");
-  const clientDisplayName = formatClientDisplayName(client).fullTitle.replace("\n", " - ");
-
   const db = await getDb();
   const orderId = uuid();
   const ts = nowIso();
@@ -97,6 +131,9 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
       throw new PricingError("La jornada está cerrada. Reábrela antes de registrar nuevas preventas.");
     }
 
+    const client = await requireAvailableClient(db, input.clientId);
+    const clientDisplayName = formatClientDisplayName(client).fullTitle.replace("\n", " - ");
+    await validateLocalCatalog(db, input.lines);
     await validateLocalCombos(db, input.lines);
     await db.runAsync(
       `INSERT INTO orders
@@ -106,7 +143,7 @@ async function createOrderLocalLocked(input: CreateOrderInput, userId: string): 
       [
         orderId,
         currentWorkDay.id,
-        input.clientId,
+        client.id,
         clientDisplayName,
         input.paymentCondition,
         totals.subtotalCents,
@@ -237,10 +274,13 @@ export async function getConsolidatedProductsForWorkDay(workDayLocalId: string):
   );
 
   const itemIds = rows.map((r) => r.id);
-  const selections = itemIds.length === 0 ? [] : await db.getAllAsync<any>(
-    `SELECT * FROM order_item_selections WHERE order_item_id IN (${itemIds.map(() => "?").join(",")}) ORDER BY sort_order, id`,
-    itemIds
+  const selections = itemIds.length === 0 ? [] : await forEachIdChunk<any>(itemIds, (chunk) =>
+    db.getAllAsync<any>(
+      `SELECT * FROM order_item_selections WHERE order_item_id IN (${placeholdersFor(chunk)})`,
+      chunk
+    )
   );
+  selections.sort((a, b) => (a.sort_order - b.sort_order) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const byItem = new Map<string, any[]>();
   for (const selection of selections) {
     const list = byItem.get(selection.order_item_id) || [];
@@ -589,6 +629,10 @@ async function updateOrderLocalLocked(orderId: string, lines: CartLine[], paymen
       throw new PricingError("La jornada está cerrada. Reábrela antes de editar esta preventa.");
     }
 
+    // El cliente original es inmutable: una edición histórica puede conservarlo
+    // aunque el catálogo lo haya desactivado, siempre que todavía exista.
+    await requireAvailableClient(db, order.client_id, true);
+    await validateLocalCatalog(db, lines);
     await validateLocalCombos(db, lines, orderId);
     await db.runAsync(`DELETE FROM order_item_selections WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)`, [orderId]);
     await db.runAsync(`DELETE FROM order_items WHERE order_id = ?`, [orderId]);

@@ -1,0 +1,27 @@
+# Upload the mobile app and its shared monetary core only.
+/*
+!/mobile
+!/backend
+/backend/*
+!/backend/src
+/backend/src/*
+!/backend/src/shared
+
+**/node_modules/
+**/.env
+**/.env.*
+**/.expo/
+**/.jest-cache/
+**/.simulation/
+**/__tests__/
+**/dist/
+**/reports/
+**/*.log
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.pem
+**/*.key
+**/*.jks
+**/*.keystore
+**/credentials.json

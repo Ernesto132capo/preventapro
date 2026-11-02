@@ -9,6 +9,10 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.simulation.example
+
+# Resultados y copias aisladas del simulador de jornadas.
+/backend/.simulation/
 
 # Reportes generados por el backend (PDF/XLSX organizados por jornada).
 /backend/reports/
@@ -23,3 +27,7 @@ dist/
 *.jks
 *.keystore
 credentials.json
+*.dump
+*.p12
+*.pfx
+*.pgpass

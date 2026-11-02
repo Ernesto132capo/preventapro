@@ -96,6 +96,13 @@ export interface CartLineSelection {
   sortOrder: number;
 }
 
+/** Configuración vista al armar el carrito; solo existe durante esa edición. */
+export interface ComboCatalogSnapshot {
+  selectionMin: number;
+  selectionMax: number;
+  options: Array<{ presentationId: string; maxQuantity: number | null }>;
+}
+
 export interface CartLine {
   productId: string;
   presentationId: string;
@@ -108,6 +115,7 @@ export interface CartLine {
   subtotalCents: number;
   isCombo?: boolean;
   selections?: CartLineSelection[];
+  comboCatalogSnapshot?: ComboCatalogSnapshot;
 }
 
 export interface OrderItemSelection {
